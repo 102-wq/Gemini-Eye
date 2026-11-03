@@ -17,7 +17,9 @@ import android.view.ViewGroup
 import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.widget.Toast
 import de.robv.android.xposed.IXposedHookLoadPackage
+import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -27,18 +29,16 @@ import org.json.JSONObject
 import java.io.Reader
 import java.lang.ref.WeakReference
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 
-class QuotaHookEntry : IXposedHookLoadPackage {
+class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     companion object {
         private const val TAG = "BardQuota"
         private const val OVERLAY_TAG = "bard_quota_overlay_view"
 
-        // IMPORTANT: Never call Handler(Looper.getMainLooper()) eagerly in <clinit>!
-        // LSPosed calls loadLegacyModules() inside Startup.bootstrapXposed() BEFORE
-        // ActivityThread.main() initializes the main Looper (getMainLooper() == null).
         @Volatile private var mainHandler: Handler? = null
 
         private fun postToMain(delayMs: Long = 0L, action: () -> Unit) {
@@ -51,8 +51,10 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         private val overlayViewRef = AtomicReference<WeakReference<TextView>>(WeakReference(null))
         private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
         private val unhookRefs = CopyOnWriteArrayList<WeakReference<XC_MethodHook.Unhook>>()
+        private val shownToastInProc = AtomicBoolean(false)
 
         @Volatile private var currentLang: Lang = Lang.ZH
+        @Volatile private var isCollapsed: Boolean = false
         @Volatile private var savedOffsetX: Float = 0f
         @Volatile private var savedOffsetY: Float = 0f
 
@@ -92,6 +94,10 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         val source: String = "init"
     )
 
+    override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
+        logInfo("initZygote -> modulePath=${startupParam.modulePath}")
+    }
+
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         logInfo("handleLoadPackage -> pkg=${lpparam.packageName} proc=${lpparam.processName}")
         if (lpparam.packageName == "android") return
@@ -114,20 +120,6 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         if (unhook != null) unhookRefs.add(WeakReference(unhook))
     }
 
-    private fun shouldAttachOverlay(pkg: String, activity: Activity): Boolean {
-        if (pkg != "com.google.android.googlequicksearchbox") return true
-        val clsName = activity.javaClass.name.lowercase()
-        val intentStr = activity.intent?.toString()?.lowercase().orEmpty()
-        return clsName.contains("robin") ||
-            clsName.contains("bard") ||
-            clsName.contains("gemini") ||
-            clsName.contains("assistant") ||
-            clsName.contains("webview") ||
-            intentStr.contains("robin") ||
-            intentStr.contains("bard") ||
-            intentStr.contains("gemini")
-    }
-
     private fun hookActivityLifecycle(pkg: String) {
         trackUnhook(
             XposedHelpers.findAndHookMethod(
@@ -136,12 +128,24 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val activity = param.thisObject as? Activity ?: return
-                        logInfo("onResume: ${activity.javaClass.name} in $pkg")
-                        if (shouldAttachOverlay(pkg, activity)) {
-                            activeActivityRef.set(WeakReference(activity))
-                            attachOrUpdateOverlay()
-                            scheduleWebViewPoll()
+                        if (activity.isFinishing) return
+                        logInfo("onResume -> ${activity.javaClass.name} in $pkg")
+
+                        // Attach unconditionally: inside googlequicksearchbox, R8 obfuscates Gemini's Activity names!
+                        activeActivityRef.set(WeakReference(activity))
+                        if (shownToastInProc.compareAndSet(false, true)) {
+                            postToMain {
+                                runCatching {
+                                    Toast.makeText(
+                                        activity.applicationContext,
+                                        "Gemini-Eye 已挂载 ($pkg)",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
                         }
+                        attachOrUpdateOverlay()
+                        scheduleWebViewPoll()
                     }
                 }
             )
@@ -185,7 +189,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                         val cs = param.args[0] as? CharSequence ?: return
                         if (cs.length !in 3..300) return
                         val text = cs.toString()
-                        if (text.startsWith("用量监控") || text.startsWith("Usage Limits")) return
+                        if (text.startsWith("用量监控") || text.startsWith("Usage Limits") || text.startsWith("👁")) return
                         scanRenderedLines(text, "Compose")
                     }
                 }
@@ -405,6 +409,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                     var downRawY = 0f
                     var startTransX = 0f
                     var startTransY = 0f
+                    var downTime = 0L
                     var dragging = false
 
                     setOnTouchListener { v, event ->
@@ -414,6 +419,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                                 downRawY = event.rawY
                                 startTransX = v.translationX
                                 startTransY = v.translationY
+                                downTime = System.currentTimeMillis()
                                 dragging = false
                                 true
                             }
@@ -431,8 +437,15 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                             }
                             MotionEvent.ACTION_UP -> {
                                 if (!dragging) {
-                                    currentLang = if (currentLang == Lang.ZH) Lang.EN else Lang.ZH
-                                    (v as TextView).text = formatOverlayText(latestSnapshot.get(), currentLang)
+                                    val heldMs = System.currentTimeMillis() - downTime
+                                    if (heldMs >= 450L) {
+                                        isCollapsed = !isCollapsed
+                                    } else if (isCollapsed) {
+                                        isCollapsed = false
+                                    } else {
+                                        currentLang = if (currentLang == Lang.ZH) Lang.EN else Lang.ZH
+                                    }
+                                    (v as TextView).text = formatOverlayText(latestSnapshot.get(), currentLang, isCollapsed)
                                     scheduleWebViewPoll()
                                 }
                                 true
@@ -454,14 +467,17 @@ class QuotaHookEntry : IXposedHookLoadPackage {
             }
 
             badge.bringToFront()
-            badge.text = formatOverlayText(latestSnapshot.get(), currentLang)
+            badge.text = formatOverlayText(latestSnapshot.get(), currentLang, isCollapsed)
         }
     }
 
-    private fun formatOverlayText(s: QuotaSnapshot, lang: Lang): String {
+    private fun formatOverlayText(s: QuotaSnapshot, lang: Lang, collapsed: Boolean): String {
+        if (collapsed) {
+            return if (lang == Lang.ZH) "👁 额度: ${s.fiveHourQuota}" else "👁 ${s.fiveHourQuota}"
+        }
         return when (lang) {
-            Lang.ZH -> "用量监控 [${s.source} | 点按切EN]\n5小时额度: ${s.fiveHourQuota}\n每周限额: ${s.weeklyLimit}\n重置时间: ${s.resetTimer}"
-            Lang.EN -> "Usage Limits [${s.source} | Tap->中文]\n5h Quota: ${s.fiveHourQuota}\nWeekly Limit: ${s.weeklyLimit}\nReset Timer: ${s.resetTimer}"
+            Lang.ZH -> "用量监控 [${s.source} | 点按切EN | 长按收起]\n5小时额度: ${s.fiveHourQuota}\n每周限额: ${s.weeklyLimit}\n重置时间: ${s.resetTimer}"
+            Lang.EN -> "Usage Limits [${s.source} | Tap->中文 | Hold->Min]\n5h Quota: ${s.fiveHourQuota}\nWeekly Limit: ${s.weeklyLimit}\nReset Timer: ${s.resetTimer}"
         }
     }
 }

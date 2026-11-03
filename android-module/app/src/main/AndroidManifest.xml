@@ -5,6 +5,16 @@
         android:label="Gemini 用量监控 Hook"
         android:hasCode="true">
 
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+            </intent-filter>
+        </activity>
+
         <meta-data
             android:name="xposedmodule"
             android:value="true" />

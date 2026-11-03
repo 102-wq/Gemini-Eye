@@ -2,6 +2,10 @@
     public <init>();
     *;
 }
+-keep public class com.example.bardquotahook.MainActivity {
+    public <init>();
+    *;
+}
 -keep class * implements de.robv.android.xposed.IXposedHookLoadPackage {
     public <init>();
     *;

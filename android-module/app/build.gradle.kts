@@ -9,10 +9,23 @@ android {
 
     defaultConfig {
         applicationId = "com.example.bardquotahook"
-        minSdk = 28
+        minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.3.0"
+        versionCode = 5
+        versionName = "1.4.0"
+    }
+
+    signingConfigs {
+        create("fixedRelease") {
+            val ksFile = file("signing.p12")
+            if (ksFile.exists()) {
+                storeFile = ksFile
+                storeType = "PKCS12"
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     packaging {
@@ -25,7 +38,12 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = false
-            signingConfig = signingConfigs.getByName("debug")
+            val ksFile = file("signing.p12")
+            signingConfig = if (ksFile.exists()) {
+                signingConfigs.getByName("fixedRelease")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
