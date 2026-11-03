@@ -25,6 +25,9 @@ android {
                 "proguard-rules.pro"
             )
         }
+        debug {
+            isMinifyEnabled = false
+        }
     }
 
     compileOptions {
@@ -38,5 +41,6 @@ android {
 }
 
 dependencies {
+    // 核心：Xposed 必须使用 compileOnly
     compileOnly("de.robv.android.xposed:api:82")
 }
