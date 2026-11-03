@@ -9,10 +9,16 @@ android {
 
     defaultConfig {
         applicationId = "com.example.bardquotahook"
-        minSdk = 27
+        minSdk = 28
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = 4
+        versionName = "1.3.0"
+    }
+
+    packaging {
+        dex {
+            useLegacyPackaging = false
+        }
     }
 
     buildTypes {

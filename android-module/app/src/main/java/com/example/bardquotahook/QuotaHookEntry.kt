@@ -36,7 +36,17 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         private const val TAG = "BardQuota"
         private const val OVERLAY_TAG = "bard_quota_overlay_view"
 
-        private val mainHandler = Handler(Looper.getMainLooper())
+        // IMPORTANT: Never call Handler(Looper.getMainLooper()) eagerly in <clinit>!
+        // LSPosed calls loadLegacyModules() inside Startup.bootstrapXposed() BEFORE
+        // ActivityThread.main() initializes the main Looper (getMainLooper() == null).
+        @Volatile private var mainHandler: Handler? = null
+
+        private fun postToMain(delayMs: Long = 0L, action: () -> Unit) {
+            val looper = Looper.getMainLooper() ?: return
+            val handler = mainHandler ?: Handler(looper).also { mainHandler = it }
+            if (delayMs > 0L) handler.postDelayed(action, delayMs) else handler.post(action)
+        }
+
         private val activeActivityRef = AtomicReference<WeakReference<Activity>>(WeakReference(null))
         private val overlayViewRef = AtomicReference<WeakReference<TextView>>(WeakReference(null))
         private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
@@ -48,14 +58,24 @@ class QuotaHookEntry : IXposedHookLoadPackage {
 
         private val latestSnapshot = AtomicReference(QuotaSnapshot())
 
-        private val KEY_REGEX = Regex(
-            """["']?([a-zA-Z0-9_]*(?:quota|limit|reset|remaining)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']?([^"',}\]\n]+)["']?""",
-            RegexOption.IGNORE_CASE
-        )
+        private val keyRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(
+                """["']?([a-zA-Z0-9_]*(?:quota|limit|reset|remaining)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']?([^"',}\]\n]+)["']?""",
+                RegexOption.IGNORE_CASE
+            )
+        }
 
-        private val FIVE_HOUR_REGEX = Regex(""".*(5\s*(-|\s)?(hour|hr|h|小时)|5h).*""", RegexOption.IGNORE_CASE)
-        private val WEEKLY_REGEX = Regex(""".*(weekly|week|每周|周限额|7\s*(-|\s)?(day|天)).*""", RegexOption.IGNORE_CASE)
-        private val RESET_REGEX = Regex(""".*(resets?\b|重置|恢复|available\s+(in|at)|后重置).*""", RegexOption.IGNORE_CASE)
+        private val fiveHourRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(""".*(5\s*(-|\s)?(hour|hr|h|小时)|5h).*""", RegexOption.IGNORE_CASE)
+        }
+
+        private val weeklyRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(""".*(weekly|week|每周|周限额|7\s*(-|\s)?(day|天)).*""", RegexOption.IGNORE_CASE)
+        }
+
+        private val resetRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(""".*(resets?\b|重置|恢复|available\s+(in|at)|后重置).*""", RegexOption.IGNORE_CASE)
+        }
 
         private fun logInfo(msg: String) {
             XposedBridge.log("[$TAG] $msg")
@@ -73,7 +93,6 @@ class QuotaHookEntry : IXposedHookLoadPackage {
     )
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        // Log unconditionally on line 1 so LSPosed Logs ALWAYS show module injection!
         logInfo("handleLoadPackage -> pkg=${lpparam.packageName} proc=${lpparam.processName}")
         if (lpparam.packageName == "android") return
 
@@ -191,9 +210,9 @@ class QuotaHookEntry : IXposedHookLoadPackage {
     }
 
     private fun scheduleWebViewPoll() {
-        mainHandler.postDelayed({
-            val wv = activeWebViewRef.get().get() ?: return@postDelayed
-            if (!wv.isShown) return@postDelayed
+        postToMain(delayMs = 1200L) {
+            val wv = activeWebViewRef.get().get() ?: return@postToMain
+            if (!wv.isShown) return@postToMain
             runCatching {
                 wv.evaluateJavascript(
                     "(function(){return document.body ? document.body.innerText : '';})()"
@@ -204,7 +223,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                     }
                 }
             }
-        }, 1200L)
+        }
     }
 
     private fun scanRenderedLines(block: String, source: String) {
@@ -217,15 +236,15 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         for (rawLine in block.lineSequence()) {
             val line = rawLine.trim()
             if (line.length !in 3..120) continue
-            if (FIVE_HOUR_REGEX.matches(line)) {
+            if (fiveHourRegex.matches(line)) {
                 fiveHour = line
                 hit = true
             }
-            if (WEEKLY_REGEX.matches(line)) {
+            if (weeklyRegex.matches(line)) {
                 weekly = line
                 hit = true
             }
-            if (RESET_REGEX.matches(line)) {
+            if (resetRegex.matches(line)) {
                 reset = line
                 hit = true
             }
@@ -327,7 +346,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
             }
         }
         val extracted = mutableMapOf<String, String>()
-        KEY_REGEX.findAll(cleaned).take(40).forEach { match ->
+        keyRegex.findAll(cleaned).take(40).forEach { match ->
             extracted[match.groupValues[1].lowercase()] = match.groupValues[2]
         }
         if (extracted.isNotEmpty()) mergeExtractedFields(extracted, source)
@@ -359,11 +378,11 @@ class QuotaHookEntry : IXposedHookLoadPackage {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun attachOrUpdateOverlay() {
-        mainHandler.post {
-            val activity = activeActivityRef.get().get() ?: return@post
-            if (activity.isFinishing || activity.isDestroyed) return@post
+        postToMain {
+            val activity = activeActivityRef.get().get() ?: return@postToMain
+            if (activity.isFinishing || activity.isDestroyed) return@postToMain
 
-            val root = activity.findViewById<ViewGroup>(android.R.id.content) ?: return@post
+            val root = activity.findViewById<ViewGroup>(android.R.id.content) ?: return@postToMain
             var badge = root.findViewWithTag<TextView>(OVERLAY_TAG) ?: overlayViewRef.get().get()
 
             if (badge == null || badge.parent == null) {

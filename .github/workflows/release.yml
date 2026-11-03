@@ -30,16 +30,16 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Build Signed APK
+      - name: Build Signed Single-DEX Release APK
         working-directory: android-module
         run: |
-          gradle assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk ../Gemini-Eye.apk
+          gradle assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk ../Gemini-Eye.apk
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: Gemini-Eye v1.0.${{ github.run_number }}
-          body: "LSPosed module APK. Enable both **Gemini** (`com.google.android.apps.bard`) and **Google** (`com.google.android.googlequicksearchbox`) in LSPosed Manager, then Force Stop Google."
+          body: "LSPosed single-DEX uncompressed module APK. Enable both **Gemini** (`com.google.android.apps.bard`) and **Google** (`com.google.android.googlequicksearchbox`) in LSPosed Manager, then Force Stop Google."
           files: Gemini-Eye.apk

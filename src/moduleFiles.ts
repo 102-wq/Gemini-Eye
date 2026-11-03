@@ -45,7 +45,14 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         private const val TAG = "BardQuota"
         private const val OVERLAY_TAG = "bard_quota_overlay_view"
 
-        private val mainHandler = Handler(Looper.getMainLooper())
+        @Volatile private var mainHandler: Handler? = null
+
+        private fun postToMain(delayMs: Long = 0L, action: () -> Unit) {
+            val looper = Looper.getMainLooper() ?: return
+            val handler = mainHandler ?: Handler(looper).also { mainHandler = it }
+            if (delayMs > 0L) handler.postDelayed(action, delayMs) else handler.post(action)
+        }
+
         private val activeActivityRef = AtomicReference<WeakReference<Activity>>(WeakReference(null))
         private val overlayViewRef = AtomicReference<WeakReference<TextView>>(WeakReference(null))
         private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
@@ -57,14 +64,22 @@ class QuotaHookEntry : IXposedHookLoadPackage {
 
         private val latestSnapshot = AtomicReference(QuotaSnapshot())
 
-        private val KEY_REGEX = Regex(
-            """["']?([a-zA-Z0-9_]*(?:quota|limit|reset|remaining)[a-zA-Z0-9_]*)["']?\\s*[:=]\\s*["']?([^"',}\\]\\n]+)["']?""",
-            RegexOption.IGNORE_CASE
-        )
+        private val KEY_REGEX by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(
+                """["']?([a-zA-Z0-9_]*(?:quota|limit|reset|remaining)[a-zA-Z0-9_]*)["']?\\s*[:=]\\s*["']?([^"',}\\]\\n]+)["']?""",
+                RegexOption.IGNORE_CASE
+            )
+        }
 
-        private val FIVE_HOUR_REGEX = Regex(""".*(5\\s*(-|\\s)?(hour|hr|h|小时)|5h).*""", RegexOption.IGNORE_CASE)
-        private val WEEKLY_REGEX = Regex(""".*(weekly|week|每周|周限额|7\\s*(-|\\s)?(day|天)).*""", RegexOption.IGNORE_CASE)
-        private val RESET_REGEX = Regex(""".*(resets?\\b|重置|恢复|available\\s+(in|at)|后重置).*""", RegexOption.IGNORE_CASE)
+        private val FIVE_HOUR_REGEX by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(""".*(5\\s*(-|\\s)?(hour|hr|h|小时)|5h).*""", RegexOption.IGNORE_CASE)
+        }
+        private val WEEKLY_REGEX by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(""".*(weekly|week|每周|周限额|7\\s*(-|\\s)?(day|天)).*""", RegexOption.IGNORE_CASE)
+        }
+        private val RESET_REGEX by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            Regex(""".*(resets?\\b|重置|恢复|available\\s+(in|at)|后重置).*""", RegexOption.IGNORE_CASE)
+        }
 
         private fun logInfo(msg: String) {
             XposedBridge.log("[\$TAG] \$msg")
@@ -198,9 +213,9 @@ class QuotaHookEntry : IXposedHookLoadPackage {
     }
 
     private fun scheduleWebViewPoll() {
-        mainHandler.postDelayed({
-            val wv = activeWebViewRef.get().get() ?: return@postDelayed
-            if (!wv.isShown) return@postDelayed
+        postToMain(delayMs = 1200L) {
+            val wv = activeWebViewRef.get().get() ?: return@postToMain
+            if (!wv.isShown) return@postToMain
             runCatching {
                 wv.evaluateJavascript(
                     "(function(){return document.body ? document.body.innerText : '';})()"
@@ -211,7 +226,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                     }
                 }
             }
-        }, 1200L)
+        }
     }
 
     private fun scanRenderedLines(block: String, source: String) {
@@ -366,11 +381,11 @@ class QuotaHookEntry : IXposedHookLoadPackage {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun attachOrUpdateOverlay() {
-        mainHandler.post {
-            val activity = activeActivityRef.get().get() ?: return@post
-            if (activity.isFinishing || activity.isDestroyed) return@post
+        postToMain {
+            val activity = activeActivityRef.get().get() ?: return@postToMain
+            if (activity.isFinishing || activity.isDestroyed) return@postToMain
 
-            val root = activity.findViewById<ViewGroup>(android.R.id.content) ?: return@post
+            val root = activity.findViewById<ViewGroup>(android.R.id.content) ?: return@postToMain
             var badge = root.findViewWithTag<TextView>(OVERLAY_TAG) ?: overlayViewRef.get().get()
 
             if (badge == null || badge.parent == null) {
@@ -490,14 +505,14 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+      - name: Build Signed Single-DEX Release APK
+        run: gradle assembleRelease --no-daemon
 
       - name: Upload Compiled APK
         uses: actions/upload-artifact@v4
         with:
-          name: bard-quota-hook-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: bard-quota-hook-release
+          path: app/build/outputs/apk/release/*.apk
 `,
   },
   {
@@ -568,10 +583,16 @@ android {
 
     defaultConfig {
         applicationId = "com.example.bardquotahook"
-        minSdk = 27
+        minSdk = 28
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = 4
+        versionName = "1.3.0"
+    }
+
+    packaging {
+        dex {
+            useLegacyPackaging = false
+        }
     }
 
     buildTypes {
@@ -583,6 +604,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+        debug {
+            isMinifyEnabled = false
         }
     }
 
