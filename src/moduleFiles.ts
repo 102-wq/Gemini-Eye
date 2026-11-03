@@ -16,6 +16,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.text.TextPaint
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -41,10 +42,7 @@ import kotlin.math.abs
 class QuotaHookEntry : IXposedHookLoadPackage {
 
     companion object {
-        private val TARGET_PKGS = setOf(
-            "com.google.android.apps.bard",
-            "com.google.android.googlequicksearchbox"
-        )
+        private const val TAG = "BardQuota"
         private const val OVERLAY_TAG = "bard_quota_overlay_view"
 
         private val mainHandler = Handler(Looper.getMainLooper())
@@ -53,7 +51,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
         private val unhookRefs = CopyOnWriteArrayList<WeakReference<XC_MethodHook.Unhook>>()
 
-        @Volatile private var currentLang: Lang = Lang.ZH // Default: Simplified Chinese
+        @Volatile private var currentLang: Lang = Lang.ZH
         @Volatile private var savedOffsetX: Float = 0f
         @Volatile private var savedOffsetY: Float = 0f
 
@@ -67,6 +65,11 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         private val FIVE_HOUR_REGEX = Regex(""".*(5\\s*(-|\\s)?(hour|hr|h|小时)|5h).*""", RegexOption.IGNORE_CASE)
         private val WEEKLY_REGEX = Regex(""".*(weekly|week|每周|周限额|7\\s*(-|\\s)?(day|天)).*""", RegexOption.IGNORE_CASE)
         private val RESET_REGEX = Regex(""".*(resets?\\b|重置|恢复|available\\s+(in|at)|后重置).*""", RegexOption.IGNORE_CASE)
+
+        private fun logInfo(msg: String) {
+            XposedBridge.log("[\$TAG] \$msg")
+            Log.i(TAG, msg)
+        }
     }
 
     enum class Lang { ZH, EN }
@@ -79,15 +82,21 @@ class QuotaHookEntry : IXposedHookLoadPackage {
     )
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        if (lpparam.packageName !in TARGET_PKGS) return
-        XposedBridge.log("[BardQuota] Loaded in pkg=\${lpparam.packageName} proc=\${lpparam.processName}")
+        logInfo("handleLoadPackage -> pkg=\${lpparam.packageName} proc=\${lpparam.processName}")
+        if (lpparam.packageName == "android") return
 
-        hookActivityLifecycle(lpparam.packageName)
-        hookFrameworkStaticLayout()
-        hookWebViewDomSniffer()
-        hookOrgJson()
-        hookGsonIfPresent(lpparam.classLoader)
-        hookRawJsonStrings()
+        runCatching { hookActivityLifecycle(lpparam.packageName) }
+            .onFailure { logInfo("hookActivityLifecycle err: \${it.message}") }
+        runCatching { hookFrameworkStaticLayout() }
+            .onFailure { logInfo("hookStaticLayout err: \${it.message}") }
+        runCatching { hookWebViewDomSniffer() }
+            .onFailure { logInfo("hookWebView err: \${it.message}") }
+        runCatching { hookOrgJson() }
+            .onFailure { logInfo("hookOrgJson err: \${it.message}") }
+        runCatching { hookGsonIfPresent(lpparam.classLoader) }
+            .onFailure { logInfo("hookGson err: \${it.message}") }
+        runCatching { hookRawJsonStrings() }
+            .onFailure { logInfo("hookRawStrings err: \${it.message}") }
     }
 
     private fun trackUnhook(unhook: XC_MethodHook.Unhook?) {
@@ -95,12 +104,13 @@ class QuotaHookEntry : IXposedHookLoadPackage {
     }
 
     private fun isGeminiActivity(pkg: String, activity: Activity): Boolean {
-        if (pkg == "com.google.android.apps.bard") return true
+        if (pkg != "com.google.android.googlequicksearchbox") return true
         val clsName = activity.javaClass.name.lowercase()
         val intentStr = activity.intent?.toString()?.lowercase().orEmpty()
         return clsName.contains("robin") ||
             clsName.contains("bard") ||
             clsName.contains("gemini") ||
+            clsName.contains("assistant") ||
             clsName.contains("webview") ||
             intentStr.contains("robin") ||
             intentStr.contains("bard") ||
@@ -560,13 +570,15 @@ android {
         applicationId = "com.example.bardquotahook"
         minSdk = 27
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = false
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -593,18 +605,25 @@ dependencies {
     path: 'app/proguard-rules.pro',
     label: 'app/proguard-rules.pro',
     language: 'pro',
-    descriptionZh: '保留 QuotaHookEntry 入口类，防止 R8 混淆移除。',
-    descriptionEn: 'Prevents R8 from stripping or renaming QuotaHookEntry.',
-    content: `-keep class com.example.bardquotahook.QuotaHookEntry { *; }
--keep class * implements de.robv.android.xposed.IXposedHookLoadPackage { *; }
+    descriptionZh: '保留 QuotaHookEntry 入口类及无参构造函数，防止 R8 混淆移除。',
+    descriptionEn: 'Preserves QuotaHookEntry and its public no-arg constructor during R8 single-DEX merge.',
+    content: `-keep public class com.example.bardquotahook.QuotaHookEntry {
+    public <init>();
+    *;
+}
+-keep class * implements de.robv.android.xposed.IXposedHookLoadPackage {
+    public <init>();
+    *;
+}
+-keepattributes *Annotation*,InnerClasses,Signature
 `,
   },
   {
     path: 'app/src/main/AndroidManifest.xml',
     label: 'AndroidManifest.xml',
     language: 'xml',
-    descriptionZh: 'LSPosed 模块元数据声明，关联双包作用域数组。',
-    descriptionEn: 'LSPosed module manifest metadata referencing the dual-package scope.',
+    descriptionZh: 'LSPosed 模块元数据声明（xposedminversion=82 兼容全版本 LSPosed）。',
+    descriptionEn: 'LSPosed module manifest metadata using xposedminversion=82.',
     content: `<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -620,7 +639,7 @@ dependencies {
             android:value="Gemini Usage Limits Sniffer &amp; Bilingual HUD (ZH/EN)" />
         <meta-data
             android:name="xposedminversion"
-            android:value="93" />
+            android:value="82" />
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />

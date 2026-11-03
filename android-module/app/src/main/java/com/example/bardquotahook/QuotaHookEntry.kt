@@ -7,6 +7,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.text.TextPaint
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -32,10 +33,7 @@ import kotlin.math.abs
 class QuotaHookEntry : IXposedHookLoadPackage {
 
     companion object {
-        private val TARGET_PKGS = setOf(
-            "com.google.android.apps.bard",
-            "com.google.android.googlequicksearchbox"
-        )
+        private const val TAG = "BardQuota"
         private const val OVERLAY_TAG = "bard_quota_overlay_view"
 
         private val mainHandler = Handler(Looper.getMainLooper())
@@ -58,6 +56,11 @@ class QuotaHookEntry : IXposedHookLoadPackage {
         private val FIVE_HOUR_REGEX = Regex(""".*(5\s*(-|\s)?(hour|hr|h|小时)|5h).*""", RegexOption.IGNORE_CASE)
         private val WEEKLY_REGEX = Regex(""".*(weekly|week|每周|周限额|7\s*(-|\s)?(day|天)).*""", RegexOption.IGNORE_CASE)
         private val RESET_REGEX = Regex(""".*(resets?\b|重置|恢复|available\s+(in|at)|后重置).*""", RegexOption.IGNORE_CASE)
+
+        private fun logInfo(msg: String) {
+            XposedBridge.log("[$TAG] $msg")
+            Log.i(TAG, msg)
+        }
     }
 
     enum class Lang { ZH, EN }
@@ -70,28 +73,36 @@ class QuotaHookEntry : IXposedHookLoadPackage {
     )
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        if (lpparam.packageName !in TARGET_PKGS) return
-        XposedBridge.log("[BardQuota] Loaded in pkg=${lpparam.packageName} proc=${lpparam.processName}")
+        // Log unconditionally on line 1 so LSPosed Logs ALWAYS show module injection!
+        logInfo("handleLoadPackage -> pkg=${lpparam.packageName} proc=${lpparam.processName}")
+        if (lpparam.packageName == "android") return
 
-        hookActivityLifecycle(lpparam.packageName)
-        hookFrameworkStaticLayout()
-        hookWebViewDomSniffer()
-        hookOrgJson()
-        hookGsonIfPresent(lpparam.classLoader)
-        hookRawJsonStrings()
+        runCatching { hookActivityLifecycle(lpparam.packageName) }
+            .onFailure { logInfo("hookActivityLifecycle err: ${it.message}") }
+        runCatching { hookFrameworkStaticLayout() }
+            .onFailure { logInfo("hookStaticLayout err: ${it.message}") }
+        runCatching { hookWebViewDomSniffer() }
+            .onFailure { logInfo("hookWebView err: ${it.message}") }
+        runCatching { hookOrgJson() }
+            .onFailure { logInfo("hookOrgJson err: ${it.message}") }
+        runCatching { hookGsonIfPresent(lpparam.classLoader) }
+            .onFailure { logInfo("hookGson err: ${it.message}") }
+        runCatching { hookRawJsonStrings() }
+            .onFailure { logInfo("hookRawStrings err: ${it.message}") }
     }
 
     private fun trackUnhook(unhook: XC_MethodHook.Unhook?) {
         if (unhook != null) unhookRefs.add(WeakReference(unhook))
     }
 
-    private fun isGeminiActivity(pkg: String, activity: Activity): Boolean {
-        if (pkg == "com.google.android.apps.bard") return true
+    private fun shouldAttachOverlay(pkg: String, activity: Activity): Boolean {
+        if (pkg != "com.google.android.googlequicksearchbox") return true
         val clsName = activity.javaClass.name.lowercase()
         val intentStr = activity.intent?.toString()?.lowercase().orEmpty()
         return clsName.contains("robin") ||
             clsName.contains("bard") ||
             clsName.contains("gemini") ||
+            clsName.contains("assistant") ||
             clsName.contains("webview") ||
             intentStr.contains("robin") ||
             intentStr.contains("bard") ||
@@ -106,7 +117,8 @@ class QuotaHookEntry : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val activity = param.thisObject as? Activity ?: return
-                        if (isGeminiActivity(pkg, activity)) {
+                        logInfo("onResume: ${activity.javaClass.name} in $pkg")
+                        if (shouldAttachOverlay(pkg, activity)) {
                             activeActivityRef.set(WeakReference(activity))
                             attachOrUpdateOverlay()
                             scheduleWebViewPoll()
@@ -340,7 +352,7 @@ class QuotaHookEntry : IXposedHookLoadPackage {
     private fun updateSnapshot(fiveHour: String, weekly: String, reset: String, source: String) {
         val prev = latestSnapshot.get()
         if (prev.fiveHourQuota == fiveHour && prev.weeklyLimit == weekly && prev.resetTimer == reset) return
-        XposedBridge.log("[BardQuota][$source] 5h=$fiveHour | week=$weekly | reset=$reset")
+        logInfo("[$source] 5h=$fiveHour | week=$weekly | reset=$reset")
         latestSnapshot.set(QuotaSnapshot(fiveHour, weekly, reset, source))
         attachOrUpdateOverlay()
     }
