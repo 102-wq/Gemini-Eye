@@ -3,8 +3,11 @@ package com.example.bardquotahook
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.database.ContentObserver
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -25,6 +28,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.util.Locale
 
 class MainActivity : Activity() {
 
@@ -56,11 +60,24 @@ class MainActivity : Activity() {
     private var launchGeminiBtn: Button? = null
 
     private val uiHandler = Handler(Looper.getMainLooper())
+    private var stateObserver: ContentObserver? = null
     private var webExpanded = false
     private var bardInstalled = false
     private var gsaInstalled = false
 
     private fun dp(v: Float): Int = QuotaHudView.dp(this, v)
+
+    private fun localizedContext(lang: QuotaHudView.Lang): Context {
+        return try {
+            val locale = if (lang == QuotaHudView.Lang.ZH) Locale.SIMPLIFIED_CHINESE else Locale.ENGLISH
+            val cfg = Configuration(resources.configuration).apply {
+                setLocale(locale)
+            }
+            createConfigurationContext(cfg)
+        } catch (_: Throwable) {
+            this
+        }
+    }
 
     private fun isPkgInstalled(pkg: String): Boolean {
         return try {
@@ -77,7 +94,8 @@ class MainActivity : Activity() {
     }
 
     private fun pingHookedProcesses() {
-        HookTelemetryReceiver.syncStateToHostApps(this, includePing = true)
+        val st = QuotaSyncProvider.ensureLoaded(this)
+        HookTelemetryReceiver.syncStateToHostApps(this, st, includePing = true)
     }
 
     private fun launchGeminiWithFallback() {
@@ -123,127 +141,100 @@ class MainActivity : Activity() {
     }
 
     private fun refreshAllUi() {
-        val ui = HookTelemetryReceiver.loadUiPrefs(this)
-        val snap = HookTelemetryReceiver.loadSnapshot(this)
-        val zh = ui.lang == QuotaHudView.Lang.ZH
+        val state = QuotaSyncProvider.ensureLoaded(this)
+        val snap = state.snapshot.sanitized()
+        val zh = state.lang == QuotaHudView.Lang.ZH
+        val loc = localizedContext(state.lang)
 
-        // Enforce Single-HUD Exclusion immediately if Xposed bound
-        if (ui.xposedBound && OverlayHudController.isShowing) {
+        if (state.isActivelyBound && OverlayHudController.isShowing) {
             OverlayHudController.enforceSingleHudExclusivity(this)
         }
 
-        titleView?.text = if (zh) {
-            "Gemini-Eye 用量胶囊 (v1.9.0)"
-        } else {
-            "Gemini-Eye Quota HUD (v1.9.0)"
-        }
+        titleView?.text = loc.getString(R.string.settings_title)
 
-        pkgView?.text = if (zh) {
-            "宿主检测 · Gemini: ${if (bardInstalled) "已安装" else "未安装"} | Google: ${if (gsaInstalled) "已安装" else "未安装"} | API 102 + 82"
-        } else {
-            "Targets · Gemini: ${if (bardInstalled) "Installed" else "Missing"} | Google: ${if (gsaInstalled) "Installed" else "Missing"} | API 102 + 82"
-        }
+        val installedLabel = loc.getString(R.string.settings_status_installed)
+        val missingLabel = loc.getString(R.string.settings_status_missing)
+        pkgView?.text = loc.getString(
+            R.string.settings_targets_fmt,
+            if (bardInstalled) installedLabel else missingLabel,
+            if (gsaInstalled) installedLabel else missingLabel
+        )
 
-        previewCaptionView?.text = if (zh) {
-            "实时单行胶囊预览（与 Gemini 应用内悬浮窗共享同一份 SharedPreferences 实时数值）"
-        } else {
-            "Live Single-Line Capsule Preview (Synced via SharedPreferences with In-App HUD)"
-        }
+        previewCaptionView?.text = loc.getString(R.string.settings_preview_caption)
 
-        liveCapsulePreview?.applyPreferences(ui.lang, ui.theme)
+        liveCapsulePreview?.applyPreferences(state.lang, state.theme)
         liveCapsulePreview?.updateSnapshot(snap)
 
-        settingsSectionTitle?.text = if (zh) {
-            "界面语言 (i18n) 与双主题引擎 (MIUIX / MD3)"
-        } else {
-            "Language (i18n) & Dual Theme Engine (MIUIX / MD3)"
-        }
+        settingsSectionTitle?.text = loc.getString(R.string.settings_appearance_title)
 
         langZhBtn?.apply {
-            text = "中文 (5h / 每周)"
+            text = loc.getString(R.string.settings_lang_zh)
             background = if (zh) makeBtnDrawable("#2563EB") else makeBtnDrawable("#0F172A", "#334155")
             setTextColor(if (zh) Color.WHITE else Color.parseColor("#94A3B8"))
         }
         langEnBtn?.apply {
-            text = "English (5h / Weekly)"
+            text = loc.getString(R.string.settings_lang_en)
             background = if (!zh) makeBtnDrawable("#2563EB") else makeBtnDrawable("#0F172A", "#334155")
             setTextColor(if (!zh) Color.WHITE else Color.parseColor("#94A3B8"))
         }
 
-        val isMiuix = ui.theme == QuotaHudView.ThemeMode.MIUIX
+        val isMiuix = state.theme == QuotaHudView.ThemeMode.MIUIX
         themeMiuixBtn?.apply {
-            text = if (zh) "MIUIX 毛玻璃胶囊" else "MIUIX Frosted Pill"
+            text = loc.getString(R.string.settings_theme_miuix)
             background = if (isMiuix) makeBtnDrawable("#0284C7") else makeBtnDrawable("#0F172A", "#334155")
             setTextColor(if (isMiuix) Color.WHITE else Color.parseColor("#94A3B8"))
         }
         themeMd3Btn?.apply {
-            text = if (zh) "MD3 动态取色" else "MD3 Material You"
+            text = loc.getString(R.string.settings_theme_md3)
             background = if (!isMiuix) makeBtnDrawable("#7C3AED") else makeBtnDrawable("#0F172A", "#334155")
             setTextColor(if (!isMiuix) Color.WHITE else Color.parseColor("#94A3B8"))
         }
 
-        val hookText = if (ui.xposedBound) {
-            val secAgo = maxOf(0L, (System.currentTimeMillis() - ui.lastHeartbeatMs) / 1000L)
-            if (zh) {
-                "✅ 单 HUD 互斥已激活 · 引擎: ${ui.lastBridge}\n宿主: ${ui.lastPkg} (${secAgo}s 前心跳) · 系统全局悬浮窗已自动禁用"
-            } else {
-                "✅ Single-HUD Bound · Engine: ${ui.lastBridge}\nHost: ${ui.lastPkg} (${secAgo}s ago) · System Overlay Auto-Disabled"
-            }
+        hookStatusView?.text = if (state.isActivelyBound) {
+            val secAgo = maxOf(0L, (System.currentTimeMillis() - state.lastHeartbeatMs) / 1000L)
+            loc.getString(
+                R.string.settings_hook_bound_fmt,
+                state.lastBridge.ifBlank { "Xposed" },
+                state.lastPkg.ifBlank { "com.google.android.apps.bard" },
+                secAgo
+            )
         } else {
-            if (zh) {
-                "⚠️ 暂未收到 Gemini 进程 Xposed 心跳：\n• 请在 LSPosed / Vector 中启用本模块并勾选 Gemini 与 Google，强行停止后重新打开。\n• 若使用 Shamiko / DenyList 隐藏了 Google，可临时使用下方系统悬浮窗保底。"
-            } else {
-                "⚠️ Waiting for Gemini Xposed heartbeat:\n• Enable Gemini-Eye in LSPosed / Vector for Gemini & Google, then force-stop Gemini.\n• If Magisk DenyList blocks Xposed, you may use the fallback System Overlay below."
-            }
+            loc.getString(R.string.settings_hook_waiting)
         }
-        hookStatusView?.text = hookText
 
-        val wkLabel = if (zh) "每周" else "Weekly"
+        val label5h = loc.getString(R.string.hud_label_5h)
+        val labelWk = loc.getString(R.string.hud_label_weekly)
         quotaPreviewView?.text =
-            "5h: ${snap.formatFiveHourDisplay()}   |   $wkLabel: ${snap.formatWeeklyDisplay()}   [${snap.source}]"
+            "$label5h: ${snap.formatFiveHourDisplay()}   |   $labelWk: ${snap.formatWeeklyDisplay()}   [${snap.source}]"
 
-        pingBtn?.text = if (zh) {
-            "立即刷新额度并同步至宿主 HUD"
-        } else {
-            "Sync Quota & Push to Host HUD Now"
-        }
-
-        syncDescView?.text = if (zh) {
-            "内置 gemini.google.com/usage 实时同步：登录一次 Google 账号后，点击胶囊右侧「↻ 刷新图标」即可在后台静默拉取最新 5h 百分比、每周百分比及各自重置倒计时。"
-        } else {
-            "Built-in gemini.google.com/usage Sync: Sign in once below so tapping the HUD's Refresh icon (↻) silently fetches live 5h %, Weekly %, and reset countdowns in the background."
-        }
-
+        pingBtn?.text = loc.getString(R.string.settings_sync_now)
+        syncDescView?.text = loc.getString(R.string.settings_sync_desc)
         syncWebBtn?.text = if (webExpanded) {
-            if (zh) "重新加载 gemini.google.com/usage 并提取最新数值" else "Reload gemini.google.com/usage & Extract Quota"
+            loc.getString(R.string.settings_reload_web_sync)
         } else {
-            if (zh) "展开内置用量网页登录同步 (gemini.google.com/usage)" else "Open Embedded Login & Sync (gemini.google.com/usage)"
+            loc.getString(R.string.settings_open_web_sync)
         }
 
         val overlayOn = OverlayHudController.isShowing
         overlayToggleBtn?.apply {
-            if (ui.xposedBound) {
+            if (state.isActivelyBound) {
                 isEnabled = false
-                text = if (zh) {
-                    "单 HUD 独占模式生效中 (已由 Xposed 应用内胶囊接管)"
-                } else {
-                    "Single-HUD Exclusive Active (Managed by In-App Xposed HUD)"
-                }
+                text = loc.getString(R.string.settings_overlay_exclusive)
                 background = makeBtnDrawable("#1E293B", "#334155")
                 setTextColor(Color.parseColor("#94A3B8"))
             } else {
                 isEnabled = true
                 setTextColor(Color.WHITE)
                 text = if (overlayOn) {
-                    if (zh) "关闭系统全局悬浮胶囊 (运行中)" else "Disable System Overlay HUD (Running)"
+                    loc.getString(R.string.settings_overlay_disable)
                 } else {
-                    if (zh) "开启免 Hook 系统悬浮胶囊 (仅未注入时可用)" else "Enable Fallback System Overlay (When Unhooked)"
+                    loc.getString(R.string.settings_overlay_enable)
                 }
                 background = makeBtnDrawable(if (overlayOn) "#059669" else "#334155")
             }
         }
 
-        launchGeminiBtn?.text = if (zh) "启动 Gemini 应用" else "Launch Gemini App"
+        launchGeminiBtn?.text = loc.getString(R.string.settings_launch_gemini)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -262,8 +253,11 @@ class MainActivity : Activity() {
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {
-                                extractFromEmbeddedWebView(900L)
-                                extractFromEmbeddedWebView(2600L)
+                                val currentUrl = url.orEmpty().lowercase()
+                                if (currentUrl.contains("gemini.google.com/usage")) {
+                                    extractFromEmbeddedWebView(900L)
+                                    extractFromEmbeddedWebView(2600L)
+                                }
                             }
                         }
                     }
@@ -292,6 +286,8 @@ class MainActivity : Activity() {
             val wv = embeddedWebView ?: return@r
             if (isFinishing || isDestroyed) return@r
             try {
+                val activeUrl = wv.url.orEmpty().lowercase()
+                if (!activeUrl.contains("gemini.google.com/usage")) return@r
                 wv.evaluateJavascript(
                     "(function(){return document.body ? document.body.innerText : '';})()"
                 ) { raw ->
@@ -300,10 +296,15 @@ class MainActivity : Activity() {
                             val text = raw.trim('"')
                                 .replace("\\n", "\n")
                                 .replace("\\\"", "\"")
-                            val prev = HookTelemetryReceiver.loadSnapshot(this@MainActivity)
-                            val snap = QuotaTextParser.parseUiBlock(text, prev, "UsageWeb")
+                            val prev = QuotaSyncProvider.ensureLoaded(this@MainActivity).snapshot.sanitized()
+                            val snap = QuotaTextParser.parseUiBlock(
+                                block = text,
+                                prev = prev,
+                                source = "UsageWeb",
+                                requireUsageStructure = true
+                            )
                             if (snap != null) {
-                                HookTelemetryReceiver.pushExternalQuotaToHostApps(this@MainActivity, snap)
+                                QuotaSyncProvider.publishQuota(this@MainActivity, snap)
                                 refreshAllUi()
                             }
                         }
@@ -384,7 +385,7 @@ class MainActivity : Activity() {
         previewCard.addView(previewCap)
         previewCard.addView(hudPreview)
 
-        // 1. Dual Language (i18n) & Dual Theme Engine (MIUIX vs MD3) Card
+        // 1. Localized Language (EN/CN) & Dual Theme Engine (MIUIX vs MD3) Card
         val prefCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeCardDrawable("#1E293B", "#334155")
@@ -418,7 +419,7 @@ class MainActivity : Activity() {
                 marginEnd = dp(5f)
             }
             setOnClickListener {
-                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, lang = QuotaHudView.Lang.ZH)
+                QuotaSyncProvider.updatePreferences(this@MainActivity, lang = QuotaHudView.Lang.ZH)
                 refreshAllUi()
             }
         }
@@ -431,7 +432,7 @@ class MainActivity : Activity() {
                 marginStart = dp(5f)
             }
             setOnClickListener {
-                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, lang = QuotaHudView.Lang.EN)
+                QuotaSyncProvider.updatePreferences(this@MainActivity, lang = QuotaHudView.Lang.EN)
                 refreshAllUi()
             }
         }
@@ -458,7 +459,7 @@ class MainActivity : Activity() {
                 marginEnd = dp(5f)
             }
             setOnClickListener {
-                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, theme = QuotaHudView.ThemeMode.MIUIX)
+                QuotaSyncProvider.updatePreferences(this@MainActivity, theme = QuotaHudView.ThemeMode.MIUIX)
                 refreshAllUi()
             }
         }
@@ -471,7 +472,7 @@ class MainActivity : Activity() {
                 marginStart = dp(5f)
             }
             setOnClickListener {
-                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, theme = QuotaHudView.ThemeMode.MD3)
+                QuotaSyncProvider.updatePreferences(this@MainActivity, theme = QuotaHudView.ThemeMode.MD3)
                 refreshAllUi()
             }
         }
@@ -484,7 +485,7 @@ class MainActivity : Activity() {
         prefCard.addView(langRow)
         prefCard.addView(themeRow)
 
-        // 2. Live Hook & Shared Quota Telemetry Card
+        // 2. Live Hook & Unified Quota Store Telemetry Card
         val diagCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeCardDrawable("#1E293B", "#334155")
@@ -594,7 +595,7 @@ class MainActivity : Activity() {
             }
             setPadding(dp(12f), dp(12f), dp(12f), dp(12f))
             setOnClickListener {
-                if (HookTelemetryReceiver.isXposedActivelyBound(this@MainActivity)) {
+                if (QuotaSyncProvider.ensureLoaded(this@MainActivity).isActivelyBound) {
                     OverlayHudController.enforceSingleHudExclusivity(this@MainActivity)
                     refreshAllUi()
                     return@setOnClickListener
@@ -648,6 +649,9 @@ class MainActivity : Activity() {
         HookTelemetryReceiver.setUiListener {
             runOnUiThread { refreshAllUi() }
         }
+        stateObserver = QuotaSyncProvider.registerStateObserver(this) {
+            runOnUiThread { refreshAllUi() }
+        }
         pingHookedProcesses()
         refreshAllUi()
     }
@@ -660,6 +664,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         HookTelemetryReceiver.setUiListener(null)
+        QuotaSyncProvider.unregisterStateObserver(this, stateObserver)
+        stateObserver = null
         embeddedWebView?.let { wv ->
             runCatching {
                 wv.stopLoading()

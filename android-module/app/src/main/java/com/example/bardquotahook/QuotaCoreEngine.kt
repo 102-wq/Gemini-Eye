@@ -7,13 +7,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.database.ContentObserver
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.BoringLayout
-import android.text.StaticLayout
-import android.text.TextPaint
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -21,15 +19,11 @@ import android.view.ViewGroup
 import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.TextView
-import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
-import java.io.BufferedReader
 import java.lang.ref.WeakReference
 import java.lang.reflect.Executable
-import java.nio.ByteBuffer
-import java.nio.CharBuffer
-import java.nio.charset.CharsetDecoder
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
@@ -38,9 +32,8 @@ import java.util.concurrent.atomic.AtomicReference
  * - `ModernQuotaModule` (`io.github.libxposed.api.XposedModule`, API 102)
  * - `QuotaHookEntry` (`de.robv.android.xposed.IXposedHookLoadPackage`, API 82)
  *
- * Mounts the single in-app `QuotaHudView` capsule inside Gemini, enforces Single-HUD Exclusion
- * via `ACTION_HOOK_HEARTBEAT`, and synchronizes quota + i18n (`ZH`/`EN`) + Theme (`MIUIX`/`MD3`)
- * with `SharedPreferences` across both HUD and Settings app.
+ * Connected directly to the single authoritative `QuotaSyncProvider` (`content://com.example.bardquotahook.provider`)
+ * so the in-app Gemini `QuotaHudView` and the module's HUD always display 100% identical real-time values.
  */
 object QuotaCoreEngine {
 
@@ -65,7 +58,9 @@ object QuotaCoreEngine {
 
     private val installedGuard = AtomicBoolean(false)
     private val receiverRegistered = AtomicBoolean(false)
+    private val observerRegistered = AtomicBoolean(false)
     private val lifecycleRegistered = AtomicBoolean(false)
+
     private val latestSnapshot = AtomicReference(QuotaHudView.Snapshot())
     private val currentLang = AtomicReference(QuotaHudView.Lang.ZH)
     private val currentTheme = AtomicReference(QuotaHudView.ThemeMode.MIUIX)
@@ -74,19 +69,18 @@ object QuotaCoreEngine {
     private val activeActivityRef = AtomicReference<WeakReference<Activity>>(WeakReference(null))
     private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
 
+    private val ipcExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "bard-quota-sync").apply { isDaemon = true }
+    }
+
     @Volatile private var appContext: Context? = null
     @Volatile private var mainHandler: Handler? = null
+    @Volatile private var providerObserver: ContentObserver? = null
     @Volatile private var hostPackageName: String = ""
     @Volatile private var hostProcessName: String = ""
     @Volatile private var activeBridgeName: String = ""
     @Volatile private var isModernApi102Bridge: Boolean = false
     @Volatile private var lastHeartbeatMs: Long = 0L
-    @Volatile private var remotePrefsRef: SharedPreferences? = null
-
-    private val remotePrefListener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, _ ->
-        readFromSharedPrefs(prefs, persistToHostLocal = true)
-        refreshHudOnUiThread()
-    }
 
     private val inHookGuard = object : ThreadLocal<Boolean>() {
         override fun initialValue(): Boolean = false
@@ -125,7 +119,6 @@ object QuotaCoreEngine {
             packageName.contains("gemini", ignoreCase = true)
         if (!isTarget) return
 
-        // Mutual exclusion: ensure only one engine installs per process
         if (!installedGuard.compareAndSet(false, true)) return
 
         hostPackageName = packageName
@@ -135,29 +128,14 @@ object QuotaCoreEngine {
 
         safeLog(bridge, "Installing [${bridge.bridgeName}] into pkg=$packageName proc=$processName")
 
-        // 0. Bind LibXposed API 102 Remote SharedPreferences if supported by framework
-        try {
-            val rPrefs = bridge.openRemotePreferences(QuotaTextParser.PREFS_NAME)
-            if (rPrefs != null) {
-                remotePrefsRef = rPrefs
-                readFromSharedPrefs(rPrefs, persistToHostLocal = false)
-                rPrefs.registerOnSharedPreferenceChangeListener(remotePrefListener)
-            }
-        } catch (_: Throwable) {
-        }
-
-        // 1. Context, IPC Broadcast & Activity Lifecycle HUD Hooks
+        // 1. Application, Unified QuotaSyncProvider Observer & Activity HUD Hooks
         hookApplicationAndActivities(bridge)
 
-        // 2. UI Text & Compose Layout Sniffing
-        hookComposeAndViewLayouts(bridge, classLoader)
-
-        // 3. Embedded WebView DOM Inspection (Usage Limits page)
+        // 2. Targeted Embedded Usage WebView Inspection (gemini.google.com/usage only)
         hookWebViewDom(bridge)
 
-        // 4. ART-safe JSON & Stream Decoder Hooks
-        hookJsonPayloads(bridge)
-        hookStreamDecoders(bridge)
+        // 3. Structured JSON Quota Inspection (strict schema keys + sanitized metrics only)
+        hookStructuredJsonPayloads(bridge)
     }
 
     // =========================================================================
@@ -177,28 +155,6 @@ object QuotaCoreEngine {
             val method = clazz.getDeclaredMethod(name, *paramTypes)
             method.isAccessible = true
             bridge.hookExecutable(method, before, after)
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun hookAllMethodsByName(
-        bridge: HookBridge,
-        clazz: Class<*>?,
-        name: String,
-        before: ((thisObj: Any?, args: Array<Any?>) -> Unit)? = null,
-        after: ((thisObj: Any?, args: Array<Any?>, result: Any?) -> Unit)? = null
-    ) {
-        if (clazz == null) return
-        try {
-            for (method in clazz.declaredMethods) {
-                if (method.name == name) {
-                    try {
-                        method.isAccessible = true
-                        bridge.hookExecutable(method, before, after)
-                    } catch (_: Throwable) {
-                    }
-                }
-            }
         } catch (_: Throwable) {
         }
     }
@@ -223,7 +179,7 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // 1. Application, Broadcasts & Activity HUD Injection
+    // 1. Unified Provider Sync, Application & Activity HUD Injection
     // =========================================================================
 
     private fun hookApplicationAndActivities(bridge: HookBridge) {
@@ -246,12 +202,14 @@ object QuotaCoreEngine {
             paramTypes = emptyArray(),
             after = cb@{ thisObj, _, _ ->
                 val activity = thisObj as? Activity ?: return@cb
-                onContextCaptured(activity.applicationContext ?: activity)
+                val ctx = activity.applicationContext ?: activity
+                onContextCaptured(ctx)
                 if (shouldDisplayHudInActivity(activity)) {
                     activeActivityRef.set(WeakReference(activity))
                     attachOrUpdateOverlay(activity)
-                    scheduleScreenInspection()
-                    sendModuleHeartbeat(activity, force = false)
+                    // Always pull authoritative state from QuotaSyncProvider on resume
+                    syncHeartbeatWithProviderAsync(ctx, force = true)
+                    scheduleScreenBannerCheck()
                 }
             }
         )
@@ -267,7 +225,8 @@ object QuotaCoreEngine {
                     if (shouldDisplayHudInActivity(activity)) {
                         activeActivityRef.set(WeakReference(activity))
                         attachOrUpdateOverlay(activity)
-                        scheduleScreenInspection()
+                        syncHeartbeatWithProviderAsync(activity.applicationContext ?: activity, force = true)
+                        scheduleScreenBannerCheck()
                     }
                 }
                 override fun onActivityPaused(activity: Activity) {}
@@ -304,83 +263,184 @@ object QuotaCoreEngine {
     private fun onContextCaptured(ctx: Context) {
         if (appContext == null) {
             appContext = ctx.applicationContext ?: ctx
-            loadHostLocalMirror(appContext)
+            loadSanitizedHostMirror(appContext)
         }
         val targetCtx = appContext ?: ctx
+        registerUnifiedObserverOnce(targetCtx)
         registerReceiversOnce(targetCtx)
-        sendModuleHeartbeat(targetCtx, force = false)
+        syncHeartbeatWithProviderAsync(targetCtx, force = false)
     }
 
-    private fun loadHostLocalMirror(ctx: Context?) {
+    /**
+     * Loads and sanitizes the local host cache, immediately purging any legacy corrupted strings
+     * (such as accidentally scraped prompt/config text from earlier versions).
+     */
+    private fun loadSanitizedHostMirror(ctx: Context?) {
         if (ctx == null) return
         try {
             val prefs = ctx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-            readFromSharedPrefs(prefs, persistToHostLocal = false)
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun saveHostLocalMirror(
-        snapshot: QuotaHudView.Snapshot? = null,
-        lang: QuotaHudView.Lang? = null,
-        theme: QuotaHudView.ThemeMode? = null
-    ) {
-        val ctx = appContext ?: return
-        try {
-            val prefs = ctx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-            val editor = prefs.edit()
-            if (snapshot != null && snapshot.hasLiveData) {
-                editor.putString("five", snapshot.fiveHourQuota)
-                editor.putString("five_reset", snapshot.fiveHourReset)
-                editor.putString("week", snapshot.weeklyLimit)
-                editor.putString("week_reset", snapshot.weeklyReset)
-                editor.putString("src", snapshot.source)
-            }
-            if (lang != null) {
-                editor.putString("ui_lang", lang.code)
-            }
-            if (theme != null) {
-                editor.putString("ui_theme", theme.code)
-            }
-            editor.apply()
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun readFromSharedPrefs(prefs: SharedPreferences, persistToHostLocal: Boolean) {
-        try {
             val langCode = prefs.getString("ui_lang", null)
             val themeCode = prefs.getString("ui_theme", null)
-            val newLang = if (langCode != null) QuotaHudView.Lang.fromCode(langCode) else null
-            val newTheme = if (themeCode != null) QuotaHudView.ThemeMode.fromCode(themeCode) else null
-            if (newLang != null) currentLang.set(newLang)
-            if (newTheme != null) currentTheme.set(newTheme)
+            if (langCode != null) currentLang.set(QuotaHudView.Lang.fromCode(langCode))
+            if (themeCode != null) currentTheme.set(QuotaHudView.ThemeMode.fromCode(themeCode))
 
-            val five = prefs.getString("five", "--") ?: "--"
-            val fiveReset = prefs.getString("five_reset", null)
+            val rawFive = prefs.getString("five", "--") ?: "--"
+            val rawFiveReset = prefs.getString("five_reset", null)
                 ?: prefs.getString("reset", "--")
                 ?: "--"
-            val week = prefs.getString("week", "--") ?: "--"
-            val weekReset = prefs.getString("week_reset", "--") ?: "--"
-            val src = prefs.getString("src", "SharedPrefs") ?: "SharedPrefs"
+            val rawWeek = prefs.getString("week", "--") ?: "--"
+            val rawWeekReset = prefs.getString("week_reset", "--") ?: "--"
+            val src = prefs.getString("src", "LocalCache") ?: "LocalCache"
 
-            val candidate = QuotaHudView.Snapshot(
-                fiveHourQuota = five,
-                fiveHourReset = fiveReset,
-                weeklyLimit = week,
-                weeklyReset = weekReset,
+            val clean = QuotaHudView.Snapshot(
+                fiveHourQuota = rawFive,
+                fiveHourReset = rawFiveReset,
+                weeklyLimit = rawWeek,
+                weeklyReset = rawWeekReset,
                 source = src
-            )
-            if (candidate.hasLiveData) {
-                latestSnapshot.set(candidate)
+            ).sanitized()
+
+            if (clean.fiveHourQuota != rawFive ||
+                clean.fiveHourReset != rawFiveReset ||
+                clean.weeklyLimit != rawWeek ||
+                clean.weeklyReset != rawWeekReset
+            ) {
+                prefs.edit()
+                    .putString("five", clean.fiveHourQuota)
+                    .putString("five_reset", clean.fiveHourReset)
+                    .putString("week", clean.weeklyLimit)
+                    .putString("week_reset", clean.weeklyReset)
+                    .remove("reset")
+                    .apply()
             }
-            if (persistToHostLocal) {
-                saveHostLocalMirror(
-                    snapshot = if (candidate.hasLiveData) candidate else null,
-                    lang = newLang,
-                    theme = newTheme
+
+            if (clean.hasLiveData) {
+                latestSnapshot.set(clean)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun saveSanitizedHostMirror(
+        snapshot: QuotaHudView.Snapshot,
+        lang: QuotaHudView.Lang,
+        theme: QuotaHudView.ThemeMode
+    ) {
+        val ctx = appContext ?: return
+        val clean = snapshot.sanitized()
+        try {
+            ctx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString("five", clean.fiveHourQuota)
+                .putString("five_reset", clean.fiveHourReset)
+                .putString("week", clean.weeklyLimit)
+                .putString("week_reset", clean.weeklyReset)
+                .putString("src", clean.source)
+                .putString("ui_lang", lang.code)
+                .putString("ui_theme", theme.code)
+                .apply()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun applyUnifiedState(state: QuotaSyncProvider.UnifiedState?) {
+        if (state == null) return
+        val cleanSnap = state.snapshot.sanitized()
+        var changed = false
+
+        if (currentLang.get() != state.lang) {
+            currentLang.set(state.lang)
+            changed = true
+        }
+        if (currentTheme.get() != state.theme) {
+            currentTheme.set(state.theme)
+            changed = true
+        }
+        if (latestSnapshot.get() != cleanSnap && (cleanSnap.hasLiveData || !latestSnapshot.get().hasLiveData)) {
+            latestSnapshot.set(cleanSnap)
+            changed = true
+        }
+
+        if (changed) {
+            saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get())
+            refreshHudOnUiThread()
+        }
+    }
+
+    private fun registerUnifiedObserverOnce(ctx: Context) {
+        if (!observerRegistered.compareAndSet(false, true)) return
+        providerObserver = QuotaSyncProvider.registerStateObserver(ctx) {
+            pullFromUnifiedProviderAsync(ctx)
+        }
+    }
+
+    private fun pullFromUnifiedProviderAsync(ctx: Context, delayMs: Long = 0L) {
+        val runPull = {
+            try {
+                ipcExecutor.execute {
+                    try {
+                        val state = QuotaSyncProvider.readUnifiedState(ctx)
+                        applyUnifiedState(state)
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        if (delayMs > 0L) {
+            postToMain(delayMs = delayMs) { runPull() }
+        } else {
+            runPull()
+        }
+    }
+
+    private fun syncHeartbeatWithProviderAsync(ctx: Context, force: Boolean) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastHeartbeatMs < 6_000L) return
+        lastHeartbeatMs = now
+
+        try {
+            ipcExecutor.execute {
+                val localSnap = latestSnapshot.get().sanitized()
+                val state = QuotaSyncProvider.sendHeartbeatAndFetchState(
+                    context = ctx,
+                    pkg = hostPackageName,
+                    proc = hostProcessName,
+                    bridge = activeBridgeName,
+                    isApi102 = isModernApi102Bridge,
+                    localSnapshot = localSnap
                 )
+                if (state != null) {
+                    applyUnifiedState(state)
+                } else {
+                    // Fallback broadcast if ContentProvider is temporarily starting up
+                    sendFallbackHeartbeatBroadcast(ctx, localSnap)
+                }
             }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun sendFallbackHeartbeatBroadcast(ctx: Context, snap: QuotaHudView.Snapshot) {
+        try {
+            val clean = snap.sanitized()
+            val hb = Intent(QuotaTextParser.ACTION_HOOK_HEARTBEAT).apply {
+                setClassName(
+                    QuotaSyncProvider.MODULE_PACKAGE,
+                    "com.example.bardquotahook.HookTelemetryReceiver"
+                )
+                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                putExtra("pkg", hostPackageName)
+                putExtra("proc", hostProcessName)
+                putExtra("bridge", activeBridgeName)
+                putExtra("api_102", isModernApi102Bridge)
+                putExtra("five", clean.fiveHourQuota)
+                putExtra("five_reset", clean.fiveHourReset)
+                putExtra("week", clean.weeklyLimit)
+                putExtra("week_reset", clean.weeklyReset)
+                putExtra("src", clean.source)
+            }
+            ctx.sendBroadcast(hb)
         } catch (_: Throwable) {
         }
     }
@@ -416,24 +476,27 @@ object QuotaCoreEngine {
                     }
 
                     if (intent.getBooleanExtra("ping", false) && context != null) {
-                        sendModuleHeartbeat(context, force = true)
+                        syncHeartbeatWithProviderAsync(context, force = true)
                     }
 
-                    val five = intent.getStringExtra("five")
-                    val fiveReset = intent.getStringExtra("five_reset")
-                        ?: intent.getStringExtra("reset")
-                    val week = intent.getStringExtra("week")
-                    val weekReset = intent.getStringExtra("week_reset")
-                    val src = intent.getStringExtra("src")
+                    val incoming = QuotaHudView.Snapshot(
+                        fiveHourQuota = intent.getStringExtra("five") ?: "--",
+                        fiveHourReset = intent.getStringExtra("five_reset")
+                            ?: intent.getStringExtra("reset")
+                            ?: "--",
+                        weeklyLimit = intent.getStringExtra("week") ?: "--",
+                        weeklyReset = intent.getStringExtra("week_reset") ?: "--",
+                        source = intent.getStringExtra("src") ?: "Sync"
+                    ).sanitized()
 
-                    val prev = latestSnapshot.get()
+                    val prev = latestSnapshot.get().sanitized()
                     val merged = QuotaHudView.Snapshot(
-                        fiveHourQuota = if (!five.isNullOrBlank() && five != "--") five else prev.fiveHourQuota,
-                        fiveHourReset = if (!fiveReset.isNullOrBlank() && fiveReset != "--") fiveReset else prev.fiveHourReset,
-                        weeklyLimit = if (!week.isNullOrBlank() && week != "--") week else prev.weeklyLimit,
-                        weeklyReset = if (!weekReset.isNullOrBlank() && weekReset != "--") weekReset else prev.weeklyReset,
-                        source = src ?: prev.source
-                    )
+                        fiveHourQuota = if (incoming.fiveHourQuota != "--") incoming.fiveHourQuota else prev.fiveHourQuota,
+                        fiveHourReset = if (incoming.fiveHourReset != "--") incoming.fiveHourReset else prev.fiveHourReset,
+                        weeklyLimit = if (incoming.weeklyLimit != "--") incoming.weeklyLimit else prev.weeklyLimit,
+                        weeklyReset = if (incoming.weeklyReset != "--") incoming.weeklyReset else prev.weeklyReset,
+                        source = incoming.source
+                    ).sanitized()
 
                     if (merged.hasLiveData && merged != prev) {
                         latestSnapshot.set(merged)
@@ -441,11 +504,7 @@ object QuotaCoreEngine {
                     }
 
                     if (uiUpdated) {
-                        saveHostLocalMirror(
-                            snapshot = latestSnapshot.get(),
-                            lang = currentLang.get(),
-                            theme = currentTheme.get()
-                        )
+                        saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get())
                         refreshHudOnUiThread()
                     }
                 }
@@ -460,179 +519,29 @@ object QuotaCoreEngine {
     }
 
     /**
-     * Notifies `com.example.bardquotahook.HookTelemetryReceiver` that Xposed is actively bound
-     * to Gemini (triggering Single-HUD Exclusion to auto-disable App System Overlay) and shares
-     * live quota back to `SharedPreferences` so HUD and Settings app match identically.
-     */
-    private fun sendModuleHeartbeat(ctx: Context, force: Boolean) {
-        val now = System.currentTimeMillis()
-        if (!force && now - lastHeartbeatMs < 8_000L) return
-        lastHeartbeatMs = now
-
-        try {
-            val snap = latestSnapshot.get()
-            val hb = Intent(QuotaTextParser.ACTION_HOOK_HEARTBEAT).apply {
-                setClassName(
-                    "com.example.bardquotahook",
-                    "com.example.bardquotahook.HookTelemetryReceiver"
-                )
-                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                putExtra("pkg", hostPackageName)
-                putExtra("proc", hostProcessName)
-                putExtra("bridge", activeBridgeName)
-                putExtra("api_102", isModernApi102Bridge)
-                putExtra("five", snap.fiveHourQuota)
-                putExtra("five_reset", snap.fiveHourReset)
-                putExtra("week", snap.weeklyLimit)
-                putExtra("week_reset", snap.weeklyReset)
-                putExtra("src", snap.source)
-            }
-            ctx.sendBroadcast(hb)
-        } catch (_: Throwable) {
-        }
-    }
-
-    /**
      * Triggered when user clicks the Refresh icon button on the in-app `QuotaHudView`.
-     * Scans local Views/WebViews AND triggers background `gemini.google.com/usage` API sync
-     * in `com.example.bardquotahook`.
+     * Invokes `QuotaSyncProvider.requestBackgroundRefresh` synchronously over ContentResolver
+     * and polls follow-up snapshots so the HUD updates immediately.
      */
     private fun triggerBackgroundQuotaRefresh(ctx: Context) {
-        scheduleScreenInspection()
-        scheduleWebViewPoll(120L)
+        scheduleScreenBannerCheck()
+        scheduleWebViewPoll(150L)
+
         try {
-            val req = Intent(QuotaTextParser.ACTION_REQUEST_QUOTA_REFRESH).apply {
-                setClassName(
-                    "com.example.bardquotahook",
-                    "com.example.bardquotahook.HookTelemetryReceiver"
-                )
-                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                putExtra("requester_pkg", hostPackageName)
+            ipcExecutor.execute {
+                QuotaSyncProvider.requestBackgroundRefresh(ctx, hostPackageName)
             }
-            ctx.sendBroadcast(req)
         } catch (_: Throwable) {
         }
+
+        // Follow-up state pulls in case OEM battery saver throttles ContentObserver broadcasts
+        pullFromUnifiedProviderAsync(ctx, delayMs = 1600L)
+        pullFromUnifiedProviderAsync(ctx, delayMs = 3600L)
     }
 
     // =========================================================================
-    // 2. UI Layout & Compose Canvas Text Sniffing
+    // 2. Targeted Embedded Usage WebView & Structured JSON Inspection
     // =========================================================================
-
-    private fun hookComposeAndViewLayouts(bridge: HookBridge, classLoader: ClassLoader?) {
-        hookAllMethodsByName(
-            bridge = bridge,
-            clazz = BoringLayout::class.java,
-            name = "isBoring",
-            before = cb@{ _, args ->
-                val cs = args.firstOrNull() as? CharSequence ?: return@cb
-                if (cs.length !in 2..200) return@cb
-                val str = cs.toString()
-                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb
-                withReentrancyGuard {
-                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), "Compose")
-                    if (snap != null) publishSnapshot(snap)
-                }
-            }
-        )
-
-        val staticBuilderCls = try {
-            Class.forName(
-                "android.text.StaticLayout\$Builder",
-                false,
-                classLoader ?: Activity::class.java.classLoader
-            )
-        } catch (_: Throwable) {
-            null
-        }
-        hookAllMethodsByName(
-            bridge = bridge,
-            clazz = staticBuilderCls,
-            name = "obtain",
-            before = cb@{ _, args ->
-                val cs = args.firstOrNull() as? CharSequence ?: return@cb
-                if (cs.length !in 2..280) return@cb
-                val str = cs.toString()
-                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb
-                withReentrancyGuard {
-                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), "Compose")
-                    if (snap != null) publishSnapshot(snap)
-                }
-            }
-        )
-
-        hookMethodSafe(
-            bridge = bridge,
-            clazz = StaticLayout::class.java,
-            name = "generate",
-            paramTypes = emptyArray()
-        )
-
-        // Hook TextPaint.measureText fallback for single-line Compose canvas text nodes
-        hookMethodSafe(
-            bridge = bridge,
-            clazz = TextPaint::class.java,
-            name = "getTextRunAdvances",
-            paramTypes = arrayOf(
-                CharArray::class.java,
-                Int::class.javaPrimitiveType!!,
-                Int::class.javaPrimitiveType!!,
-                Int::class.javaPrimitiveType!!,
-                Int::class.javaPrimitiveType!!,
-                Boolean::class.javaPrimitiveType!!,
-                FloatArray::class.java,
-                Int::class.javaPrimitiveType!!
-            ),
-            before = cb@{ _, args ->
-                val chars = args.getOrNull(0) as? CharArray ?: return@cb
-                val index = args.getOrNull(1) as? Int ?: 0
-                val count = args.getOrNull(2) as? Int ?: return@cb
-                if (count !in 3..140 || index < 0 || index + count > chars.size) return@cb
-                val str = String(chars, index, count)
-                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb
-                withReentrancyGuard {
-                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), "Canvas")
-                    if (snap != null) publishSnapshot(snap)
-                }
-            }
-        )
-
-        hookMethodSafe(
-            bridge = bridge,
-            clazz = TextView::class.java,
-            name = "setText",
-            paramTypes = arrayOf(CharSequence::class.java, TextView.BufferType::class.java),
-            before = cb@{ thisObj, args ->
-                val tv = thisObj as? TextView ?: return@cb
-                val tagStr = tv.tag as? String
-                if (tagStr != null && tagStr.startsWith("bard_quota_hud")) return@cb
-                val cs = args.firstOrNull() as? CharSequence ?: return@cb
-                if (cs.length !in 2..240) return@cb
-                val str = cs.toString()
-                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb
-                withReentrancyGuard {
-                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), "View")
-                    if (snap != null) publishSnapshot(snap)
-                }
-            }
-        )
-
-        hookMethodSafe(
-            bridge = bridge,
-            clazz = View::class.java,
-            name = "setContentDescription",
-            paramTypes = arrayOf(CharSequence::class.java),
-            before = cb@{ _, args ->
-                val cs = args.firstOrNull() as? CharSequence ?: return@cb
-                if (cs.length !in 3..240) return@cb
-                val str = cs.toString()
-                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb
-                withReentrancyGuard {
-                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), "A11y")
-                    if (snap != null) publishSnapshot(snap)
-                }
-            }
-        )
-    }
 
     private fun hookWebViewDom(bridge: HookBridge) {
         hookMethodSafe(
@@ -643,8 +552,8 @@ object QuotaCoreEngine {
             after = cb@{ thisObj, _, _ ->
                 val wv = thisObj as? WebView ?: return@cb
                 activeWebViewRef.set(WeakReference(wv))
-                scheduleWebViewPoll(900L)
-                scheduleWebViewPoll(2400L)
+                scheduleWebViewPoll(1000L)
+                scheduleWebViewPoll(2500L)
             }
         )
 
@@ -653,27 +562,26 @@ object QuotaCoreEngine {
             clazz = WebView::class.java,
             name = "loadUrl",
             paramTypes = arrayOf(String::class.java),
-            after = cb@{ thisObj, _, _ ->
+            after = cb@{ thisObj, args, _ ->
                 val wv = thisObj as? WebView ?: return@cb
-                activeWebViewRef.set(WeakReference(wv))
-                scheduleWebViewPoll(1500L)
-                scheduleWebViewPoll(3200L)
+                val url = (args.firstOrNull() as? String).orEmpty().lowercase()
+                if (url.contains("gemini.google.com/usage")) {
+                    activeWebViewRef.set(WeakReference(wv))
+                    scheduleWebViewPoll(1500L)
+                    scheduleWebViewPoll(3200L)
+                }
             }
         )
     }
 
-    // =========================================================================
-    // 3. ART-Safe JSON & Stream Decoding Hooks
-    // =========================================================================
-
-    private fun hookJsonPayloads(bridge: HookBridge) {
+    private fun hookStructuredJsonPayloads(bridge: HookBridge) {
         hookConstructorSafe(
             bridge = bridge,
             clazz = JSONObject::class.java,
             paramTypes = arrayOf(String::class.java)
-        ) { thisObj, args ->
-            val raw = args.firstOrNull() as? String ?: return@hookConstructorSafe
-            if (!QuotaTextParser.fastHasQuotaKeyword(raw)) return@hookConstructorSafe
+        ) ctor@{ thisObj, args ->
+            val raw = args.firstOrNull() as? String ?: return@ctor
+            if (raw.length > 65_536 || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@ctor
             withReentrancyGuard {
                 val obj = thisObj as? JSONObject ?: return@withReentrancyGuard
                 val snap = QuotaTextParser.inspectJsonObject(obj, latestSnapshot.get(), "JSONObj")
@@ -692,68 +600,18 @@ object QuotaCoreEngine {
                 if (snap != null) publishSnapshot(snap)
             }
         }
-
-        hookConstructorSafe(
-            bridge = bridge,
-            clazz = JSONArray::class.java,
-            paramTypes = arrayOf(String::class.java)
-        ) { thisObj, args ->
-            val raw = args.firstOrNull() as? String ?: return@hookConstructorSafe
-            if (!QuotaTextParser.fastHasQuotaKeyword(raw)) return@hookConstructorSafe
-            withReentrancyGuard {
-                val arr = thisObj as? JSONArray ?: return@withReentrancyGuard
-                val snap = QuotaTextParser.inspectJsonArray(arr, latestSnapshot.get(), "JSONArr")
-                if (snap != null) publishSnapshot(snap)
-            }
-        }
-    }
-
-    private fun hookStreamDecoders(bridge: HookBridge) {
-        hookMethodSafe(
-            bridge = bridge,
-            clazz = CharsetDecoder::class.java,
-            name = "decode",
-            paramTypes = arrayOf(ByteBuffer::class.java),
-            after = cb@{ _, _, result ->
-                val cb = result as? CharBuffer ?: return@cb
-                val rem = cb.remaining()
-                if (rem !in 6..262_144) return@cb
-                val str = cb.toString()
-                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb
-                withReentrancyGuard {
-                    val snap = QuotaTextParser.parseRawPayload(str, latestSnapshot.get(), "Decoder")
-                    if (snap != null) publishSnapshot(snap)
-                }
-            }
-        )
-
-        hookMethodSafe(
-            bridge = bridge,
-            clazz = BufferedReader::class.java,
-            name = "readLine",
-            paramTypes = emptyArray(),
-            after = cb@{ _, _, result ->
-                val line = result as? String ?: return@cb
-                if (!QuotaTextParser.fastHasQuotaKeyword(line)) return@cb
-                withReentrancyGuard {
-                    val snap = QuotaTextParser.parseRawPayload(line, latestSnapshot.get(), "Stream")
-                    if (snap != null) publishSnapshot(snap)
-                }
-            }
-        )
     }
 
     // =========================================================================
-    // View Tree & Embedded WebView Inspection
+    // Rate-Limit Banner & Usage WebView Inspection (Zero Chat Contamination)
     // =========================================================================
 
-    private fun scheduleScreenInspection() {
-        postToMain(delayMs = 450L) { scanActiveDecorView() }
-        postToMain(delayMs = 1600L) { scanActiveDecorView() }
+    private fun scheduleScreenBannerCheck() {
+        postToMain(delayMs = 500L) { scanForExhaustedBannerOnly() }
         scheduleWebViewPoll(1100L)
     }
 
-    private fun scanActiveDecorView() {
+    private fun scanForExhaustedBannerOnly() {
         val activity = activeActivityRef.get().get() ?: return
         if (activity.isFinishing || activity.isDestroyed) return
         val decor = activity.window?.decorView ?: return
@@ -763,7 +621,7 @@ object QuotaCoreEngine {
             val text = sb.toString()
             if (QuotaTextParser.fastHasQuotaKeyword(text)) {
                 withReentrancyGuard {
-                    val snap = QuotaTextParser.parseUiBlock(text, latestSnapshot.get(), "Screen")
+                    val snap = QuotaTextParser.parseExhaustedBannerOnly(text, latestSnapshot.get(), "Banner")
                     if (snap != null) publishSnapshot(snap)
                 }
             }
@@ -771,7 +629,7 @@ object QuotaCoreEngine {
     }
 
     private fun collectViewTexts(v: View, out: StringBuilder, depth: Int) {
-        if (depth > 18 || out.length > 8192) return
+        if (depth > 16 || out.length > 6144) return
         if (v.tag == QuotaHudView.HUD_VIEW_TAG) return
         if (v.visibility != View.VISIBLE) return
 
@@ -787,10 +645,6 @@ object QuotaCoreEngine {
                 }
             }
         }
-        val desc = v.contentDescription
-        if (!desc.isNullOrBlank() && desc.length <= 200) {
-            out.append(desc).append('\n')
-        }
         if (v is ViewGroup) {
             for (i in 0 until v.childCount) {
                 val child = v.getChildAt(i) ?: continue
@@ -804,6 +658,8 @@ object QuotaCoreEngine {
             val wv = activeWebViewRef.get().get() ?: return@postToMain
             if (!wv.isAttachedToWindow) return@postToMain
             try {
+                val currentUrl = wv.url.orEmpty().lowercase()
+                if (!currentUrl.contains("gemini.google.com/usage")) return@postToMain
                 wv.evaluateJavascript(
                     "(function(){return document.body ? document.body.innerText : '';})()"
                 ) { raw ->
@@ -815,9 +671,10 @@ object QuotaCoreEngine {
                             if (QuotaTextParser.fastHasQuotaKeyword(unquoted)) {
                                 withReentrancyGuard {
                                     val snap = QuotaTextParser.parseUiBlock(
-                                        unquoted,
-                                        latestSnapshot.get(),
-                                        "WebView"
+                                        block = unquoted,
+                                        prev = latestSnapshot.get(),
+                                        source = "WebView",
+                                        requireUsageStructure = true
                                     )
                                     if (snap != null) publishSnapshot(snap)
                                 }
@@ -836,30 +693,40 @@ object QuotaCoreEngine {
     // =========================================================================
 
     private fun publishSnapshot(snapshot: QuotaHudView.Snapshot) {
-        val current = latestSnapshot.get()
-        if (snapshot == current) return
-        latestSnapshot.set(snapshot)
-        saveHostLocalMirror(snapshot = snapshot)
+        val clean = snapshot.sanitized()
+        if (!clean.hasLiveData) return
+        val current = latestSnapshot.get().sanitized()
+        if (clean == current) return
 
-        // Sync across multi-process host (:search / :interactor -> main UI) & Gemini-Eye app
-        try {
-            val ctx = appContext
-            if (ctx != null) {
+        latestSnapshot.set(clean)
+        saveSanitizedHostMirror(clean, currentLang.get(), currentTheme.get())
+        refreshHudOnUiThread()
+
+        val ctx = appContext
+        if (ctx != null) {
+            try {
                 val sync = Intent(QuotaTextParser.ACTION_QUOTA_INTERNAL_SYNC).apply {
                     if (hostPackageName.isNotEmpty()) setPackage(hostPackageName)
-                    putExtra("five", snapshot.fiveHourQuota)
-                    putExtra("five_reset", snapshot.fiveHourReset)
-                    putExtra("week", snapshot.weeklyLimit)
-                    putExtra("week_reset", snapshot.weeklyReset)
-                    putExtra("src", snapshot.source)
+                    putExtra("five", clean.fiveHourQuota)
+                    putExtra("five_reset", clean.fiveHourReset)
+                    putExtra("week", clean.weeklyLimit)
+                    putExtra("week_reset", clean.weeklyReset)
+                    putExtra("src", clean.source)
                 }
                 ctx.sendBroadcast(sync)
-                sendModuleHeartbeat(ctx, force = true)
+            } catch (_: Throwable) {
             }
-        } catch (_: Throwable) {
-        }
 
-        refreshHudOnUiThread()
+            try {
+                ipcExecutor.execute {
+                    val merged = QuotaSyncProvider.publishQuota(ctx, clean)
+                    if (merged != null) {
+                        applyUnifiedState(merged)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     private fun postToMain(delayMs: Long = 0L, action: () -> Unit) {
@@ -888,7 +755,7 @@ object QuotaCoreEngine {
             val hud = activeHudRef.get().get()
             if (hud != null && hud.isAttachedToWindow) {
                 hud.applyPreferences(currentLang.get(), currentTheme.get())
-                hud.updateSnapshot(latestSnapshot.get())
+                hud.updateSnapshot(latestSnapshot.get().sanitized())
             } else {
                 val act = activeActivityRef.get().get()
                 if (act != null && !act.isFinishing && !act.isDestroyed) {
@@ -908,7 +775,7 @@ object QuotaCoreEngine {
                 hud = QuotaHudView(
                     context = activity,
                     onRefreshClick = {
-                        triggerBackgroundQuotaRefresh(activity)
+                        triggerBackgroundQuotaRefresh(activity.applicationContext ?: activity)
                     },
                     onOpenUsageClick = {
                         QuotaHudView.openUsageWebpage(activity)
@@ -928,7 +795,7 @@ object QuotaCoreEngine {
             }
 
             hud.applyPreferences(currentLang.get(), currentTheme.get())
-            hud.updateSnapshot(latestSnapshot.get())
+            hud.updateSnapshot(latestSnapshot.get().sanitized())
             hud.bringToFront()
             activeHudRef.set(WeakReference(hud))
         }

@@ -18,13 +18,14 @@
     <application
         android:label="@string/app_name"
         android:description="@string/module_description"
+        android:forceQueryable="true"
         android:usesCleartextTraffic="false"
         android:hasCode="true">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|uiMode">
+            android:configChanges="orientation|screenSize|uiMode|locale|layoutDirection">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -32,6 +33,12 @@
                 <category android:name="io.github.libxposed.category.MODULE_SETTINGS" />
             </intent-filter>
         </activity>
+
+        <!-- Single Authoritative Cross-Process Unified Quota & Preference Store -->
+        <provider
+            android:name=".QuotaSyncProvider"
+            android:authorities="com.example.bardquotahook.provider"
+            android:exported="true" />
 
         <receiver
             android:name=".HookTelemetryReceiver"

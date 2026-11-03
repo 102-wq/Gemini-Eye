@@ -6,6 +6,10 @@ import android.content.Intent
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicReference
 
+/**
+ * Broadcast bridge that delegates all state reads and writes to the single authoritative
+ * `QuotaSyncProvider` store so every HUD view and Settings screen stays 100% identical.
+ */
 class HookTelemetryReceiver : BroadcastReceiver() {
 
     data class AppUiPrefs(
@@ -19,9 +23,6 @@ class HookTelemetryReceiver : BroadcastReceiver() {
     )
 
     companion object {
-        // Consider Xposed actively bound if Gemini sent a heartbeat within the current session window
-        private const val ACTIVE_HOOK_WINDOW_MS = 12 * 60 * 60 * 1000L
-
         private val uiListenerRef = AtomicReference<WeakReference<() -> Unit>>(WeakReference(null))
 
         fun setUiListener(listener: (() -> Unit)?) {
@@ -33,29 +34,20 @@ class HookTelemetryReceiver : BroadcastReceiver() {
         }
 
         fun isXposedActivelyBound(context: Context): Boolean {
-            return try {
-                val prefs = context.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-                val boundFlag = prefs.getBoolean("xposed_bound", false)
-                val lastHb = prefs.getLong("last_hb_ms", 0L)
-                boundFlag && lastHb > 0L && (System.currentTimeMillis() - lastHb) in 0L..ACTIVE_HOOK_WINDOW_MS
-            } catch (_: Throwable) {
-                false
-            }
+            return QuotaSyncProvider.ensureLoaded(context).isActivelyBound
         }
 
         fun loadUiPrefs(context: Context): AppUiPrefs {
             return try {
-                val prefs = context.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-                val lastHb = prefs.getLong("last_hb_ms", 0L)
-                val active = isXposedActivelyBound(context)
+                val st = QuotaSyncProvider.ensureLoaded(context)
                 AppUiPrefs(
-                    lang = QuotaHudView.Lang.fromCode(prefs.getString("ui_lang", "ZH")),
-                    theme = QuotaHudView.ThemeMode.fromCode(prefs.getString("ui_theme", "MIUIX")),
-                    xposedBound = active,
-                    isApi102 = prefs.getBoolean("api_102_bound", false),
-                    lastHeartbeatMs = lastHb,
-                    lastPkg = prefs.getString("last_pkg", "") ?: "",
-                    lastBridge = prefs.getString("last_bridge", "") ?: ""
+                    lang = st.lang,
+                    theme = st.theme,
+                    xposedBound = st.isActivelyBound,
+                    isApi102 = st.isApi102,
+                    lastHeartbeatMs = st.lastHeartbeatMs,
+                    lastPkg = st.lastPkg,
+                    lastBridge = st.lastBridge
                 )
             } catch (_: Throwable) {
                 AppUiPrefs()
@@ -67,88 +59,32 @@ class HookTelemetryReceiver : BroadcastReceiver() {
             lang: QuotaHudView.Lang? = null,
             theme: QuotaHudView.ThemeMode? = null
         ) {
-            try {
-                val prefs = context.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-                val editor = prefs.edit()
-                if (lang != null) editor.putString("ui_lang", lang.code)
-                if (theme != null) editor.putString("ui_theme", theme.code)
-                editor.apply()
-            } catch (_: Throwable) {
-            }
-            OverlayHudController.applySavedPreferences(context)
-            syncStateToHostApps(context, includePing = false)
-            notifyUiListeners()
-        }
-
-        fun saveSnapshot(
-            context: Context,
-            snapshot: QuotaHudView.Snapshot,
-            pkg: String? = null,
-            proc: String? = null,
-            bridge: String? = null,
-            isApi102: Boolean? = null
-        ) {
-            try {
-                val prefs = context.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-                val editor = prefs.edit()
-                if (pkg != null) {
-                    editor.putString("last_pkg", pkg)
-                    editor.putLong("last_hb_ms", System.currentTimeMillis())
-                    editor.putBoolean("xposed_bound", true)
-                    editor.putBoolean("overlay_enabled", false)
-                }
-                if (proc != null) editor.putString("last_proc", proc)
-                if (bridge != null) editor.putString("last_bridge", bridge)
-                if (isApi102 != null) editor.putBoolean("api_102_bound", isApi102)
-
-                if (snapshot.hasLiveData) {
-                    if (snapshot.fiveHourQuota != "--") {
-                        editor.putString("five", snapshot.fiveHourQuota)
-                    }
-                    if (snapshot.fiveHourReset != "--") {
-                        editor.putString("five_reset", snapshot.fiveHourReset)
-                    }
-                    if (snapshot.weeklyLimit != "--") {
-                        editor.putString("week", snapshot.weeklyLimit)
-                    }
-                    if (snapshot.weeklyReset != "--") {
-                        editor.putString("week_reset", snapshot.weeklyReset)
-                    }
-                    editor.putString("src", snapshot.source)
-                    editor.putLong("last_quota_ms", System.currentTimeMillis())
-                }
-                editor.apply()
-            } catch (_: Throwable) {
-            }
+            QuotaSyncProvider.updatePreferences(
+                context = context,
+                lang = lang,
+                theme = theme
+            )
         }
 
         fun loadSnapshot(context: Context): QuotaHudView.Snapshot {
             return try {
-                val prefs = context.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-                QuotaHudView.Snapshot(
-                    fiveHourQuota = prefs.getString("five", "--") ?: "--",
-                    fiveHourReset = prefs.getString("five_reset", null)
-                        ?: prefs.getString("reset", "--")
-                        ?: "--",
-                    weeklyLimit = prefs.getString("week", "--") ?: "--",
-                    weeklyReset = prefs.getString("week_reset", "--") ?: "--",
-                    source = prefs.getString("src", "SharedPrefs") ?: "SharedPrefs"
-                )
+                QuotaSyncProvider.ensureLoaded(context).snapshot.sanitized()
             } catch (_: Throwable) {
                 QuotaHudView.Snapshot()
             }
         }
 
         fun pushExternalQuotaToHostApps(context: Context, snapshot: QuotaHudView.Snapshot) {
-            saveSnapshot(context, snapshot)
-            OverlayHudController.updateSnapshot(context, loadSnapshot(context))
-            syncStateToHostApps(context, includePing = false)
-            notifyUiListeners()
+            QuotaSyncProvider.publishQuota(context, snapshot.sanitized())
         }
 
-        fun syncStateToHostApps(context: Context, includePing: Boolean) {
-            val snap = loadSnapshot(context)
-            val ui = loadUiPrefs(context)
+        fun syncStateToHostApps(
+            context: Context,
+            state: QuotaSyncProvider.UnifiedState? = null,
+            includePing: Boolean = false
+        ) {
+            val st = state ?: QuotaSyncProvider.ensureLoaded(context)
+            val snap = st.snapshot.sanitized()
             val targets = arrayOf(
                 "com.google.android.apps.bard",
                 "com.google.android.googlequicksearchbox"
@@ -162,8 +98,8 @@ class HookTelemetryReceiver : BroadcastReceiver() {
                         putExtra("week", snap.weeklyLimit)
                         putExtra("week_reset", snap.weeklyReset)
                         putExtra("src", snap.source)
-                        putExtra("ui_lang", ui.lang.code)
-                        putExtra("ui_theme", ui.theme.code)
+                        putExtra("ui_lang", st.lang.code)
+                        putExtra("ui_theme", st.theme.code)
                         if (includePing) putExtra("ping", true)
                     }
                     context.sendBroadcast(intent)
@@ -175,6 +111,7 @@ class HookTelemetryReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context?, intent: Intent?) {
         if (context == null || intent == null) return
+        val appCtx = context.applicationContext ?: context
         val act = intent.action ?: return
 
         try {
@@ -184,41 +121,33 @@ class HookTelemetryReceiver : BroadcastReceiver() {
                     val proc = intent.getStringExtra("proc") ?: ""
                     val bridge = intent.getStringExtra("bridge") ?: "Xposed"
                     val isApi102 = intent.getBooleanExtra("api_102", false)
-                    val five = intent.getStringExtra("five") ?: "--"
-                    val fiveReset = intent.getStringExtra("five_reset")
-                        ?: intent.getStringExtra("reset")
-                        ?: "--"
-                    val week = intent.getStringExtra("week") ?: "--"
-                    val weekReset = intent.getStringExtra("week_reset") ?: "--"
-                    val src = intent.getStringExtra("src") ?: "Hook"
-
                     val incoming = QuotaHudView.Snapshot(
-                        fiveHourQuota = five,
-                        fiveHourReset = fiveReset,
-                        weeklyLimit = week,
-                        weeklyReset = weekReset,
-                        source = src
-                    )
-                    saveSnapshot(
-                        context = context,
-                        snapshot = incoming,
+                        fiveHourQuota = intent.getStringExtra("five") ?: "--",
+                        fiveHourReset = intent.getStringExtra("five_reset")
+                            ?: intent.getStringExtra("reset")
+                            ?: "--",
+                        weeklyLimit = intent.getStringExtra("week") ?: "--",
+                        weeklyReset = intent.getStringExtra("week_reset") ?: "--",
+                        source = intent.getStringExtra("src") ?: "Hook"
+                    ).sanitized()
+
+                    val updated = QuotaSyncProvider.mutateLocalStore(
+                        appCtx = appCtx,
+                        incomingSnapshot = if (incoming.hasLiveData) incoming else null,
                         pkg = pkg,
                         proc = proc,
                         bridge = bridge,
-                        isApi102 = isApi102
+                        isApi102 = isApi102,
+                        markXposedBound = true
                     )
 
-                    // Single-HUD Exclusion: Automatically disable App System Overlay when Xposed binds to Gemini
-                    OverlayHudController.enforceSingleHudExclusivity(context)
-
-                    // Reply with authoritative SharedPreferences quota + i18n + ThemeMode
-                    syncStateToHostApps(context, includePing = false)
+                    OverlayHudController.enforceSingleHudExclusivity(appCtx)
+                    syncStateToHostApps(appCtx, updated, includePing = false)
                     notifyUiListeners()
                 }
 
                 QuotaTextParser.ACTION_REQUEST_QUOTA_REFRESH -> {
-                    // Triggered by Refresh Icon Button on in-app QuotaHudView
-                    OverlayHudController.triggerHeadlessSync(context)
+                    OverlayHudController.triggerHeadlessSync(appCtx)
                 }
             }
         } catch (_: Throwable) {

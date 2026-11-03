@@ -169,7 +169,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'Gemini-Eye-v1.9.0-Android-Project.zip';
+    link.download = 'Gemini-Eye-v1.9.1-Android-Project.zip';
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -190,8 +190,8 @@ export default function App() {
     setIsRefreshingHud(true);
     setLastSyncNote(
       isZh
-        ? '已发送 ACTION_REQUEST_QUOTA_REFRESH -> 后台同步 gemini.google.com/usage 并写入 SharedPreferences'
-        : 'Dispatched ACTION_REQUEST_QUOTA_REFRESH -> synced gemini.google.com/usage to SharedPreferences'
+        ? '已调用 QuotaSyncProvider.requestBackgroundRefresh -> 后台同步 gemini.google.com/usage 并通过 ContentObserver 实时推送到所有 HUD'
+        : 'Invoked QuotaSyncProvider.requestBackgroundRefresh -> synced gemini.google.com/usage and notified all HUD observers'
     );
     setTimeout(() => {
       setIsRefreshingHud(false);
@@ -299,7 +299,7 @@ export default function App() {
           <div className="mt-1 text-xs text-slate-500">
             <span>QuotaHudView · API 102 + 82</span>
             <span aria-hidden="true"> · </span>
-            <span>v1.9.0</span>
+            <span>v1.9.1</span>
           </div>
         </div>
 
@@ -347,7 +347,7 @@ export default function App() {
           >
             <FolderGit2 className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? 'v1.9.0 重构架构说明' : 'v1.9.0 Refactor Architecture'}
+              {isZh ? 'v1.9.1 统一数据源与修复说明' : 'v1.9.1 Unified Sync & Fixes'}
             </span>
           </button>
         </nav>
@@ -398,8 +398,8 @@ export default function App() {
                 : activeView === 'files'
                 ? currentFile.path
                 : isZh
-                ? 'v1.9.0 架构规范与同步机制'
-                : 'v1.9.0 Architecture & Sync Spec'}
+                ? 'v1.9.1 统一数据源与资源本地化规范'
+                : 'v1.9.1 Unified Sync & Localization Spec'}
             </span>
           </div>
 
@@ -412,11 +412,11 @@ export default function App() {
             <span>
               {zipDownloaded
                 ? isZh
-                  ? '已导出 v1.9.0 工程 .zip'
-                  : 'v1.9.0 .zip Downloaded'
+                  ? '已导出 v1.9.1 工程 .zip'
+                  : 'v1.9.1 .zip Downloaded'
                 : isZh
-                ? '导出 v1.9.0 Android 工程 (.zip)'
-                : 'Export v1.9.0 Project (.zip)'}
+                ? '导出 v1.9.1 Android 工程 (.zip)'
+                : 'Export v1.9.1 Project (.zip)'}
             </span>
           </button>
         </header>
@@ -449,12 +449,23 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setSelectedPath('app/src/main/java/com/example/bardquotahook/MainActivity.kt');
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaSyncProvider.kt');
                 setActiveView('files');
               }}
               className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
             >
-              MainActivity.kt
+              QuotaSyncProvider.kt
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath('app/src/main/res/values/strings.xml');
+                setActiveView('files');
+              }}
+              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
+            >
+              strings.xml
             </button>
           </div>
 
@@ -649,8 +660,8 @@ export default function App() {
                 <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '3. 实时同步数据源 (SharedPreferences: gemini_eye_state)'
-                      : '3. SharedPreferences Real-Time Sync Data'}
+                      ? '3. 单一权威跨进程数据源 (QuotaSyncProvider)'
+                      : '3. Single Unified Data Source (QuotaSyncProvider)'}
                   </div>
 
                   <div className="space-y-2">
@@ -975,13 +986,13 @@ export default function App() {
               <div>
                 <h1 className="text-2xl font-bold tracking-tight text-slate-900">
                   {isZh
-                    ? 'v1.9.0 单行胶囊重构与单 HUD 互斥架构说明'
-                    : 'v1.9.0 Capsule HUD Refactor & Single-HUD Exclusion Spec'}
+                    ? 'v1.9.1 单一统一数据源与本地化字符串修复说明'
+                    : 'v1.9.1 Unified Data Source & Localized String Resources'}
                 </h1>
                 <p className="mt-1.5 text-sm text-slate-600 max-w-3xl leading-relaxed">
                   {isZh
-                    ? '严格对齐参考布局规范，将悬浮窗与数据同步重构为纯代码 Canvas 矢量绘制的 QuotaHudView 单行胶囊，消除宿主 R.drawable 资源查找崩溃隐患。'
-                    : 'Rebuilt around programmatic Canvas vector rendering in QuotaHudView so zero host resource ID lookups occur inside Gemini.'}
+                    ? '通过导出型 QuotaSyncProvider + forceQueryable 解决 Android 11–15 跨进程可见性与广播冻结导致的额度不同步问题，并引入严格数值清洗与 Android 标准中英字符串资源。'
+                    : 'Resolves cross-process quota sync via an exported QuotaSyncProvider with forceQueryable package visibility, strict metric sanitization, and localized values/strings.xml + values-zh/strings.xml.'}
                 </p>
               </div>
 
@@ -989,39 +1000,39 @@ export default function App() {
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '01. 单行胶囊精确三段式结构 (QuotaHudView.kt)'
-                      : '01. Exact Three-Section Single-Row Capsule (QuotaHudView.kt)'}
+                      ? '01. 单一权威跨进程数据源 (QuotaSyncProvider.kt + forceQueryable)'
+                      : '01. Single Authoritative Cross-Process Store (QuotaSyncProvider.kt)'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '左侧为 5h 标签 + 迷你水平圆角进度条 + 百分比与重置倒计时（如 "15% (1h52m)"）；中段为 每周/Weekly 标签 + 迷你水平圆角进度条 + 百分比与重置倒计时（如 "29% (23h52m)"）；右侧为 Canvas 绘制的旋转刷新图标按钮（触发 ACTION_REQUEST_QUOTA_REFRESH 后台静默同步）与外链图标按钮（直达 gemini.google.com/usage）。内置 onInterceptTouchEvent 滑动阈值判定，兼顾任意拖拽与图标精准点击。'
-                      : 'Left: "5h" + mini rounded progress bar + "15% (1h52m)". Middle: "每周"/"Weekly" + mini rounded progress bar + "29% (23h52m)". Right: Canvas-drawn Refresh icon button (triggers background sync) and External Link button (opens gemini.google.com/usage), with touchSlop drag vs click disambiguation.'}
+                      ? 'Android 11+ 默认限制宿主反向查询模块包名，导致 Gemini 内发出的广播被系统静默拦截，且各自私有 SharedPreferences 处于隔离沙盒。v1.9.1 在 AndroidManifest.xml 开启 android:forceQueryable="true" 并注册 QuotaSyncProvider，使 Gemini 应用内 HUD、设置页实时预览与后台同步引擎读写同一个权威数据源，并通过 ContentObserver 毫秒级实时推送变更。'
+                      : 'Android 11+ asymmetric package visibility previously blocked broadcasts from Gemini to the module. Adding android:forceQueryable="true" and QuotaSyncProvider unifies all HUD views onto one authoritative store with live ContentObserver notifications.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '02. 中英双语切换 (i18n) 与 MIUIX / MD3 双主题引擎'
-                      : '02. Bilingual i18n (ZH/EN) & Dual Theme Engine (MIUIX vs MD3)'}
+                      ? '02. 严格额度白名单清洗与防对话文本污染 (QuotaTextParser.kt)'
+                      : '02. Strict Quota Sanitizer & Zero Chat Text Contamination (QuotaTextParser.kt)'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '支持在设置页一键切换中文 ("5h" / "每周") 与英文 ("5h" / "Weekly")。主题引擎提供 MIUIX（连续超椭圆圆角胶囊、半透明微光毛玻璃边框，Android 12+ 悬浮窗支持原生 FLAG_BLUR_BEHIND 高斯背景模糊）与 MD3（调用 Android 12+ android.R.color.system_accent1_* / system_neutral1_* Material You 动态壁纸取色及 API 26-30 色调回退）。'
-                      : 'Supports live switching between CN ("5h" / "每周") and EN ("5h" / "Weekly"), plus MIUIX frosted glass (with Android 12+ compositor blur support) vs MD3 Material You Monet dynamic system colors.'}
+                      ? '彻底移除 QuotaCoreEngine 对聊天正文布局的宽泛抓取与 normalizeValue 原文截断回退逻辑；新增 sanitizeQuotaMetric 与 sanitizeResetToken 严格白名单校验（仅允许合法百分比、比例及重置倒计时），并在读取旧缓存时自动清除任何历史残留的配置描述文本。'
+                      : 'Removed broad chat-text layout scraping and raw string truncation fallbacks; added strict whitelist validators (sanitizeQuotaMetric & sanitizeResetToken) and automatic cache sanitization so chat or config text can never appear in HUD TextViews.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '03. 单 HUD 独占互斥与 SharedPreferences 实时共享'
-                      : '03. Single-HUD Exclusion & SharedPreferences Real-Time Sync'}
+                      ? '03. 标准 Android 本地化双语资源 (res/values & res/values-zh)'
+                      : '03. Proper Localized String Resources (values/strings.xml & values-zh/strings.xml)'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '当 ModernQuotaModule (Xposed API 102) 绑定 Gemini 后立即广播 ACTION_HOOK_HEARTBEAT，HookTelemetryReceiver 自动调用 OverlayHudController.enforceSingleHudExclusivity 关闭并禁用 App 系统全局悬浮窗，仅保留唯一的 Gemini 应用内胶囊；同时通过 SharedPreferences ("gemini_eye_state") 与跨进程广播保持 HUD 与设置页预览数值 100% 实时一致。'
-                      : 'When ModernQuotaModule (API 102) binds to Gemini, ACTION_HOOK_HEARTBEAT triggers OverlayHudController.enforceSingleHudExclusivity to auto-disable the App System Overlay while syncing identical quota snapshots across SharedPreferences ("gemini_eye_state").'}
+                      ? '新增完整的英文默认资源 res/values/strings.xml 与简体中文资源 res/values-zh/strings.xml，通过 createConfigurationContext 动态切换 Locale，规范渲染 "5h" / "每周" (CN) 与 "5h" / "Weekly" (EN) 及设置界面文案。'
+                      : 'Added complete English (res/values/strings.xml) and Chinese (res/values-zh/strings.xml) string resources resolved via Configuration locale contexts for clean EN/CN toggling.'}
                   </p>
                 </div>
               </div>

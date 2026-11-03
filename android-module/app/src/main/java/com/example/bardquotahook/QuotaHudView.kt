@@ -22,6 +22,7 @@ import android.view.ViewConfiguration
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
@@ -76,11 +77,16 @@ class QuotaHudView(
         val weeklyReset: String = "--",
         val source: String = "init"
     ) {
+        fun sanitized(): Snapshot = QuotaTextParser.sanitizeSnapshot(this)
+
         val hasLiveData: Boolean
-            get() = fiveHourQuota != "--" ||
-                weeklyLimit != "--" ||
-                fiveHourReset != "--" ||
-                weeklyReset != "--"
+            get() {
+                val c = sanitized()
+                return c.fiveHourQuota != "--" ||
+                    c.weeklyLimit != "--" ||
+                    c.fiveHourReset != "--" ||
+                    c.weeklyReset != "--"
+            }
 
         val fiveHourProgress: Float
             get() = QuotaTextParser.parseProgressFraction(fiveHourQuota)
@@ -89,19 +95,28 @@ class QuotaHudView(
             get() = QuotaTextParser.parseProgressFraction(weeklyLimit)
 
         fun formatFiveHourDisplay(): String {
-            if (fiveHourQuota == "--") {
-                return if (fiveHourReset != "--") "-- ($fiveHourReset)" else "--"
+            val c = sanitized()
+            if (c.fiveHourQuota == "--") {
+                return if (c.fiveHourReset != "--") "-- (${c.fiveHourReset})" else "--"
             }
-            return if (fiveHourReset != "--") "$fiveHourQuota ($fiveHourReset)" else fiveHourQuota
+            return if (c.fiveHourReset != "--") "${c.fiveHourQuota} (${c.fiveHourReset})" else c.fiveHourQuota
         }
 
         fun formatWeeklyDisplay(): String {
-            if (weeklyLimit == "--") {
-                return if (weeklyReset != "--") "-- ($weeklyReset)" else "--"
+            val c = sanitized()
+            if (c.weeklyLimit == "--") {
+                return if (c.weeklyReset != "--") "-- (${c.weeklyReset})" else "--"
             }
-            return if (weeklyReset != "--") "$weeklyLimit ($weeklyReset)" else weeklyLimit
+            return if (c.weeklyReset != "--") "${c.weeklyLimit} (${c.weeklyReset})" else c.weeklyLimit
         }
     }
+
+    private data class LocalizedHudLabels(
+        val fiveHour: String,
+        val weekly: String,
+        val refreshDesc: String,
+        val openUsageDesc: String
+    )
 
     private data class Palette(
         val bgTop: Int,
@@ -288,7 +303,7 @@ class QuotaHudView(
     }
 
     fun updateSnapshot(snapshot: Snapshot) {
-        currentSnapshot = snapshot
+        currentSnapshot = snapshot.sanitized()
         renderAll()
     }
 
@@ -309,6 +324,8 @@ class QuotaHudView(
 
     private fun renderAll() {
         val palette = resolvePalette(context, currentTheme)
+        val labels = resolveLocalizedHudLabels(context, currentLang)
+        val safeSnap = currentSnapshot.sanitized()
 
         background = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
@@ -324,20 +341,20 @@ class QuotaHudView(
             outlineAmbientShadowColor = palette.shadowSpot
         }
 
-        fiveHourLabelView.text = "5h"
+        fiveHourLabelView.text = labels.fiveHour
         fiveHourLabelView.setTextColor(palette.labelText)
 
-        weeklyLabelView.text = if (currentLang == Lang.ZH) "每周" else "Weekly"
+        weeklyLabelView.text = labels.weekly
         weeklyLabelView.setTextColor(palette.labelText)
 
-        fiveHourValueView.text = currentSnapshot.formatFiveHourDisplay()
+        fiveHourValueView.text = safeSnap.formatFiveHourDisplay()
         fiveHourValueView.setTextColor(palette.primaryText)
 
-        weeklyValueView.text = currentSnapshot.formatWeeklyDisplay()
+        weeklyValueView.text = safeSnap.formatWeeklyDisplay()
         weeklyValueView.setTextColor(palette.primaryText)
 
-        val p5 = currentSnapshot.fiveHourProgress
-        val pW = currentSnapshot.weeklyProgress
+        val p5 = safeSnap.fiveHourProgress
+        val pW = safeSnap.weeklyProgress
 
         fiveHourBarView.update(
             fraction = p5,
@@ -353,6 +370,8 @@ class QuotaHudView(
         dividerOneView.setBackgroundColor(palette.divider)
         dividerTwoView.setBackgroundColor(palette.divider)
 
+        refreshIconBtn.contentDescription = labels.refreshDesc
+        externalLinkBtn.contentDescription = labels.openUsageDesc
         refreshIconBtn.updateColors(palette.iconColor, palette.iconPressedBg)
         externalLinkBtn.updateColors(palette.iconColor, palette.iconPressedBg)
     }
@@ -626,7 +645,40 @@ class QuotaHudView(
 
     companion object {
         const val HUD_VIEW_TAG = "bard_quota_hud_capsule_v19"
+        const val MODULE_PACKAGE = "com.example.bardquotahook"
         const val USAGE_WEBPAGE_URL = "https://gemini.google.com/usage"
+
+        private fun resolveLocalizedHudLabels(context: Context, lang: Lang): LocalizedHudLabels {
+            val fallback5h = "5h"
+            val fallbackWeekly = if (lang == Lang.ZH) "每周" else "Weekly"
+            val fallbackRefresh = if (lang == Lang.ZH) "刷新用量" else "Refresh quota"
+            val fallbackOpen = if (lang == Lang.ZH) "打开用量网页" else "Open usage page"
+            return try {
+                val basePkgCtx = if (context.packageName == MODULE_PACKAGE) {
+                    context
+                } else {
+                    context.createPackageContext(MODULE_PACKAGE, 0)
+                }
+                val locale = if (lang == Lang.ZH) Locale.SIMPLIFIED_CHINESE else Locale.ENGLISH
+                val cfg = Configuration(basePkgCtx.resources.configuration).apply {
+                    setLocale(locale)
+                }
+                val locRes = basePkgCtx.createConfigurationContext(cfg).resources
+                LocalizedHudLabels(
+                    fiveHour = locRes.getString(R.string.hud_label_5h).ifBlank { fallback5h },
+                    weekly = locRes.getString(R.string.hud_label_weekly).ifBlank { fallbackWeekly },
+                    refreshDesc = locRes.getString(R.string.hud_action_refresh).ifBlank { fallbackRefresh },
+                    openUsageDesc = locRes.getString(R.string.hud_action_open_usage).ifBlank { fallbackOpen }
+                )
+            } catch (_: Throwable) {
+                LocalizedHudLabels(
+                    fiveHour = fallback5h,
+                    weekly = fallbackWeekly,
+                    refreshDesc = fallbackRefresh,
+                    openUsageDesc = fallbackOpen
+                )
+            }
+        }
 
         fun dp(context: Context, value: Float): Int {
             return TypedValue.applyDimension(

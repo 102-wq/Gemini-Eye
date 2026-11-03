@@ -23,6 +23,10 @@
     public <init>();
     *;
 }
+-keep public class com.example.bardquotahook.QuotaSyncProvider {
+    public <init>();
+    *;
+}
 -keep class com.example.bardquotahook.** {
     *;
 }

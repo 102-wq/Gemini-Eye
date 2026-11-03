@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Gemini-Eye 用量胶囊</string>
+    <string name="module_description">Gemini 单行胶囊用量监控（5h / 每周进度条 + 重置倒计时 · MIUIX/MD3 双主题 · 中英双语）</string>
+
+    <!-- Floating Capsule HUD Localized Labels -->
+    <string name="hud_label_5h">5h</string>
+    <string name="hud_label_weekly">每周</string>
+    <string name="hud_action_refresh">刷新用量</string>
+    <string name="hud_action_open_usage">打开用量网页</string>
+
+    <!-- Module Settings & Preview Localized Strings -->
+    <string name="settings_title">Gemini-Eye 用量胶囊 (v1.9.1)</string>
+    <string name="settings_targets_fmt">宿主检测 · Gemini: %1$s | Google: %2$s | API 102 + 82</string>
+    <string name="settings_status_installed">已安装</string>
+    <string name="settings_status_missing">未安装</string>
+    <string name="settings_preview_caption">实时单行胶囊预览（统一数据源实时同步）</string>
+    <string name="settings_appearance_title">语言与主题样式</string>
+    <string name="settings_lang_zh">中文</string>
+    <string name="settings_lang_en">English</string>
+    <string name="settings_theme_miuix">MIUIX 毛玻璃</string>
+    <string name="settings_theme_md3">MD3 动态取色</string>
+    <string name="settings_hook_bound_fmt">单 HUD 独占已激活 · 引擎: %1$s\n宿主: %2$s (%3$ds 前同步) · 系统全局悬浮窗已自动关闭</string>
+    <string name="settings_hook_waiting">等待 Gemini 进程连接：\n• 请在 LSPosed / Vector 中启用本模块并勾选 Gemini 与 Google，强行停止后重新打开。\n• 未注入时可临时启用下方备用系统悬浮窗。</string>
+    <string name="settings_sync_now">立即刷新并同步用量</string>
+    <string name="settings_sync_desc">在下方登录一次 Google 账号后，点击胶囊右侧刷新图标（↻）即可在后台静默同步最新 5h 百分比、每周百分比及重置倒计时。</string>
+    <string name="settings_open_web_sync">展开用量网页登录并同步 (gemini.google.com/usage)</string>
+    <string name="settings_reload_web_sync">重新加载用量网页并提取最新数值</string>
+    <string name="settings_overlay_exclusive">单 HUD 独占模式生效中（已由应用内胶囊接管）</string>
+    <string name="settings_overlay_disable">关闭备用系统悬浮胶囊（运行中）</string>
+    <string name="settings_overlay_enable">开启备用系统悬浮胶囊（仅未注入时可用）</string>
+    <string name="settings_launch_gemini">启动 Gemini 应用</string>
+</resources>
