@@ -44,7 +44,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.6.${{ github.run_number }}
-          name: Gemini-Eye v1.6.${{ github.run_number }}
-          body: "**v1.6 Crash-Safe & Adaptive Single-Line HUD Update**: Wrapped all reflection/hooks in `try-catch (Throwable)` with re-entrancy guards, added non-destructive OkHttp (`peekBody`)/Retrofit/Okio/Cronet/JSON network response fallbacks, upgraded Xposed API 102 (`io.github.libxposed:api:102.0.0`), and refactored the HUD into a compact single-line horizontal Light/Dark adaptive translucent pill."
+          tag_name: v1.7.${{ github.run_number }}
+          name: Gemini-Eye v1.7.${{ github.run_number }}
+          body: "**v1.7 R8-Obfuscation Bypass & Adaptive Single-Line HUD**: Added R8-immune `org.json.JSONObject` / `JSONArray` + `java.lang.String` (`byte[]` & `char[]`) constructor hooks and stateful Compose label-value pairing to capture `quota` / `remaining` payloads across obfuscated builds, upgraded to Xposed API 102 (`io.github.libxposed:api:102.0.0`), and separated `QuotaHudLayout.kt` for the single-line Light/Dark adaptive translucent HUD."
           files: Gemini-Eye.apk

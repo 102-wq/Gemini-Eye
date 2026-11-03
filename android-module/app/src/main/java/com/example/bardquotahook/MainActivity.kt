@@ -72,7 +72,7 @@ class MainActivity : Activity() {
         }
 
         val titleView = TextView(this).apply {
-            text = "Gemini-Eye 用量监控 (v1.6.0)"
+            text = "Gemini-Eye 用量监控 (v1.7.0)"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
             typeface = Typeface.DEFAULT_BOLD
@@ -87,12 +87,12 @@ class MainActivity : Activity() {
 
         val guideCard = TextView(this).apply {
             text = """
-                防崩增强版 (v1.6.0 · Xposed API 102) 配置说明：
+                抗 R8 混淆版 (v1.7.0 · Xposed API 102) 配置说明：
                 
                 1. 在 LSPosed 作用域页面点击右上角「⋮」->「隐藏」-> 取消勾选「系统应用」。
                 2. 同时勾选「Gemini」与「Google (com.google.android.googlequicksearchbox)」。
                 3. 在系统设置中「强行停止」Google 应用，再点击下方按钮启动 Gemini。
-                4. 顶部单行半透明胶囊悬浮窗自动适配深色/浅色主题：点按切换中英 (ZH/EN)，拖动调整位置，长按折叠。
+                4. 进入 Gemini「设置 -> 用量限制 (Usage Limits)」后，底层 JSONObject / String 构造器与界面层会自动捕获 quota / remaining 并实时刷新单行悬浮胶囊。
             """.trimIndent()
             setTextColor(Color.parseColor("#E2E8F0"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)

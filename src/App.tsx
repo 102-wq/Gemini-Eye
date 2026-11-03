@@ -177,7 +177,7 @@ export default function App() {
           <div className="mt-1 text-xs text-slate-500">
             <span>Xposed API 102</span>
             <span aria-hidden="true"> · </span>
-            <span>v1.6.0</span>
+            <span>v1.7.0</span>
           </div>
         </div>
 
