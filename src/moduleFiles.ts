@@ -1034,8 +1034,9 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             val activeSlot = pendingSlot
             if (activeSlot != null && (now - pendingSlotTimestampMs) <= 450L) {
                 if (activeSlot == MetricKind.RESET) {
-                    compactTimeRegex.find(line)?.value?.trim()?.let {
-                        reset = it
+                    val resetMatch = compactTimeRegex.find(line)?.value?.trim()
+                    if (resetMatch != null) {
+                        reset = resetMatch
                         hit = true
                         pendingSlot = null
                         continue
