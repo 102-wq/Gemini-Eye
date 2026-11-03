@@ -1,7 +1,6 @@
 package com.example.bardquotahook
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Color
@@ -65,8 +64,8 @@ object QuotaHudLayout {
         val isDark = nightMask == Configuration.UI_MODE_NIGHT_YES
         return if (isDark) {
             Palette(
-                backgroundFill = Color.argb(214, 24, 24, 27),    // Translucent dark (#18181B @ 84%)
-                borderStroke = Color.argb(64, 255, 255, 255),    // Subtle light hairline
+                backgroundFill = Color.argb(216, 24, 24, 27),    // Translucent dark (#18181B @ ~85%)
+                borderStroke = Color.argb(68, 255, 255, 255),    // Subtle light hairline
                 primaryText = Color.parseColor("#F8FAFC"),       // High-contrast light text
                 mutedLabelText = Color.parseColor("#94A3B8"),    // Muted slate-400 label
                 accentLangText = Color.parseColor("#38BDF8"),    // Sky-400 badge
@@ -76,8 +75,8 @@ object QuotaHudLayout {
             )
         } else {
             Palette(
-                backgroundFill = Color.argb(226, 255, 255, 255), // Translucent frosted white (~89%)
-                borderStroke = Color.argb(42, 15, 23, 42),       // Subtle dark hairline
+                backgroundFill = Color.argb(230, 255, 255, 255), // Translucent frosted white (~90%)
+                borderStroke = Color.argb(44, 15, 23, 42),       // Subtle dark hairline
                 primaryText = Color.parseColor("#0F172A"),       // High-contrast dark text
                 mutedLabelText = Color.parseColor("#475569"),    // Muted slate-600 label
                 accentLangText = Color.parseColor("#0284C7"),    // Sky-600 badge
@@ -108,32 +107,35 @@ object QuotaHudLayout {
 
     @SuppressLint("ClickableViewAccessibility")
     fun createContainer(
-        activity: Activity,
+        context: Context,
         snapshotProvider: () -> Snapshot,
-        onTapRefresh: () -> Unit
+        onTapRefresh: () -> Unit,
+        onWindowDrag: ((dx: Int, dy: Int) -> Unit)? = null
     ): LinearLayout {
-        val touchSlop = ViewConfiguration.get(activity).scaledTouchSlop
-        val maxMetricsWidth = (activity.resources.displayMetrics.widthPixels * 0.78f).roundToInt()
+        val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+        val maxMetricsWidth = (context.resources.displayMetrics.widthPixels * 0.78f).roundToInt()
 
-        val container = LinearLayout(activity).apply {
+        val container = LinearLayout(context).apply {
             tag = OVERLAY_TAG
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(activity, 11f), dp(activity, 6f), dp(activity, 11f), dp(activity, 6f))
-            elevation = dp(activity, 6f).toFloat()
-            translationX = savedOffsetX
-            translationY = savedOffsetY
-        }
-
-        val statusDot = View(activity).apply {
-            tag = TAG_DOT
-            val size = dp(activity, 6f)
-            layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                marginEnd = dp(activity, 7f)
+            setPadding(dp(context, 11f), dp(context, 6f), dp(context, 11f), dp(context, 6f))
+            elevation = dp(context, 6f).toFloat()
+            if (onWindowDrag == null) {
+                translationX = savedOffsetX
+                translationY = savedOffsetY
             }
         }
 
-        val metricsText = TextView(activity).apply {
+        val statusDot = View(context).apply {
+            tag = TAG_DOT
+            val size = dp(context, 6f)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                marginEnd = dp(context, 7f)
+            }
+        }
+
+        val metricsText = TextView(context).apply {
             tag = TAG_METRICS
             isSingleLine = true
             maxLines = 1
@@ -144,15 +146,15 @@ object QuotaHudLayout {
             typeface = Typeface.MONOSPACE
         }
 
-        val divider = View(activity).apply {
+        val divider = View(context).apply {
             tag = TAG_DIVIDER
-            layoutParams = LinearLayout.LayoutParams(dp(activity, 1f), dp(activity, 12f)).apply {
-                marginStart = dp(activity, 8f)
-                marginEnd = dp(activity, 7f)
+            layoutParams = LinearLayout.LayoutParams(dp(context, 1f), dp(context, 12f)).apply {
+                marginStart = dp(context, 8f)
+                marginEnd = dp(context, 7f)
             }
         }
 
-        val langBadge = TextView(activity).apply {
+        val langBadge = TextView(context).apply {
             tag = TAG_LANG
             isSingleLine = true
             maxLines = 1
@@ -168,6 +170,8 @@ object QuotaHudLayout {
 
         var downRawX = 0f
         var downRawY = 0f
+        var lastRawX = 0f
+        var lastRawY = 0f
         var startTransX = 0f
         var startTransY = 0f
         var downTime = 0L
@@ -178,6 +182,8 @@ object QuotaHudLayout {
                 MotionEvent.ACTION_DOWN -> {
                     downRawX = event.rawX
                     downRawY = event.rawY
+                    lastRawX = event.rawX
+                    lastRawY = event.rawY
                     startTransX = v.translationX
                     startTransY = v.translationY
                     downTime = System.currentTimeMillis()
@@ -185,16 +191,26 @@ object QuotaHudLayout {
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - downRawX
-                    val dy = event.rawY - downRawY
-                    if (!dragging && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+                    val totalDx = event.rawX - downRawX
+                    val totalDy = event.rawY - downRawY
+                    if (!dragging && (abs(totalDx) > touchSlop || abs(totalDy) > touchSlop)) {
                         dragging = true
                     }
                     if (dragging) {
-                        v.translationX = startTransX + dx
-                        v.translationY = startTransY + dy
-                        savedOffsetX = v.translationX
-                        savedOffsetY = v.translationY
+                        if (onWindowDrag != null) {
+                            val stepX = (event.rawX - lastRawX).roundToInt()
+                            val stepY = (event.rawY - lastRawY).roundToInt()
+                            if (stepX != 0 || stepY != 0) {
+                                onWindowDrag(stepX, stepY)
+                                lastRawX = event.rawX
+                                lastRawY = event.rawY
+                            }
+                        } else {
+                            v.translationX = startTransX + totalDx
+                            v.translationY = startTransY + totalDy
+                            savedOffsetX = v.translationX
+                            savedOffsetY = v.translationY
+                        }
                     }
                     true
                 }
@@ -208,7 +224,7 @@ object QuotaHudLayout {
                         } else {
                             currentLang = if (currentLang == Lang.ZH) Lang.EN else Lang.ZH
                         }
-                        bind(activity, v as LinearLayout, snapshotProvider())
+                        bind(context, v as LinearLayout, snapshotProvider())
                         onTapRefresh()
                     }
                     true

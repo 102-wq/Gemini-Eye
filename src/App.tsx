@@ -22,60 +22,61 @@ const SAMPLE_PAYLOADS: Array<{
   parsed: HudSnapshot;
 }> = [
   {
-    id: 'compose',
-    labelZh: 'Compose 界面文本嗅探 (StaticLayout)',
-    labelEn: 'Compose UI Sniff (StaticLayout)',
-    source: 'Compose',
-    raw: '5 小时额度剩余 32 / 50 次\n每周限额已用 140 / 350\n3 小时 18 分钟后重置',
+    id: 'usage-web',
+    labelZh: 'gemini.google.com/usage 实时百分比提取 (UsageWeb)',
+    labelEn: 'gemini.google.com/usage Live % Sync (UsageWeb)',
+    source: 'UsageWeb',
+    raw: 'Usage limits\nCurrent usage\n18% used\nResets in 3 hr 42 min\nWeekly limit\n7% used\nResets Sun 12:00 PM',
     parsed: {
-      fiveHourQuota: '32 / 50',
-      weeklyLimit: '140 / 350',
-      resetTimer: '3h 18m',
+      fiveHourQuota: '18%',
+      weeklyLimit: '7%',
+      resetTimer: '3h42m',
+      source: 'UsageWeb',
+    },
+  },
+  {
+    id: 'compose',
+    labelZh: 'Compose 用量设置页渲染嗅探 (BoringLayout / StaticLayout)',
+    labelEn: 'Compose Usage Settings Sniff (BoringLayout / StaticLayout)',
+    source: 'Compose',
+    raw: '用量与限额\n当前用量\n已使用 24%\n4 小时 15 分钟后重置\n每周限额\n已使用 11%',
+    parsed: {
+      fiveHourQuota: '24%',
+      weeklyLimit: '11%',
+      resetTimer: '4h15m',
       source: 'Compose',
     },
   },
   {
     id: 'json',
-    labelZh: 'batchexecute 转义 JSON 载荷',
-    labelEn: 'batchexecute Escaped JSON Payload',
-    source: 'UTF8',
-    raw: ')]}\'\n[["wrb.fr","robin", "{\\"five_hour_quota\\":\\"18/50\\",\\"weekly_limit\\":\\"210/350\\",\\"reset_in\\":\\"01:42:00\\"}"]]',
+    labelZh: 'RPC / JSON 解码流提取 (CharsetDecoder / JSONObject)',
+    labelEn: 'RPC / JSON Stream Decode (CharsetDecoder / JSONObject)',
+    source: 'Decoder',
+    raw: ')]}\'\n[["wrb.fr","robin", "{\\"five_hour_quota\\":\\"32/50\\",\\"weekly_limit\\":\\"140/350\\",\\"reset_in\\":\\"01:42:00\\"}"]]',
     parsed: {
-      fiveHourQuota: '18/50',
-      weeklyLimit: '210/350',
+      fiveHourQuota: '32/50',
+      weeklyLimit: '140/350',
       resetTimer: '01:42:00',
-      source: 'UTF8',
-    },
-  },
-  {
-    id: 'webview',
-    labelZh: 'WebView 用量设置页 DOM 提取',
-    labelEn: 'Embedded WebView Usage Page DOM',
-    source: 'WebView',
-    raw: '5-hour quota: 44 remaining\nWeekly limit: 88% available\nResets in 4h 05m',
-    parsed: {
-      fiveHourQuota: '44 remaining',
-      weeklyLimit: '88% available',
-      resetTimer: 'Resets in 4h 05m',
-      source: 'WebView',
+      source: 'Decoder',
     },
   },
 ];
 
 export default function App() {
-  const [uiLang, setUiLang] = useState<UiLang>('zh'); // Simplified Chinese default
+  const [uiLang, setUiLang] = useState<UiLang>('zh');
   const [hudLang, setHudLang] = useState<UiLang>('zh');
   const [activeView, setActiveView] = useState<ActiveView>('fix');
   const [selectedPath, setSelectedPath] = useState<string>(
-    'app/src/main/java/com/example/bardquotahook/QuotaHookEntry.kt'
+    'app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt'
   );
   const [fileQuery, setFileQuery] = useState('');
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const [zipDownloaded, setZipDownloaded] = useState(false);
 
-  const [selectedSampleId, setSelectedSampleId] = useState<string>('compose');
+  const [selectedSampleId, setSelectedSampleId] = useState<string>('usage-web');
   const [simDarkTheme, setSimDarkTheme] = useState<boolean>(true);
-  const [hudOffset, setHudOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const hudBtnRef = useRef<HTMLButtonElement | null>(null);
+  const hudPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const dragRef = useRef<{
     startX: number;
     startY: number;
@@ -113,7 +114,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'BardQuotaHook-Android-Project.zip';
+    link.download = 'Gemini-Eye-v1.8.0-Android-Project.zip';
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -133,8 +134,8 @@ export default function App() {
     dragRef.current = {
       startX: e.clientX,
       startY: e.clientY,
-      origX: hudOffset.x,
-      origY: hudOffset.y,
+      origX: hudPosRef.current.x,
+      origY: hudPosRef.current.y,
       moved: false,
       pointerDown: true,
     };
@@ -148,10 +149,12 @@ export default function App() {
       dragRef.current.moved = true;
     }
     if (dragRef.current.moved) {
-      setHudOffset({
-        x: Math.max(-150, Math.min(20, dragRef.current.origX + dx)),
-        y: Math.max(-40, Math.min(240, dragRef.current.origY + dy)),
-      });
+      const nextX = Math.max(-150, Math.min(20, dragRef.current.origX + dx));
+      const nextY = Math.max(-40, Math.min(240, dragRef.current.origY + dy));
+      hudPosRef.current = { x: nextX, y: nextY };
+      if (hudBtnRef.current) {
+        hudBtnRef.current.style.translate = `${nextX}px ${nextY}px`;
+      }
     }
   };
 
@@ -172,12 +175,12 @@ export default function App() {
       <aside className="w-full lg:w-64 shrink-0 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col">
         <div className="px-5 py-4 border-b border-slate-200">
           <div className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap">
-            BardQuotaHook
+            Gemini-Eye
           </div>
           <div className="mt-1 text-xs text-slate-500">
-            <span>Xposed API 102</span>
+            <span>LibXposed API 102 + API 82</span>
             <span aria-hidden="true"> · </span>
-            <span>v1.7.0</span>
+            <span>v1.8.0</span>
           </div>
         </div>
 
@@ -185,7 +188,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveView('fix')}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${
+            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
               activeView === 'fix'
                 ? 'bg-slate-900 text-white'
                 : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
@@ -193,14 +196,14 @@ export default function App() {
           >
             <FolderGit2 className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? 'GitHub 推送报错修复' : 'GitHub Push Error Fix'}
+              {isZh ? 'v1.8.0 根因诊断与升级方案' : 'v1.8.0 Root Cause & Fix'}
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveView('files')}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${
+            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
               activeView === 'files'
                 ? 'bg-slate-900 text-white'
                 : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
@@ -208,14 +211,16 @@ export default function App() {
           >
             <FileCode className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? `Android 工程源码 (${PROJECT_FILES.length})` : `Android Source Files (${PROJECT_FILES.length})`}
+              {isZh
+                ? `Android 工程源码 (${PROJECT_FILES.length})`
+                : `Android Source Files (${PROJECT_FILES.length})`}
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveView('simulator')}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${
+            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
               activeView === 'simulator'
                 ? 'bg-slate-900 text-white'
                 : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
@@ -223,7 +228,7 @@ export default function App() {
           >
             <Smartphone className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? '双语悬浮窗交互预览' : 'Bilingual HUD Simulator'}
+              {isZh ? '双语悬浮胶囊交互预览' : 'Bilingual HUD Simulator'}
             </span>
           </button>
         </nav>
@@ -243,7 +248,7 @@ export default function App() {
                     setSelectedPath(file.path);
                     setActiveView('files');
                   }}
-                  className={`w-full text-left px-2.5 py-1.5 rounded-md text-xs font-mono truncate transition-colors ${
+                  className={`w-full text-left px-2.5 py-1.5 rounded-md text-xs font-mono truncate transition-colors cursor-pointer ${
                     active
                       ? 'bg-slate-100 text-slate-900 font-semibold'
                       : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
@@ -260,7 +265,6 @@ export default function App() {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Top Bar Contract: Breadcrumb left, 1 primary action right */}
         <header className="flex items-center justify-between gap-8 px-6 py-3.5 bg-white border-b border-slate-200">
           <div className="flex items-center gap-2 text-sm text-slate-600 min-w-0">
             <span className="font-semibold text-slate-900 whitespace-nowrap">
@@ -270,13 +274,13 @@ export default function App() {
             <span className="truncate">
               {activeView === 'fix'
                 ? isZh
-                  ? 'Precondition check failed 解决方案'
-                  : 'Precondition check failed Fix'
+                  ? '修复不触发 Hook 与拿不到额度 (v1.8.0)'
+                  : 'Fixing Hook & Quota Acquisition (v1.8.0)'
                 : activeView === 'files'
                 ? currentFile.path
                 : isZh
-                ? '悬浮窗与解析器预览'
-                : 'Overlay & Sniffer Simulator'}
+                ? '单行自适应胶囊与解析器预览'
+                : 'Single-Line HUD & Parser Simulator'}
             </span>
           </div>
 
@@ -289,23 +293,23 @@ export default function App() {
             <span>
               {zipDownloaded
                 ? isZh
-                  ? '已导出完整工程 .zip'
-                  : 'Project .zip Downloaded'
+                  ? '已导出 v1.8.0 工程 .zip'
+                  : 'v1.8.0 .zip Downloaded'
                 : isZh
-                ? '下载完整 Android 工程 (.zip)'
-                : 'Download Android Project (.zip)'}
+                ? '下载 v1.8.0 Android 工程 (.zip)'
+                : 'Download v1.8.0 Project (.zip)'}
             </span>
           </button>
         </header>
 
-        {/* Workspace Toolbar (Language Switcher + Summary Metadata) */}
+        {/* Workspace Toolbar */}
         <div className="px-6 py-3 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-2 text-xs text-slate-600">
-            <span>com.google.android.apps.bard</span>
+            <span>META-INF/xposed (API 102)</span>
             <span aria-hidden="true">·</span>
-            <span>com.google.android.googlequicksearchbox</span>
+            <span>assets/xposed_init (API 82)</span>
             <span aria-hidden="true">·</span>
-            <span>WeakReference Memory-Safe</span>
+            <span>gemini.google.com/usage Live Sync</span>
           </div>
 
           <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
@@ -341,138 +345,103 @@ export default function App() {
               <div>
                 <h1 className="text-2xl font-bold tracking-tight text-slate-900 text-balance">
                   {isZh
-                    ? '修复 “Failed to push commit to GitHub: Precondition check failed”'
-                    : 'Fixing “Failed to push commit to GitHub: Precondition check failed”'}
+                    ? 'v1.8.0 彻底解决「仍不触发 Hook」与「拿不到真实额度」三大根因'
+                    : 'v1.8.0: Resolving Both “Still Doesn’t Hook” and “Can’t Get Quota”'}
                 </h1>
                 <p className="mt-2 text-sm text-slate-600 max-w-3xl leading-relaxed">
                   {isZh
-                    ? '你在 AI Studio 点击右上角 GitHub 按钮推送时出现该报错，主要由以下三个前置条件冲突触发。我们已初始化当前工作区，并提供一键导出完整 Android Gradle 压缩包的直通方案。'
-                    : 'This error in AI Studio’s GitHub drawer happens due to three repository state & OAuth scope constraints. We have now initialized this workspace and generated a standalone wrapper-free Android Gradle archive.'}
+                    ? '通过对 v1.7.12 已发布 APK 反编译核查与 LibXposed API 102 源码对齐，定位到现代框架入口缺失、Magisk 排除列表卸载以及聊天二进制流不含百分比三大核心原因，并在 v1.8.0 中一次性全部补齐。'
+                    : 'Inspecting the compiled v1.7.12 APK against io.github.libxposed:api:102.0.0 revealed three exact root causes across modern Xposed loaders, Magisk DenyList behavior, and Gemini’s usage endpoint.'}
                 </p>
               </div>
 
-              {/* Root causes */}
               <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200">
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '01. 工作区未初始化或 metadata.json 为空（已自动修复）'
-                      : '01. Uninitialized AI Studio Workspace & Empty metadata.json (Fixed)'}
+                      ? '01. 为什么在 API 102 框架 (Vector / 新版 LSPosed) 上不触发 Hook？'
+                      : '01. Why API 102 Frameworks (Vector / Modern LSPosed) Ignored v1.7.12'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '此前代码仅在聊天框展示，AI Studio 工作区处于空白未保存状态（屏幕上显示 Enjoy these tips while you wait）。现在工作区已完成初始化并将 Android 模块写入 /android-module 目录。'
-                      : 'Previously, code existed only in chat replies while the workspace had an empty metadata.json and no saved checkpoint. This workspace is now initialized with all module files under /android-module.'}
+                      ? 'v1.7.12 虽然在 Gradle 添加了 io.github.libxposed:api:102.0.0 依赖，但 APK 内仅有旧版 assets/xposed_init，缺少现代 API 102 强制要求的 META-INF/xposed/module.prop (minApiVersion=101, targetApiVersion=102)、java_init.list、scope.list 以及继承 XposedModule 的入口类。v1.8.0 新增 ModernQuotaModule.kt + QuotaCoreEngine.kt 双引擎架构，新旧框架通吃且互不冲突。'
+                      : 'v1.7.12 only bundled legacy assets/xposed_init and lacked META-INF/xposed/{module.prop,java_init.list,scope.list} and an io.github.libxposed.api.XposedModule entry class. v1.8.0 implements ModernQuotaModule.kt + QuotaHookEntry.kt sharing QuotaCoreEngine.kt.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '02. 目标 GitHub 仓库已存在旧提交（分支 SHA 不一致）'
-                      : '02. Pushing to an Existing Non-Empty GitHub Repo (Diverged HEAD SHA)'}
+                      ? '02. Magisk 排除列表 (DenyList) / Shamiko 隐藏导致 Google 进程被剥离模块'
+                      : '02. Magisk DenyList / Shamiko Unmounting Xposed Inside Google App'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '如果你关联了一个已经在网页端改过文件（例如带 README 或手动建过 workflow）的现有仓库，GitHub 会拒绝非快进覆盖并返回 Precondition check failed。使用 AI Studio 推送时必须新建一个空白仓库名称。'
-                      : 'Linking AI Studio to an existing repository that already has commits on GitHub causes a branch SHA mismatch. Always create a brand-new repository name if pushing via AI Studio.'}
+                      ? '很多 Root 设备为了过 Play Integrity 会在 Magisk 排除列表或 Shamiko 中勾选 Google (com.google.android.googlequicksearchbox) 或 Gemini，这会导致 Zygisk 在启动该进程时直接卸载所有 Xposed 模块！v1.8.0 在 MainActivity 新增实时 Hook 心跳回执检测 (Ping)，并内置「免 Hook 全局悬浮胶囊 (SYSTEM_ALERT_WINDOW)」，即便不移出排除列表也能照常在屏幕右上角显示同款自适应悬浮窗。'
+                      : 'If Google App or Gemini is checked in Magisk DenyList / Shamiko, Zygisk unmounts all Xposed modules in that process. v1.8.0 adds live Hook Heartbeat Ping diagnostics in MainActivity plus a one-tap SYSTEM_ALERT_WINDOW floating capsule fallback.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '03. AI Studio 的 GitHub 授权不支持直接推送 .github/workflows/*，且根目录并非纯 Android 工程'
-                      : '03. GitHub OAuth Token Cannot Push .github/workflows/* & Root Layout Is Vite'}
+                      ? '03. 为什么普通聊天拿不到额度？内置 gemini.google.com/usage 实时提取与跨进程推送'
+                      : '03. Why Chat Traffic Lacks Quota & Built-in gemini.google.com/usage Live Sync'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? 'GitHub 限制无 workflow 权限的第三方应用写入 .github/workflows/ 目录，且 AI Studio 根目录是 Web 模板而非 Android 根目录。因此最稳妥的做法是点击右上角「下载完整 Android 工程 (.zip)」，解压后上传到你的新建 GitHub 仓库自动触发云编译。'
-                      : 'GitHub rejects commits to .github/workflows/ from OAuth tokens lacking workflow scope, and AI Studio’s root directory is a Vite web project. Downloading the standalone .zip gives you a pure Android root layout with .github/workflows/android.yml included.'}
+                      ? 'Gemini 聊天流走原生 Cronet 二进制 Protobuf 且不返回百分比，同时 Android ART 会将 String 构造器内联替换为 StringFactory 导致传统 String Hook 失效。真实 5 小时百分比 (如 "18% used") 与周限额位于 gemini.google.com/usage。v1.8.0 重构了 QuotaTextParser 精准识别双分区 "% used / 已使用 %"，并在 Gemini-Eye 应用内嵌入支持持久化 Cookie 的 gemini.google.com/usage 同步器，登录一次即可实时抓取并通过广播直接刷新 Gemini 悬浮胶囊！'
+                      : 'Gemini chat uses binary Protobuf without usage percentages, and ART intrinsifies String constructors. Real 5-hour & weekly "% used" meters live at gemini.google.com/usage. v1.8.0 upgrades QuotaTextParser for "% used" meters and embeds a persistent-cookie gemini.google.com/usage live WebView sync that broadcasts directly into the Gemini HUD.'}
                   </p>
                 </div>
               </div>
 
-              {/* Recommended 3-Step Action Plan */}
-              <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+              {/* Action Plan */}
+              <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
                     <h2 className="text-base font-semibold text-slate-900">
                       {isZh
-                        ? '推荐操作：3 步完成 GitHub Actions 云端编译 APK（零报错方案）'
-                        : 'Recommended Fix: 3 Steps to Cloud-Compile Your APK on GitHub'}
+                        ? '同步 v1.8.0 到你的 GitHub 仓库 (102-wq/Gemini-Eye)'
+                        : 'Deploy v1.8.0 to Your GitHub Repository (102-wq/Gemini-Eye)'}
                     </h2>
                     <p className="mt-1 text-xs text-slate-500">
                       {isZh
-                        ? '已内置 gradle/actions/setup-gradle@v4，无需本地安装 Android Studio 或生成 gradle-wrapper.jar 二进制文件'
-                        : 'Uses gradle/actions/setup-gradle@v4 so no local Android Studio or binary gradle-wrapper.jar is required'}
+                        ? '保持相同固定签名密钥 (signing.p12)，可直接覆盖安装升级，无需卸载旧版'
+                        : 'Uses the exact same persistent signing.p12 key so you can upgrade in-place'}
                     </p>
                   </div>
 
                   <button
                     type="button"
-                    onClick={handleDownloadZip}
+                    onClick={() => {
+                      setSelectedPath('app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt');
+                      setActiveView('files');
+                    }}
                     className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    <Download className="w-4 h-4" />
-                    <span>
-                      {isZh ? '立即导出 .zip 压缩包' : 'Export .zip Archive'}
-                    </span>
+                    <FileCode className="w-4 h-4" />
+                    <span>{isZh ? '查看 v1.8.0 新增源码' : 'Inspect v1.8.0 Source'}</span>
                   </button>
                 </div>
 
-                <ol className="space-y-3 text-sm text-slate-700 list-decimal list-inside leading-relaxed">
+                <ol className="space-y-2.5 text-sm text-slate-700 list-decimal list-inside leading-relaxed">
                   <li>
                     {isZh
-                      ? '点击右上角蓝色按钮「下载完整 Android 工程 (.zip)」并在本地解压（内含 .github/workflows/android.yml、双包作用域与最新防混淆 QuotaHookEntry.kt）。'
-                      : 'Click “Download Android Project (.zip)” in the top right and unzip it locally (includes .github/workflows/android.yml, dual-package scope, and R8-proof QuotaHookEntry.kt).'}
+                      ? '将当前工作区变更推送至 GitHub（或下载右上角 v1.8.0 .zip 解压覆盖 android-module/），等待 GitHub Actions 自动生成 Gemini-Eye v1.8.x Release APK。'
+                      : 'Push this workspace update to GitHub (or export the v1.8.0 .zip) and let GitHub Actions publish the signed Gemini-Eye v1.8.x APK.'}
                   </li>
                   <li>
                     {isZh
-                      ? '在 GitHub.com 新建一个空仓库（不要勾选 Add README），通过 Git 命令行推送解压后的文件夹，或直接在网页端点击 uploading an existing file 拖入全部文件并 Commit。'
-                      : 'Create a new empty repository on GitHub.com, then push the unzipped folder via git CLI (or drag-and-drop all unzipped files via “uploading an existing file” on GitHub).'}
+                      ? '安装 APK 后打开「Gemini 用量监控 Hook」桌面图标：查看顶部「Xposed 已连接」回执；若使用 Shamiko / Magisk 排除列表，请将 Google 与 Gemini 移出排除列表，或直接点击「开启免 Hook 全局悬浮胶囊」。'
+                      : 'Open the Gemini-Eye app to verify the live Xposed Heartbeat indicator; if Google App is on Magisk DenyList, either remove it from DenyList or tap “Enable Hook-Free System Floating Capsule”.'}
                   </li>
                   <li>
                     {isZh
-                      ? '打开 GitHub 仓库顶部的 Actions 标签页，等待 Build LSPosed APK 变绿（约 1 分钟），下载底部 Artifacts 中的 APK；在 LSPosed 中同时勾选 Gemini 与 Google 两个应用，强行停止 Google 应用后重新打开 Gemini。'
-                      : 'Open the Actions tab on GitHub, download bard-quota-hook-debug from Artifacts once green (~1 min), enable BOTH Gemini and Google in LSPosed Manager, and Force Stop the Google app.'}
+                      ? '点击应用内「展开内置网页登录并同步 gemini.google.com/usage」登录一次账号，即可提取实时 5h %、周限额 % 与重置倒计时并自动推送至 Gemini 右上角单行胶囊！'
+                      : 'Tap “Sync gemini.google.com/usage” inside Gemini-Eye once to sign in and stream real 5h %, weekly %, and reset timer directly to the HUD pill.'}
                   </li>
                 </ol>
-
-                <div className="pt-2">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-slate-600">
-                      {isZh
-                        ? '或者使用本地 Git 一键推送解压目录到新仓库：'
-                        : 'Or push the unzipped folder via Git CLI to a new empty repo:'}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        handleCopy(
-                          `git init\ngit add .\ngit commit -m "Initial Android LSPosed module"\ngit branch -M main\ngit remote add origin https://github.com/<YOUR_USER>/<NEW_REPO>.git\ngit push -u origin main`,
-                          'git-cli'
-                        )
-                      }
-                      className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
-                    >
-                      {copiedPath === 'git-cli' ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-600" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                      <span>{copiedPath === 'git-cli' ? (isZh ? '已复制' : 'Copied') : isZh ? '复制命令' : 'Copy'}</span>
-                    </button>
-                  </div>
-                  <pre className="p-4 rounded-lg bg-slate-900 text-slate-100 text-xs font-mono overflow-x-auto leading-relaxed">
-{`git init
-git add .
-git commit -m "Initial Android LSPosed module"
-git branch -M main
-git remote add origin https://github.com/<YOUR_USER>/<NEW_REPO>.git
-git push -u origin main`}
-                  </pre>
-                </div>
               </div>
             </div>
           )}
@@ -554,12 +523,12 @@ git push -u origin main`}
               <div className="lg:col-span-6 space-y-5">
                 <div>
                   <h2 className="text-lg font-bold text-slate-900">
-                    {isZh ? '多源嗅探与双语悬浮窗验证' : 'Multi-Layer Sniffer & Bilingual HUD Test'}
+                    {isZh ? '多源额度嗅探与自适应单行胶囊验证' : 'Multi-Source Quota Parser & HUD Test'}
                   </h2>
                   <p className="mt-1 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '选择下方不同数据源模拟 Gemini Android 内部流量或界面渲染文本；在右侧手机预览框中可按住拖动悬浮窗，或单击悬浮窗在「简体中文」与「English」之间实时切换。'
-                      : 'Select a payload source below to test extraction; drag the floating HUD inside the phone frame or single-tap it to toggle Simplified Chinese and English.'}
+                      ? '选择下方真实 gemini.google.com/usage 或 Compose 数据格式查看解析结果；在右侧手机预览框中可按住拖动胶囊，或单击在「简体中文」与「English」之间实时切换。'
+                      : 'Select a payload format below to test v1.8.0 extraction; drag the floating HUD inside the phone frame or single-tap it to toggle Simplified Chinese and English.'}
                   </p>
                 </div>
 
@@ -622,7 +591,6 @@ git push -u origin main`}
                       : 'bg-white border-slate-300 text-slate-900'
                   }`}
                 >
-                  {/* Mock Status Bar */}
                   <div
                     className={`px-6 py-3 flex items-center justify-between text-xs font-mono border-b ${
                       simDarkTheme
@@ -634,7 +602,6 @@ git push -u origin main`}
                     <span>Gemini · Usage Limits</span>
                   </div>
 
-                  {/* Mock Gemini Usage Limits Page */}
                   <div
                     className={`p-6 space-y-5 flex-1 ${
                       simDarkTheme ? 'bg-zinc-900/50' : 'bg-slate-50/60'
@@ -662,7 +629,7 @@ git push -u origin main`}
                     >
                       <div className="flex justify-between text-xs">
                         <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
-                          {isZh ? '5 小时对话窗口' : '5-hour window'}
+                          {isZh ? '5 小时窗口已用' : '5-hour window'}
                         </span>
                         <span className="font-mono font-semibold">
                           {activeSample.parsed.fiveHourQuota}
@@ -670,7 +637,7 @@ git push -u origin main`}
                       </div>
                       <div className="flex justify-between text-xs">
                         <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
-                          {isZh ? '每周总限额' : 'Weekly cap'}
+                          {isZh ? '每周总限额已用' : 'Weekly cap'}
                         </span>
                         <span className="font-mono font-semibold">
                           {activeSample.parsed.weeklyLimit}
@@ -678,7 +645,7 @@ git push -u origin main`}
                       </div>
                       <div className="flex justify-between text-xs">
                         <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
-                          {isZh ? '下次重置计时' : 'Next reset'}
+                          {isZh ? '下次重置倒计时' : 'Next reset'}
                         </span>
                         <span className="font-mono font-semibold">
                           {activeSample.parsed.resetTimer}
@@ -694,21 +661,19 @@ git push -u origin main`}
                       <Layers className="w-3.5 h-3.5 shrink-0" />
                       <span>
                         {isZh
-                          ? '单行半透明胶囊悬浮窗：支持拖拽、单击切换 ZH/EN、自动随系统深浅色变色'
+                          ? '单行半透明圆角胶囊：支持拖拽、单击切换 ZH/EN、自动随宿主深浅色变色'
                           : 'Single-line translucent pill HUD: draggable, tap to toggle ZH/EN, adaptive Light/Dark'}
                       </span>
                     </div>
                   </div>
 
-                  {/* Refactored Compact Single-Line Horizontal Adaptive HUD Pill */}
+                  {/* Compact Single-Line Horizontal Adaptive HUD Pill */}
                   <button
+                    ref={hudBtnRef}
                     type="button"
                     onPointerDown={onHudPointerDown}
                     onPointerMove={onHudPointerMove}
                     onPointerUp={onHudPointerUp}
-                    style={{
-                      transform: `translate(${hudOffset.x}px, ${hudOffset.y}px)`,
-                    }}
                     className={`absolute top-12 right-3 max-w-[92%] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full backdrop-blur-md border shadow-md text-[11.5px] font-mono whitespace-nowrap overflow-hidden cursor-grab active:cursor-grabbing touch-none transition-colors ${
                       simDarkTheme
                         ? 'bg-zinc-900/85 border-white/25 text-slate-50'

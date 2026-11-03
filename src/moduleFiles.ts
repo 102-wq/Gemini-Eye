@@ -7,1553 +7,173 @@ export interface ProjectFile {
   content: string;
 }
 
-export const MAIN_ACTIVITY_KT = `package com.example.bardquotahook
-
-import android.app.Activity
-import android.content.ComponentName
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
-import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.util.TypedValue
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-
-class MainActivity : Activity() {
-
-    private fun isPkgInstalled(pkg: String): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= 33) {
-                packageManager.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getPackageInfo(pkg, 0)
-            }
-            true
-        } catch (_: Throwable) {
-            packageManager.getLaunchIntentForPackage(pkg) != null
-        }
-    }
-
-    private fun launchGeminiWithFallback() {
-        val candidates = listOf(
-            packageManager.getLaunchIntentForPackage("com.google.android.apps.bard"),
-            Intent(Intent.ACTION_MAIN).apply {
-                component = ComponentName(
-                    "com.google.android.apps.bard",
-                    "com.google.android.apps.bard.shellapp.BardEntryPointActivity"
-                )
-            },
-            packageManager.getLaunchIntentForPackage("com.google.android.googlequicksearchbox"),
-            Intent(Intent.ACTION_VIEW, Uri.parse("https://gemini.google.com/app"))
-        )
-
-        for (intent in candidates) {
-            if (intent == null) continue
-            val started = runCatching {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
-                true
-            }.getOrDefault(false)
-            if (started) return
-        }
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        val bardInstalled = isPkgInstalled("com.google.android.apps.bard")
-        val gsaInstalled = isPkgInstalled("com.google.android.googlequicksearchbox")
-
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#0F172A"))
-        }
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(56, 96, 56, 96)
-        }
-
-        val titleView = TextView(this).apply {
-            text = "Gemini-Eye 用量监控 (v1.7.0)"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
-            typeface = Typeface.DEFAULT_BOLD
-        }
-
-        val statusView = TextView(this).apply {
-            text = "检测状态 · Gemini 壳应用: \${if (bardInstalled) "已安装" else "未安装(走Google主程序)"} | Google 主程序: \${if (gsaInstalled) "已安装" else "未检测到"}"
-            setTextColor(Color.parseColor("#38BDF8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setPadding(0, 16, 0, 36)
-        }
-
-        val guideCard = TextView(this).apply {
-            text = """
-                抗 R8 混淆版 (v1.7.0 · Xposed API 102) 配置说明：
-                
-                1. 在 LSPosed 作用域页面点击右上角「⋮」->「隐藏」-> 取消勾选「系统应用」。
-                2. 同时勾选「Gemini」与「Google (com.google.android.googlequicksearchbox)」。
-                3. 在系统设置中「强行停止」Google 应用，再点击下方按钮启动 Gemini。
-                4. 进入 Gemini「设置 -> 用量限制 (Usage Limits)」后，底层 JSONObject / String 构造器与界面层会自动捕获 quota / remaining 并实时刷新单行悬浮胶囊。
-            """.trimIndent()
-            setTextColor(Color.parseColor("#E2E8F0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            setLineSpacing(10f, 1.15f)
-            setPadding(40, 40, 40, 40)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#1E293B"))
-                cornerRadius = 28f
-                setStroke(2, Color.parseColor("#334155"))
-            }
-        }
-
-        val launchBtn = Button(this).apply {
-            text = "启动 Gemini / Launch Gemini"
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#2563EB"))
-                cornerRadius = 24f
-            }
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 48
-            }
-            setPadding(32, 32, 32, 32)
-            setOnClickListener { launchGeminiWithFallback() }
-        }
-
-        container.addView(titleView)
-        container.addView(statusView)
-        container.addView(guideCard)
-        container.addView(launchBtn)
-        scroll.addView(container)
-        setContentView(scroll)
-    }
-}
-`;
-
-export const QUOTA_HUD_LAYOUT_KT = `package com.example.bardquotahook
-
-import android.annotation.SuppressLint
-import android.app.Activity
-import android.content.Context
-import android.content.res.Configuration
-import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.TextUtils
-import android.text.style.ForegroundColorSpan
-import android.text.style.StyleSpan
-import android.util.TypedValue
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
-import android.view.ViewConfiguration
-import android.view.ViewGroup
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
-import kotlin.math.abs
-import kotlin.math.roundToInt
-
-object QuotaHudLayout {
-
-    const val OVERLAY_TAG = "bard_quota_hud_container"
-    private const val TAG_DOT = "bard_quota_hud_dot"
-    private const val TAG_METRICS = "bard_quota_hud_metrics"
-    private const val TAG_DIVIDER = "bard_quota_hud_divider"
-    private const val TAG_LANG = "bard_quota_hud_lang"
-
-    enum class Lang { ZH, EN }
-
-    data class Snapshot(
-        val fiveHourQuota: String = "--",
-        val weeklyLimit: String = "--",
-        val resetTimer: String = "--",
-        val source: String = "init"
-    ) {
-        val hasLiveData: Boolean
-            get() = fiveHourQuota != "--" || weeklyLimit != "--" || resetTimer != "--"
-    }
-
-    private data class Palette(
-        val backgroundFill: Int,
-        val borderStroke: Int,
-        val primaryText: Int,
-        val mutedLabelText: Int,
-        val accentLangText: Int,
-        val dividerColor: Int,
-        val liveDotColor: Int,
-        val idleDotColor: Int
-    )
-
-    @Volatile var currentLang: Lang = Lang.ZH
-    @Volatile var isCollapsed: Boolean = false
-    @Volatile var savedOffsetX: Float = 0f
-    @Volatile var savedOffsetY: Float = 0f
-
-    private fun resolvePalette(context: Context): Palette {
-        val nightMask = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
-        val isDark = nightMask == Configuration.UI_MODE_NIGHT_YES
-        return if (isDark) {
-            Palette(
-                backgroundFill = Color.argb(214, 24, 24, 27),    // Translucent dark (#18181B @ 84%)
-                borderStroke = Color.argb(64, 255, 255, 255),    // Subtle light hairline
-                primaryText = Color.parseColor("#F8FAFC"),       // High-contrast light text
-                mutedLabelText = Color.parseColor("#94A3B8"),    // Muted slate-400 label
-                accentLangText = Color.parseColor("#38BDF8"),    // Sky-400 badge
-                dividerColor = Color.argb(56, 255, 255, 255),
-                liveDotColor = Color.parseColor("#34D399"),
-                idleDotColor = Color.parseColor("#FBBF24")
-            )
-        } else {
-            Palette(
-                backgroundFill = Color.argb(226, 255, 255, 255), // Translucent frosted white (~89%)
-                borderStroke = Color.argb(42, 15, 23, 42),       // Subtle dark hairline
-                primaryText = Color.parseColor("#0F172A"),       // High-contrast dark text
-                mutedLabelText = Color.parseColor("#475569"),    // Muted slate-600 label
-                accentLangText = Color.parseColor("#0284C7"),    // Sky-600 badge
-                dividerColor = Color.argb(38, 15, 23, 42),
-                liveDotColor = Color.parseColor("#059669"),
-                idleDotColor = Color.parseColor("#D97706")
-            )
-        }
-    }
-
-    fun dp(context: Context, value: Float): Int {
-        return TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_DIP,
-            value,
-            context.resources.displayMetrics
-        ).roundToInt()
-    }
-
-    fun defaultLayoutParams(context: Context): FrameLayout.LayoutParams {
-        return FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.END
-        ).apply {
-            setMargins(dp(context, 12f), dp(context, 52f), dp(context, 12f), 0)
-        }
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
-    fun createContainer(
-        activity: Activity,
-        snapshotProvider: () -> Snapshot,
-        onTapRefresh: () -> Unit
-    ): LinearLayout {
-        val touchSlop = ViewConfiguration.get(activity).scaledTouchSlop
-        val maxMetricsWidth = (activity.resources.displayMetrics.widthPixels * 0.78f).roundToInt()
-
-        val container = LinearLayout(activity).apply {
-            tag = OVERLAY_TAG
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(activity, 11f), dp(activity, 6f), dp(activity, 11f), dp(activity, 6f))
-            elevation = dp(activity, 6f).toFloat()
-            translationX = savedOffsetX
-            translationY = savedOffsetY
-        }
-
-        val statusDot = View(activity).apply {
-            tag = TAG_DOT
-            val size = dp(activity, 6f)
-            layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                marginEnd = dp(activity, 7f)
-            }
-        }
-
-        val metricsText = TextView(activity).apply {
-            tag = TAG_METRICS
-            isSingleLine = true
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            includeFontPadding = false
-            maxWidth = maxMetricsWidth
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            typeface = Typeface.MONOSPACE
-        }
-
-        val divider = View(activity).apply {
-            tag = TAG_DIVIDER
-            layoutParams = LinearLayout.LayoutParams(dp(activity, 1f), dp(activity, 12f)).apply {
-                marginStart = dp(activity, 8f)
-                marginEnd = dp(activity, 7f)
-            }
-        }
-
-        val langBadge = TextView(activity).apply {
-            tag = TAG_LANG
-            isSingleLine = true
-            maxLines = 1
-            includeFontPadding = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        }
-
-        container.addView(statusDot)
-        container.addView(metricsText)
-        container.addView(divider)
-        container.addView(langBadge)
-
-        var downRawX = 0f
-        var downRawY = 0f
-        var startTransX = 0f
-        var startTransY = 0f
-        var downTime = 0L
-        var dragging = false
-
-        container.setOnTouchListener { v, event ->
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    downRawX = event.rawX
-                    downRawY = event.rawY
-                    startTransX = v.translationX
-                    startTransY = v.translationY
-                    downTime = System.currentTimeMillis()
-                    dragging = false
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - downRawX
-                    val dy = event.rawY - downRawY
-                    if (!dragging && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
-                        dragging = true
-                    }
-                    if (dragging) {
-                        v.translationX = startTransX + dx
-                        v.translationY = startTransY + dy
-                        savedOffsetX = v.translationX
-                        savedOffsetY = v.translationY
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    if (!dragging) {
-                        val heldMs = System.currentTimeMillis() - downTime
-                        if (heldMs >= 450L) {
-                            isCollapsed = !isCollapsed
-                        } else if (isCollapsed) {
-                            isCollapsed = false
-                        } else {
-                            currentLang = if (currentLang == Lang.ZH) Lang.EN else Lang.ZH
-                        }
-                        bind(activity, v as LinearLayout, snapshotProvider())
-                        onTapRefresh()
-                    }
-                    true
-                }
-                else -> false
-            }
-        }
-
-        return container
-    }
-
-    fun bind(context: Context, container: LinearLayout, snapshot: Snapshot) {
-        val palette = resolvePalette(context)
-
-        container.background = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = dp(context, 20f).toFloat()
-            setColor(palette.backgroundFill)
-            setStroke(maxOf(1, dp(context, 1f)), palette.borderStroke)
-        }
-
-        container.findViewWithTag<View>(TAG_DOT)?.background = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(if (snapshot.hasLiveData) palette.liveDotColor else palette.idleDotColor)
-        }
-
-        val metricsTv = container.findViewWithTag<TextView>(TAG_METRICS)
-        val divider = container.findViewWithTag<View>(TAG_DIVIDER)
-        val langTv = container.findViewWithTag<TextView>(TAG_LANG)
-
-        metricsTv?.text = buildSingleLineSpannable(snapshot, currentLang, isCollapsed, palette)
-
-        if (isCollapsed) {
-            divider?.visibility = View.GONE
-            langTv?.visibility = View.GONE
-        } else {
-            divider?.visibility = View.VISIBLE
-            divider?.setBackgroundColor(palette.dividerColor)
-            langTv?.visibility = View.VISIBLE
-            langTv?.setTextColor(palette.accentLangText)
-            langTv?.text = if (currentLang == Lang.ZH) "ZH" else "EN"
-        }
-    }
-
-    private fun buildSingleLineSpannable(
-        s: Snapshot,
-        lang: Lang,
-        collapsed: Boolean,
-        palette: Palette
-    ): CharSequence {
-        val sb = SpannableStringBuilder()
-
-        fun appendSegment(label: String, value: String, addSep: Boolean) {
-            val lStart = sb.length
-            sb.append(label)
-            sb.setSpan(
-                ForegroundColorSpan(palette.mutedLabelText),
-                lStart,
-                sb.length,
-                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-            )
-
-            val vStart = sb.length
-            sb.append(value)
-            sb.setSpan(
-                ForegroundColorSpan(palette.primaryText),
-                vStart,
-                sb.length,
-                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-            )
-            sb.setSpan(
-                StyleSpan(Typeface.BOLD),
-                vStart,
-                sb.length,
-                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-            )
-
-            if (addSep) {
-                val sepStart = sb.length
-                sb.append(" · ")
-                sb.setSpan(
-                    ForegroundColorSpan(palette.mutedLabelText),
-                    sepStart,
-                    sb.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-            }
-        }
-
-        if (collapsed) {
-            appendSegment("5h ", s.fiveHourQuota, false)
-            return sb
-        }
-
-        if (lang == Lang.ZH) {
-            appendSegment("5h ", s.fiveHourQuota, true)
-            appendSegment("周 ", s.weeklyLimit, true)
-            appendSegment("重置 ", s.resetTimer, false)
-        } else {
-            appendSegment("5h ", s.fiveHourQuota, true)
-            appendSegment("Wk ", s.weeklyLimit, true)
-            appendSegment("Rst ", s.resetTimer, false)
-        }
-        return sb
-    }
-}
-`;
-
-export const QUOTA_HOOK_KT = `package com.example.bardquotahook
-
-import android.annotation.SuppressLint
-import android.app.Activity
-import android.app.AndroidAppHelper
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.content.res.Configuration
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import android.text.BoringLayout
-import android.text.TextPaint
-import android.util.Log
-import android.view.View
-import android.view.ViewGroup
-import android.webkit.WebView
-import android.widget.LinearLayout
-import android.widget.TextView
-import de.robv.android.xposed.IXposedHookLoadPackage
-import de.robv.android.xposed.IXposedHookZygoteInit
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
-import org.json.JSONArray
-import org.json.JSONObject
-import org.json.JSONTokener
-import java.lang.ref.WeakReference
-import java.nio.ByteBuffer
-import java.nio.CharBuffer
-import java.nio.charset.Charset
-import java.nio.charset.CharsetDecoder
-import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicReference
-
-class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
-
-    companion object {
-        private const val TAG = "BardQuota"
-        private const val ACTION_QUOTA_SYNC = "com.example.bardquotahook.ACTION_QUOTA_SYNC"
-
-        @Volatile private var mainHandler: Handler? = null
-
-        private val inHookGuard = object : ThreadLocal<Boolean>() {
-            override fun initialValue(): Boolean = false
-        }
-
-        private inline fun withReentrancyGuard(block: () -> Unit) {
-            if (inHookGuard.get() == true) return
-            inHookGuard.set(true)
-            try {
-                block()
-            } catch (t: Throwable) {
-                logDebug("Hook callback err: \${t.javaClass.simpleName}: \${t.message}")
-            } finally {
-                inHookGuard.set(false)
-            }
-        }
-
-        private fun postToMain(delayMs: Long = 0L, action: () -> Unit) {
-            try {
-                val looper = Looper.getMainLooper() ?: return
-                val handler = mainHandler ?: Handler(looper).also { mainHandler = it }
-                val runnable = Runnable {
-                    try {
-                        action()
-                    } catch (t: Throwable) {
-                        logDebug("Main runnable err: \${t.message}")
-                    }
-                }
-                if (delayMs > 0L) handler.postDelayed(runnable, delayMs) else handler.post(runnable)
-            } catch (_: Throwable) {
-            }
-        }
-
-        private val activeActivityRef = AtomicReference<WeakReference<Activity>>(WeakReference(null))
-        private val overlayContainerRef = AtomicReference<WeakReference<LinearLayout>>(WeakReference(null))
-        private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
-        private val receiverRef = AtomicReference<WeakReference<BroadcastReceiver>>(WeakReference(null))
-        private val unhookRefs = CopyOnWriteArrayList<WeakReference<XC_MethodHook.Unhook>>()
-
-        private val latestSnapshot = AtomicReference(QuotaHudLayout.Snapshot())
-
-        @Volatile private var pendingSlot: MetricKind? = null
-        @Volatile private var pendingSlotTimestampMs: Long = 0L
-
-        private val keyRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(
-                """["']?([a-zA-Z0-9_]*(?:quota|remaining|limit|reset|cap|usage|window)[a-zA-Z0-9_]*)["']?\\s*[:=]\\s*["']?([^"',}\\]\\n]{1,40})["']?""",
-                RegexOption.IGNORE_CASE
-            )
-        }
-
-        private val ratioOrPctRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex("""(\\d+\\s*/\\s*\\d+|\\d+(?:\\.\\d+)?%)""")
-        }
-
-        private val countMetricRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex("""(\\d+\\s*(?:次|条|left|remaining|used|prompts?|messages?|queries))""", RegexOption.IGNORE_CASE)
-        }
-
-        private val standaloneMetricRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex("""^(?:已用\\s*|剩余\\s*)?(\\d+\\s*/\\s*\\d+|\\d+(?:\\.\\d+)?%)(?:\\s*(?:used|remaining|left|已用|剩余))?\$""", RegexOption.IGNORE_CASE)
-        }
-
-        private val compactTimeRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(
-                """(\\d{1,2}:\\d{2}(?::\\d{2})?(?:\\s*[AP]M)?|\\d+\\s*(?:h|hr|hrs|小时|时)\\s*\\d*\\s*(?:m|min|mins|分钟|分)?|\\d+\\s*(?:m|min|mins|分钟|分))""",
-                RegexOption.IGNORE_CASE
-            )
-        }
-
-        private val fiveHourLabelRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(
-                """.*(5\\s*(-|\\s)?(hour|hr|h|小时)|5h|current\\s+(?:session|window|cycle)|当前周期|短周期|remaining\\s*prompts?|剩余\\s*\\d+).*""",
-                RegexOption.IGNORE_CASE
-            )
-        }
-
-        private val weeklyLabelRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(
-                """.*(weekly|week|每周|周限额|周上限|周额度|7\\s*(-|\\s)?(day|天)).*""",
-                RegexOption.IGNORE_CASE
-            )
-        }
-
-        private val resetLabelRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(
-                """.*(resets?\\b|重置|恢复|refreshes?\\s+in|available\\s+(in|at)|try\\s+again\\s+(in|after|at)|后重置).*""",
-                RegexOption.IGNORE_CASE
-            )
-        }
-
-        private fun logInfo(msg: String) {
-            try {
-                XposedBridge.log("[\$TAG] \$msg")
-                Log.i(TAG, msg)
-            } catch (_: Throwable) {
-            }
-        }
-
-        private fun logDebug(msg: String) {
-            try {
-                Log.d(TAG, msg)
-            } catch (_: Throwable) {
-            }
-        }
-    }
-
-    enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }
-
-    override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        safeTry("initZygote") {
-            logInfo("initZygote -> \${startupParam.modulePath}")
-        }
-    }
-
-    override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        safeTry("handleLoadPackage") {
-            val pkg = lpparam.packageName ?: return@safeTry
-            if (pkg == "android" || pkg == "com.example.bardquotahook") return@safeTry
-            logInfo("Loaded pkg=\$pkg proc=\${lpparam.processName}")
-
-            safeTry("hookJsonConstructors") { hookJsonConstructors() }
-            safeTry("hookStringConstructors") { hookStringConstructors() }
-            safeTry("hookCharsetDecoder") { hookCharsetDecoder() }
-
-            safeTry("hookActivityLifecycle") { hookActivityLifecycle() }
-            safeTry("hookUiTextLayouts") { hookUiTextLayouts() }
-            safeTry("hookWebViewDom") { hookWebViewDom() }
-        }
-    }
-
-    private inline fun safeTry(tag: String, block: () -> Unit) {
-        try {
-            block()
-        } catch (t: Throwable) {
-            logDebug("\$tag failed safely: \${t.javaClass.simpleName}: \${t.message}")
-        }
-    }
-
-    private fun findClassSafe(name: String, cl: ClassLoader? = null): Class<*>? {
-        return try {
-            XposedHelpers.findClassIfExists(name, cl)
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    private fun trackUnhook(unhook: XC_MethodHook.Unhook?) {
-        if (unhook != null) unhookRefs.add(WeakReference(unhook))
-    }
-
-    private fun safeHookMethod(clazz: Class<*>?, method: String, vararg paramsAndCallback: Any) {
-        if (clazz == null) return
-        try {
-            trackUnhook(XposedHelpers.findAndHookMethod(clazz, method, *paramsAndCallback))
-        } catch (t: Throwable) {
-            logDebug("Hook method \${clazz.name}.\$method skipped: \${t.javaClass.simpleName}")
-        }
-    }
-
-    private fun safeHookAllMethods(clazz: Class<*>?, method: String, callback: XC_MethodHook) {
-        if (clazz == null) return
-        try {
-            XposedBridge.hookAllMethods(clazz, method, callback)?.forEach { trackUnhook(it) }
-        } catch (t: Throwable) {
-            logDebug("HookAllMethods \${clazz.name}.\$method skipped: \${t.javaClass.simpleName}")
-        }
-    }
-
-    private fun safeHookConstructor(clazz: Class<*>?, vararg paramsAndCallback: Any) {
-        if (clazz == null) return
-        try {
-            trackUnhook(XposedHelpers.findAndHookConstructor(clazz, *paramsAndCallback))
-        } catch (t: Throwable) {
-            logDebug("Hook ctor \${clazz.name} skipped: \${t.javaClass.simpleName}")
-        }
-    }
-
-    private fun hookJsonConstructors() {
-        safeHookConstructor(
-            JSONObject::class.java,
-            String::class.java,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val raw = param.args.firstOrNull() as? String ?: return
-                    if (!fastHasQuotaKeyword(raw)) return
-                    withReentrancyGuard {
-                        val obj = param.thisObject as? JSONObject ?: return@withReentrancyGuard
-                        inspectJsonObject(obj, "JSONObj")
-                    }
-                }
-            }
-        )
-
-        safeHookConstructor(
-            JSONObject::class.java,
-            JSONTokener::class.java,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    withReentrancyGuard {
-                        val obj = param.thisObject as? JSONObject ?: return@withReentrancyGuard
-                        inspectJsonObject(obj, "JSONTok")
-                    }
-                }
-            }
-        )
-
-        safeHookConstructor(
-            JSONArray::class.java,
-            String::class.java,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val raw = param.args.firstOrNull() as? String ?: return
-                    if (!fastHasQuotaKeyword(raw)) return
-                    withReentrancyGuard {
-                        val arr = param.thisObject as? JSONArray ?: return@withReentrancyGuard
-                        val extracted = mutableMapOf<String, String>()
-                        collectFromJson(arr, extracted, 0)
-                        if (extracted.isNotEmpty()) mergeExtractedFields(extracted, "JSONArr")
-                    }
-                }
-            }
-        )
-    }
-
-    private fun hookStringConstructors() {
-        val stringHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val str = param.thisObject as? String ?: return
-                if (!fastHasQuotaKeyword(str)) return
-                withReentrancyGuard {
-                    parseRawPayload(str, "StrCtor")
-                }
-            }
-        }
-
-        safeHookConstructor(
-            String::class.java,
-            ByteArray::class.java,
-            Int::class.javaPrimitiveType!!,
-            Int::class.javaPrimitiveType!!,
-            Charset::class.java,
-            stringHook
-        )
-        safeHookConstructor(
-            String::class.java,
-            ByteArray::class.java,
-            Charset::class.java,
-            stringHook
-        )
-        safeHookConstructor(
-            String::class.java,
-            ByteArray::class.java,
-            Int::class.javaPrimitiveType!!,
-            Int::class.javaPrimitiveType!!,
-            String::class.java,
-            stringHook
-        )
-        safeHookConstructor(
-            String::class.java,
-            ByteArray::class.java,
-            String::class.java,
-            stringHook
-        )
-        safeHookConstructor(
-            String::class.java,
-            ByteArray::class.java,
-            stringHook
-        )
-        safeHookConstructor(
-            String::class.java,
-            CharArray::class.java,
-            Int::class.javaPrimitiveType!!,
-            Int::class.javaPrimitiveType!!,
-            stringHook
-        )
-    }
-
-    private fun hookCharsetDecoder() {
-        safeHookMethod(
-            CharsetDecoder::class.java,
-            "decode",
-            ByteBuffer::class.java,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val cb = param.result as? CharBuffer ?: return
-                    val rem = cb.remaining()
-                    if (rem !in 6..262_144) return
-                    val str = cb.toString()
-                    if (!fastHasQuotaKeyword(str)) return
-                    withReentrancyGuard {
-                        parseRawPayload(str, "Decoder")
-                    }
-                }
-            }
-        )
-    }
-
-    private fun fastHasQuotaKeyword(text: String): Boolean {
-        val len = text.length
-        if (len < 6 || len > 262_144) return false
-        return text.contains("quota", ignoreCase = true) ||
-            text.contains("remaining", ignoreCase = true) ||
-            text.contains("limit", ignoreCase = true) ||
-            text.contains("reset", ignoreCase = true) ||
-            text.contains("5-hour", ignoreCase = true) ||
-            text.contains("weekly", ignoreCase = true) ||
-            text.contains("小时") ||
-            text.contains("剩余") ||
-            text.contains("限额") ||
-            text.contains("额度") ||
-            text.contains("重置")
-    }
-
-    private fun hookActivityLifecycle() {
-        safeHookMethod(
-            Activity::class.java,
-            "onResume",
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    withReentrancyGuard {
-                        val activity = param.thisObject as? Activity ?: return@withReentrancyGuard
-                        if (activity.isFinishing || activity.isDestroyed) return@withReentrancyGuard
-                        activeActivityRef.set(WeakReference(activity))
-                        registerCrossProcessReceiver(activity)
-                        attachOrUpdateOverlay()
-                        scheduleWebViewPoll()
-                    }
-                }
-            }
-        )
-
-        safeHookMethod(
-            Activity::class.java,
-            "onConfigurationChanged",
-            Configuration::class.java,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    withReentrancyGuard {
-                        val activity = param.thisObject as? Activity ?: return@withReentrancyGuard
-                        if (activeActivityRef.get().get() === activity) {
-                            attachOrUpdateOverlay()
-                        }
-                    }
-                }
-            }
-        )
-
-        safeHookMethod(
-            Activity::class.java,
-            "onDestroy",
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    withReentrancyGuard {
-                        val destroyed = param.thisObject as? Activity ?: return@withReentrancyGuard
-                        if (activeActivityRef.get().get() === destroyed) {
-                            unregisterCrossProcessReceiver(destroyed)
-                            activeActivityRef.set(WeakReference(null))
-                            overlayContainerRef.set(WeakReference(null))
-                        }
-                        unhookRefs.removeIf { it.get() == null }
-                    }
-                }
-            }
-        )
-    }
-
-    private fun hookUiTextLayouts() {
-        safeHookAllMethods(
-            BoringLayout::class.java,
-            "isBoring",
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val cs = param.args.firstOrNull() as? CharSequence ?: return
-                    if (cs.length !in 2..180) return
-                    withReentrancyGuard {
-                        inspectUiText(cs.toString(), "Compose")
-                    }
-                }
-            }
-        )
-
-        val staticBuilderCls = findClassSafe("android.text.StaticLayout\\$Builder", null)
-        safeHookMethod(
-            staticBuilderCls,
-            "obtain",
-            CharSequence::class.java,
-            Int::class.javaPrimitiveType!!,
-            Int::class.javaPrimitiveType!!,
-            TextPaint::class.java,
-            Int::class.javaPrimitiveType!!,
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val cs = param.args.firstOrNull() as? CharSequence ?: return
-                    if (cs.length !in 2..260) return
-                    withReentrancyGuard {
-                        inspectUiText(cs.toString(), "Compose")
-                    }
-                }
-            }
-        )
-
-        safeHookMethod(
-            TextView::class.java,
-            "setText",
-            CharSequence::class.java,
-            TextView.BufferType::class.java,
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val tv = param.thisObject as? TextView ?: return
-                    val tagStr = tv.tag as? String
-                    if (tagStr != null && tagStr.startsWith("bard_quota_hud")) return
-                    val cs = param.args.firstOrNull() as? CharSequence ?: return
-                    if (cs.length !in 2..200) return
-                    withReentrancyGuard {
-                        inspectUiText(cs.toString(), "View")
-                    }
-                }
-            }
-        )
-    }
-
-    private fun hookWebViewDom() {
-        safeHookMethod(
-            View::class.java,
-            "onAttachedToWindow",
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val wv = param.thisObject as? WebView ?: return
-                    activeWebViewRef.set(WeakReference(wv))
-                    scheduleWebViewPoll()
-                }
-            }
-        )
-    }
-
-    private fun scheduleWebViewPoll() {
-        postToMain(delayMs = 1000L) {
-            val wv = activeWebViewRef.get().get() ?: return@postToMain
-            if (!wv.isShown) return@postToMain
-            safeTry("evaluateJavascript") {
-                wv.evaluateJavascript(
-                    "(function(){return document.body ? document.body.innerText : '';})()"
-                ) { rawJsString ->
-                    safeTry("webViewDomResult") {
-                        if (!rawJsString.isNullOrBlank() && rawJsString != "null") {
-                            val unescaped = rawJsString.trim('"').replace("\\\\n", "\\n")
-                            inspectUiText(unescaped, "WebView")
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    @SuppressLint("UnspecifiedRegisterReceiverFlag")
-    private fun registerCrossProcessReceiver(activity: Activity) {
-        if (receiverRef.get().get() != null) return
-        safeTry("registerReceiver") {
-            val appCtx = activity.applicationContext ?: return@safeTry
-            val receiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    safeTry("onReceiveQuotaSync") {
-                        if (intent?.action != ACTION_QUOTA_SYNC) return@safeTry
-                        val prev = latestSnapshot.get()
-                        val five = intent.getStringExtra("five") ?: prev.fiveHourQuota
-                        val week = intent.getStringExtra("week") ?: prev.weeklyLimit
-                        val reset = intent.getStringExtra("reset") ?: prev.resetTimer
-                        val src = intent.getStringExtra("src") ?: "IPC"
-                        applyLocalSnapshot(five, week, reset, src)
-                    }
-                }
-            }
-            val filter = IntentFilter(ACTION_QUOTA_SYNC)
-            if (Build.VERSION.SDK_INT >= 33) {
-                appCtx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                appCtx.registerReceiver(receiver, filter)
-            }
-            receiverRef.set(WeakReference(receiver))
-        }
-    }
-
-    private fun unregisterCrossProcessReceiver(activity: Activity) {
-        val receiver = receiverRef.get().get() ?: return
-        safeTry("unregisterReceiver") {
-            activity.applicationContext?.unregisterReceiver(receiver)
-        }
-        receiverRef.set(WeakReference(null))
-    }
-
-    private fun extractMetricToken(line: String, kind: MetricKind): String? {
-        when (kind) {
-            MetricKind.FIVE_HOUR, MetricKind.WEEKLY -> {
-                ratioOrPctRegex.find(line)?.value?.replace(" ", "")?.let { return it }
-                countMetricRegex.find(line)?.value?.trim()?.let { return it.take(14) }
-            }
-            MetricKind.RESET -> {
-                compactTimeRegex.find(line)?.value?.trim()?.let { return it }
-            }
-        }
-        return null
-    }
-
-    private fun normalizeValue(raw: String, kind: MetricKind): String {
-        val singleLine = raw.replace(Regex("\\\\s+"), " ").trim()
-        if (singleLine.isEmpty()) return "--"
-        extractMetricToken(singleLine, kind)?.let { return it }
-        return if (singleLine.length > 15) singleLine.take(14) + "…" else singleLine
-    }
-
-    private fun inspectUiText(block: String, source: String) {
-        if (block.contains("5h ") && (block.contains("· 周 ") || block.contains("· Wk "))) return
-        val prev = latestSnapshot.get()
-        var fiveHour = prev.fiveHourQuota
-        var weekly = prev.weeklyLimit
-        var reset = prev.resetTimer
-        var hit = false
-        val now = System.currentTimeMillis()
-
-        for (rawLine in block.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.length !in 2..140) continue
-
-            val activeSlot = pendingSlot
-            if (activeSlot != null && (now - pendingSlotTimestampMs) <= 450L) {
-                if (activeSlot == MetricKind.RESET) {
-                    val resetMatch = compactTimeRegex.find(line)?.value?.trim()
-                    if (resetMatch != null) {
-                        reset = resetMatch
-                        hit = true
-                        pendingSlot = null
-                        continue
-                    }
-                } else if (standaloneMetricRegex.matches(line)) {
-                    val token = extractMetricToken(line, activeSlot) ?: line.take(12)
-                    if (activeSlot == MetricKind.FIVE_HOUR) fiveHour = token else weekly = token
-                    hit = true
-                    pendingSlot = null
-                    continue
-                }
-            }
-
-            if (fiveHourLabelRegex.matches(line)) {
-                val token = extractMetricToken(line, MetricKind.FIVE_HOUR)
-                if (token != null) {
-                    fiveHour = token
-                    hit = true
-                    pendingSlot = null
-                } else {
-                    pendingSlot = MetricKind.FIVE_HOUR
-                    pendingSlotTimestampMs = now
-                }
-            } else if (weeklyLabelRegex.matches(line)) {
-                val token = extractMetricToken(line, MetricKind.WEEKLY)
-                if (token != null) {
-                    weekly = token
-                    hit = true
-                    pendingSlot = null
-                } else {
-                    pendingSlot = MetricKind.WEEKLY
-                    pendingSlotTimestampMs = now
-                }
-            } else if (resetLabelRegex.matches(line)) {
-                val token = extractMetricToken(line, MetricKind.RESET)
-                if (token != null) {
-                    reset = token
-                    hit = true
-                    pendingSlot = null
-                } else {
-                    pendingSlot = MetricKind.RESET
-                    pendingSlotTimestampMs = now
-                }
-            }
-        }
-
-        if (hit) publishSnapshot(fiveHour, weekly, reset, source)
-    }
-
-    private fun parseRawPayload(payload: String, source: String) {
-        val cleaned = payload
-            .removePrefix(")]}'\\n")
-            .removePrefix(")]}'")
-            .trim()
-
-        val firstBracket = cleaned.indexOfFirst { it == '{' || it == '[' }
-        if (firstBracket in 0..32) {
-            val candidate = cleaned.substring(firstBracket)
-            try {
-                when (val node = JSONTokener(candidate).nextValue()) {
-                    is JSONObject -> inspectJsonObject(node, source)
-                    is JSONArray -> {
-                        val extracted = mutableMapOf<String, String>()
-                        collectFromJson(node, extracted, 0)
-                        if (extracted.isNotEmpty()) mergeExtractedFields(extracted, source)
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-        }
-
-        val unescaped = cleaned.replace("\\\\\\"", "\\"")
-        val extracted = mutableMapOf<String, String>()
-        keyRegex.findAll(unescaped).take(40).forEach { match ->
-            extracted[match.groupValues[1].lowercase()] = match.groupValues[2]
-        }
-        if (extracted.isNotEmpty()) mergeExtractedFields(extracted, source)
-        inspectUiText(unescaped, source)
-    }
-
-    private fun inspectJsonObject(json: JSONObject, source: String) {
-        val extracted = mutableMapOf<String, String>()
-        collectFromJson(json, extracted, 0)
-        if (extracted.isNotEmpty()) mergeExtractedFields(extracted, source)
-    }
-
-    private fun collectFromJson(node: Any?, out: MutableMap<String, String>, depth: Int) {
-        if (depth > 6 || node == null) return
-        when (node) {
-            is JSONObject -> {
-                val keys = node.keys()
-                while (keys.hasNext()) {
-                    val key = keys.next()
-                    val value = node.opt(key)
-                    if (fastHasQuotaKeyword(key) && value != null && value !is JSONObject && value !is JSONArray) {
-                        out[key.lowercase()] = value.toString()
-                    } else {
-                        collectFromJson(value, out, depth + 1)
-                    }
-                }
-            }
-            is JSONArray -> {
-                for (i in 0 until minOf(node.length(), 40)) {
-                    val elem = node.opt(i)
-                    if (elem is String && fastHasQuotaKeyword(elem)) {
-                        val trimmed = elem.trim()
-                        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-                            try {
-                                collectFromJson(JSONTokener(trimmed).nextValue(), out, depth + 1)
-                            } catch (_: Throwable) {
-                                parseRawPayload(trimmed, "BatchRPC")
-                            }
-                        } else {
-                            parseRawPayload(trimmed, "BatchRPC")
-                        }
-                    } else {
-                        collectFromJson(elem, out, depth + 1)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun mergeExtractedFields(fields: Map<String, String>, source: String) {
-        val prev = latestSnapshot.get()
-        var fiveHour = prev.fiveHourQuota
-        var weekly = prev.weeklyLimit
-        var reset = prev.resetTimer
-
-        var remainingVal: String? = null
-        var totalLimitVal: String? = null
-
-        for ((k, v) in fields) {
-            when {
-                k == "remaining" || k.endsWith("_remaining") || k.startsWith("remaining_") -> remainingVal = v
-                k == "limit" || k == "quota_limit" || k == "max_quota" -> totalLimitVal = v
-                k.contains("5h") || k.contains("five") || k.contains("window") || k.contains("quota") ->
-                    fiveHour = normalizeValue(v, MetricKind.FIVE_HOUR)
-                k.contains("week") || k.contains("cap") ->
-                    weekly = normalizeValue(v, MetricKind.WEEKLY)
-                k.contains("reset") || k.contains("expire") ->
-                    reset = normalizeValue(v, MetricKind.RESET)
-            }
-        }
-
-        if (remainingVal != null && totalLimitVal != null && remainingVal.all { it.isDigit() } && totalLimitVal.all { it.isDigit() }) {
-            fiveHour = "\$remainingVal/\$totalLimitVal"
-        } else if (remainingVal != null && fiveHour == prev.fiveHourQuota) {
-            fiveHour = normalizeValue(remainingVal, MetricKind.FIVE_HOUR)
-        } else if (totalLimitVal != null && weekly == prev.weeklyLimit) {
-            weekly = normalizeValue(totalLimitVal, MetricKind.WEEKLY)
-        }
-
-        publishSnapshot(fiveHour, weekly, reset, source)
-    }
-
-    private fun publishSnapshot(fiveHour: String, weekly: String, reset: String, source: String) {
-        val changed = applyLocalSnapshot(fiveHour, weekly, reset, source)
-        if (!changed) return
-
-        safeTry("sendQuotaBroadcast") {
-            val appCtx = AndroidAppHelper.currentApplication()
-                ?: activeActivityRef.get().get()?.applicationContext
-                ?: return@safeTry
-            val intent = Intent(ACTION_QUOTA_SYNC).apply {
-                setPackage(appCtx.packageName)
-                putExtra("five", fiveHour)
-                putExtra("week", weekly)
-                putExtra("reset", reset)
-                putExtra("src", source)
-            }
-            appCtx.sendBroadcast(intent)
-        }
-    }
-
-    private fun applyLocalSnapshot(fiveHour: String, weekly: String, reset: String, source: String): Boolean {
-        val prev = latestSnapshot.get()
-        if (prev.fiveHourQuota == fiveHour && prev.weeklyLimit == weekly && prev.resetTimer == reset) return false
-        logInfo("[\$source] 5h=\$fiveHour | week=\$weekly | reset=\$reset")
-        latestSnapshot.set(QuotaHudLayout.Snapshot(fiveHour, weekly, reset, source))
-        attachOrUpdateOverlay()
-        return true
-    }
-
-    private fun attachOrUpdateOverlay() {
-        postToMain {
-            val activity = activeActivityRef.get().get() ?: return@postToMain
-            if (activity.isFinishing || activity.isDestroyed) return@postToMain
-
-            val root = activity.findViewById<ViewGroup>(android.R.id.content) ?: return@postToMain
-            var container = root.findViewWithTag<LinearLayout>(QuotaHudLayout.OVERLAY_TAG)
-                ?: overlayContainerRef.get().get()
-
-            if (container == null || container.parent == null) {
-                container = QuotaHudLayout.createContainer(
-                    activity = activity,
-                    snapshotProvider = { latestSnapshot.get() },
-                    onTapRefresh = { scheduleWebViewPoll() }
-                )
-                root.addView(container, QuotaHudLayout.defaultLayoutParams(activity))
-                overlayContainerRef.set(WeakReference(container))
-            }
-
-            withReentrancyGuard {
-                QuotaHudLayout.bind(activity, container, latestSnapshot.get())
-                container.bringToFront()
-            }
-        }
-    }
-}
-`;
-
 export const PROJECT_FILES: ProjectFile[] = [
   {
-    path: '.github/workflows/android.yml',
-    label: 'android.yml (GitHub Actions)',
-    language: 'yaml',
-    descriptionZh: '基于 ubuntu-24.04 + JDK 17 + Gradle 8.9 自动产出单 DEX 未压缩 Release APK。',
-    descriptionEn: 'GitHub Actions workflow on ubuntu-24.04 using JDK 17 + Gradle 8.9 to build a single uncompressed DEX APK.',
-    content: `name: Build LSPosed APK
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Accept Android SDK Licenses
-        run: yes | "\$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-
-      - name: Setup Gradle 8.9
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.9'
-
-      - name: Build Signed Single-DEX Release APK
-        run: gradle assembleRelease --no-daemon --stacktrace
-
-      - name: Upload Compiled APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: bard-quota-hook-release
-          path: app/build/outputs/apk/release/*.apk
-`,
+    "path": ".github/workflows/android.yml",
+    "label": "android.yml (CI)",
+    "language": "yaml",
+    "descriptionZh": "GitHub Actions 云端自动构建工作流 (Node 24 · setup-gradle@v6 · JDK 17)。",
+    "descriptionEn": "GitHub Actions cloud APK workflow (Node 24, setup-gradle@v6, JDK 17).",
+    "content": "name: Build LSPosed & LibXposed APK\n\non:\n  push:\n    branches: [ \"**\" ]\n  workflow_dispatch:\n\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: Checkout Source\n        uses: actions/checkout@v5\n\n      - name: Set up JDK 17\n        uses: actions/setup-java@v5\n        with:\n          distribution: 'temurin'\n          java-version: '17'\n\n      - name: Accept Android SDK Licenses\n        run: yes | \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --licenses > /dev/null || true\n\n      - name: Setup Gradle 8.9\n        uses: gradle/actions/setup-gradle@v6\n        with:\n          gradle-version: '8.9'\n\n      - name: Build Signed Single-DEX Release APK\n        run: gradle assembleRelease --no-daemon --stacktrace\n\n      - name: Upload Compiled APK\n        uses: actions/upload-artifact@v4\n        with:\n          name: bard-quota-hook-v1.8.0-release\n          path: app/build/outputs/apk/release/*.apk\n"
   },
   {
-    path: 'settings.gradle.kts',
-    label: 'settings.gradle.kts',
-    language: 'kotlin',
-    descriptionZh: '声明 Google、MavenCentral (LibXposed API 102) 与 Xposed 官方源 (api.xposed.info)。',
-    descriptionEn: 'Configures Google, MavenCentral (for LibXposed API 102), and api.xposed.info.',
-    content: `pluginManagement {
-    repositories {
-        google()
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-
-dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    repositories {
-        google()
-        mavenCentral()
-        maven { url = uri("https://api.xposed.info/") }
-    }
-}
-
-rootProject.name = "BardQuotaHook"
-include(":app")
-`,
+    "path": "settings.gradle.kts",
+    "label": "settings.gradle.kts",
+    "language": "kotlin",
+    "descriptionZh": "声明 Google、MavenCentral (LibXposed API 102) 与 Xposed 官方源 (api.xposed.info)。",
+    "descriptionEn": "Configures Google, MavenCentral (for LibXposed API 102), and api.xposed.info.",
+    "content": "pluginManagement {\n    repositories {\n        google()\n        mavenCentral()\n        gradlePluginPortal()\n    }\n}\n\ndependencyResolutionManagement {\n    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n    repositories {\n        google()\n        mavenCentral()\n        maven { url = uri(\"https://api.xposed.info/\") }\n    }\n}\n\nrootProject.name = \"BardQuotaHook\"\ninclude(\":app\")\n"
   },
   {
-    path: 'build.gradle.kts',
-    label: 'build.gradle.kts (Root)',
-    language: 'kotlin',
-    descriptionZh: '根工程配置，对齐 Android Gradle Plugin 8.5.2 与 Kotlin 1.9.24。',
-    descriptionEn: 'Root Gradle build file targeting AGP 8.5.2 and Kotlin 1.9.24.',
-    content: `plugins {
-    id("com.android.application") version "8.5.2" apply false
-    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-}
-`,
+    "path": "build.gradle.kts",
+    "label": "build.gradle.kts (Root)",
+    "language": "kotlin",
+    "descriptionZh": "根工程配置，对齐 Android Gradle Plugin 8.5.2 与 Kotlin 1.9.24。",
+    "descriptionEn": "Root Gradle build file targeting AGP 8.5.2 and Kotlin 1.9.24.",
+    "content": "plugins {\n    id(\"com.android.application\") version \"8.5.2\" apply false\n    id(\"org.jetbrains.kotlin.android\") version \"1.9.24\" apply false\n}\n"
   },
   {
-    path: 'gradle.properties',
-    label: 'gradle.properties',
-    language: 'properties',
-    descriptionZh: 'JVM 内存参数与 AndroidX 开关。',
-    descriptionEn: 'JVM heap arguments and standard Android build flags.',
-    content: `org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-android.useAndroidX=true
-kotlin.code.style=official
-android.nonTransitiveRClass=true
-`,
+    "path": "gradle.properties",
+    "label": "gradle.properties",
+    "language": "properties",
+    "descriptionZh": "JVM 内存参数与 AndroidX 开关。",
+    "descriptionEn": "JVM heap arguments and standard Android build flags.",
+    "content": "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\nkotlin.code.style=official\nandroid.nonTransitiveRClass=true\n"
   },
   {
-    path: 'app/build.gradle.kts',
-    label: 'app/build.gradle.kts',
-    language: 'kotlin',
-    descriptionZh: '应用模块构建脚本 (v1.7.0)：升级 Xposed API 102 (io.github.libxposed:api:102.0.0) 并兼容 Bridge API 82。',
-    descriptionEn: 'App module script (v1.7.0) upgraded to Xposed API 102 (io.github.libxposed:api:102.0.0) + Bridge API 82.',
-    content: `plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-}
-
-android {
-    namespace = "com.example.bardquotahook"
-    compileSdk = 34
-
-    defaultConfig {
-        applicationId = "com.example.bardquotahook"
-        minSdk = 24
-        targetSdk = 34
-        versionCode = 8
-        versionName = "1.7.0"
-    }
-
-    signingConfigs {
-        create("fixedRelease") {
-            val ksFile = file("signing.p12")
-            if (ksFile.exists()) {
-                storeFile = ksFile
-                storeType = "PKCS12"
-                storePassword = "android"
-                keyAlias = "androiddebugkey"
-                keyPassword = "android"
-            }
-        }
-    }
-
-    packaging {
-        dex {
-            useLegacyPackaging = false
-        }
-    }
-
-    lint {
-        checkReleaseBuilds = false
-        abortOnError = false
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = true
-            isShrinkResources = false
-            val ksFile = file("signing.p12")
-            signingConfig = if (ksFile.exists()) {
-                signingConfigs.getByName("fixedRelease")
-            } else {
-                signingConfigs.getByName("debug")
-            }
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
-        }
-        debug {
-            isMinifyEnabled = false
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-}
-
-dependencies {
-    // Modern Xposed / LibXposed API 102 (Maven Central)
-    compileOnly("io.github.libxposed:api:102.0.0")
-    // Legacy Xposed Bridge API (82 is the latest version in https://api.xposed.info/)
-    compileOnly("de.robv.android.xposed:api:82")
-}
-`,
+    "path": "app/build.gradle.kts",
+    "label": "app/build.gradle.kts",
+    "language": "kotlin",
+    "descriptionZh": "v1.8.0 构建配置：minSdk=26，合并 META-INF/xposed/*，同时支持 LibXposed API 102 与 Xposed API 82。",
+    "descriptionEn": "v1.8.0 module build script: minSdk=26, merges META-INF/xposed/*, compiles against LibXposed API 102 + Bridge API 82.",
+    "content": "plugins {\n    id(\"com.android.application\")\n    id(\"org.jetbrains.kotlin.android\")\n}\n\nandroid {\n    namespace = \"com.example.bardquotahook\"\n    compileSdk = 34\n\n    defaultConfig {\n        applicationId = \"com.example.bardquotahook\"\n        minSdk = 26\n        targetSdk = 34\n        versionCode = 9\n        versionName = \"1.8.0\"\n    }\n\n    signingConfigs {\n        create(\"fixedRelease\") {\n            val ksFile = file(\"signing.p12\")\n            if (ksFile.exists()) {\n                storeFile = ksFile\n                storeType = \"PKCS12\"\n                storePassword = \"android\"\n                keyAlias = \"androiddebugkey\"\n                keyPassword = \"android\"\n            }\n        }\n    }\n\n    packaging {\n        dex {\n            useLegacyPackaging = false\n        }\n        resources {\n            merges += \"META-INF/xposed/*\"\n        }\n    }\n\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n\n    buildTypes {\n        release {\n            isMinifyEnabled = true\n            isShrinkResources = false\n            val ksFile = file(\"signing.p12\")\n            signingConfig = if (ksFile.exists()) {\n                signingConfigs.getByName(\"fixedRelease\")\n            } else {\n                signingConfigs.getByName(\"debug\")\n            }\n            proguardFiles(\n                getDefaultProguardFile(\"proguard-android-optimize.txt\"),\n                \"proguard-rules.pro\"\n            )\n        }\n        debug {\n            isMinifyEnabled = false\n        }\n    }\n\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n\n    kotlinOptions {\n        jvmTarget = \"17\"\n    }\n}\n\ndependencies {\n    // Modern Xposed / LibXposed API 102 (Maven Central)\n    compileOnly(\"io.github.libxposed:api:102.0.0\")\n    compileOnly(\"androidx.annotation:annotation:1.8.0\")\n    // Legacy Xposed Bridge API (82 is the latest version in https://api.xposed.info/)\n    compileOnly(\"de.robv.android.xposed:api:82\")\n}\n"
   },
   {
-    path: 'app/proguard-rules.pro',
-    label: 'app/proguard-rules.pro',
-    language: 'pro',
-    descriptionZh: '保留 QuotaHookEntry、QuotaHudLayout 与 MainActivity，防止 R8 混淆移除。',
-    descriptionEn: 'Preserves QuotaHookEntry, QuotaHudLayout, and MainActivity during R8 single-DEX merge.',
-    content: `-dontwarn de.robv.android.xposed.**
--dontwarn io.github.libxposed.**
--dontwarn io.github.libxposed.annotation.**
-
--keep public class com.example.bardquotahook.QuotaHookEntry {
-    public <init>();
-    *;
-}
--keep public class com.example.bardquotahook.MainActivity {
-    public <init>();
-    *;
-}
--keep class com.example.bardquotahook.** {
-    *;
-}
--keep class * implements de.robv.android.xposed.IXposedHookLoadPackage {
-    public <init>();
-    *;
-}
--keepattributes *Annotation*,InnerClasses,Signature
-`,
+    "path": "app/proguard-rules.pro",
+    "label": "app/proguard-rules.pro",
+    "language": "pro",
+    "descriptionZh": "包含 -adaptresourcefilecontents META-INF/xposed/java_init.list 及双引擎入口保留规则。",
+    "descriptionEn": "Preserves ModernQuotaModule (API 102) & QuotaHookEntry (API 82) with java_init.list resource adaptation.",
+    "content": "-dontwarn de.robv.android.xposed.**\n-dontwarn io.github.libxposed.**\n-dontwarn io.github.libxposed.annotation.**\n-adaptresourcefilecontents META-INF/xposed/java_init.list\n\n-keep,allowoptimization public class com.example.bardquotahook.ModernQuotaModule {\n    public <init>();\n    *;\n}\n-keep,allowoptimization public class * extends io.github.libxposed.api.XposedModule {\n    public <init>();\n    *;\n}\n-keep public class com.example.bardquotahook.QuotaHookEntry {\n    public <init>();\n    *;\n}\n-keep public class com.example.bardquotahook.MainActivity {\n    public <init>();\n    *;\n}\n-keep public class com.example.bardquotahook.HookTelemetryReceiver {\n    public <init>();\n    *;\n}\n-keep class com.example.bardquotahook.** {\n    *;\n}\n-keep class * implements de.robv.android.xposed.IXposedHookLoadPackage {\n    public <init>();\n    *;\n}\n-keepattributes *Annotation*,InnerClasses,Signature\n"
   },
   {
-    path: 'app/src/main/AndroidManifest.xml',
-    label: 'AndroidManifest.xml',
-    language: 'xml',
-    descriptionZh: '包含 Android 11+ <queries> 包可见性声明、MainActivity 启动页与 LSPosed 元数据。',
-    descriptionEn: 'Android 11+ <queries> package visibility declarations, MainActivity launcher, and LSPosed metadata.',
-    content: `<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <!-- Android 11+ (API 30+) Package Visibility declarations -->
-    <queries>
-        <package android:name="com.google.android.apps.bard" />
-        <package android:name="com.google.android.googlequicksearchbox" />
-        <package android:name="com.android.chrome" />
-        <intent>
-            <action android:name="android.intent.action.MAIN" />
-            <category android:name="android.intent.category.LAUNCHER" />
-        </intent>
-    </queries>
-
-    <application
-        android:label="Gemini 用量监控 Hook"
-        android:hasCode="true">
-
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
-            </intent-filter>
-        </activity>
-
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="Gemini Usage Limits Sniffer &amp; Adaptive Single-Line HUD (ZH/EN)" />
-        <meta-data
-            android:name="xposedminversion"
-            android:value="82" />
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
-    </application>
-</manifest>
-`,
+    "path": "app/src/main/AndroidManifest.xml",
+    "label": "AndroidManifest.xml",
+    "language": "xml",
+    "descriptionZh": "声明 <queries> 包可见性、android:description (API 102)、HookTelemetryReceiver 与悬浮窗兜底权限。",
+    "descriptionEn": "Declares <queries>, android:description (API 102), HookTelemetryReceiver, INTERNET, and SYSTEM_ALERT_WINDOW.",
+    "content": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n\n    <uses-permission android:name=\"android.permission.INTERNET\" />\n    <uses-permission android:name=\"android.permission.SYSTEM_ALERT_WINDOW\" />\n\n    <!-- Android 11+ (API 30+) Package Visibility declarations -->\n    <queries>\n        <package android:name=\"com.google.android.apps.bard\" />\n        <package android:name=\"com.google.android.googlequicksearchbox\" />\n        <package android:name=\"com.android.chrome\" />\n        <intent>\n            <action android:name=\"android.intent.action.MAIN\" />\n            <category android:name=\"android.intent.category.LAUNCHER\" />\n        </intent>\n    </queries>\n\n    <application\n        android:label=\"@string/app_name\"\n        android:description=\"@string/module_description\"\n        android:usesCleartextTraffic=\"false\"\n        android:hasCode=\"true\">\n\n        <activity\n            android:name=\".MainActivity\"\n            android:exported=\"true\"\n            android:configChanges=\"orientation|screenSize|uiMode\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n                <category android:name=\"de.robv.android.xposed.category.MODULE_SETTINGS\" />\n                <category android:name=\"io.github.libxposed.category.MODULE_SETTINGS\" />\n            </intent-filter>\n        </activity>\n\n        <receiver\n            android:name=\".HookTelemetryReceiver\"\n            android:exported=\"true\">\n            <intent-filter>\n                <action android:name=\"com.example.bardquotahook.ACTION_HOOK_HEARTBEAT\" />\n            </intent-filter>\n        </receiver>\n\n        <!-- Legacy Xposed / LSPosed Bridge Metadata -->\n        <meta-data\n            android:name=\"xposedmodule\"\n            android:value=\"true\" />\n        <meta-data\n            android:name=\"xposeddescription\"\n            android:value=\"@string/module_description\" />\n        <meta-data\n            android:name=\"xposedminversion\"\n            android:value=\"82\" />\n        <meta-data\n            android:name=\"xposedscope\"\n            android:resource=\"@array/xposed_scope\" />\n    </application>\n</manifest>\n"
   },
   {
-    path: 'app/src/main/res/values/arrays.xml',
-    label: 'res/values/arrays.xml',
-    language: 'xml',
-    descriptionZh: '同时勾选 Gemini 壳应用与实际承载界面的 Google 主程序 (googlequicksearchbox)。',
-    descriptionEn: 'Scopes both the Bard launcher stub and Google App (googlequicksearchbox) where Gemini runs.',
-    content: `<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string-array name="xposed_scope">
-        <item>com.google.android.apps.bard</item>
-        <item>com.google.android.googlequicksearchbox</item>
-    </string-array>
-</resources>
-`,
+    "path": "app/src/main/res/values/strings.xml",
+    "label": "res/values/strings.xml",
+    "language": "xml",
+    "descriptionZh": "模块名称与 LibXposed API 102 所需的 @string/module_description 描述资源。",
+    "descriptionEn": "App label and @string/module_description required by Modern LibXposed API 102.",
+    "content": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n    <string name=\"app_name\">Gemini 用量监控 Hook</string>\n    <string name=\"module_description\">Gemini 用量实时监控 · 双引擎兼容 LibXposed API 102 &amp; LSPosed API 82 单行自适应胶囊 (ZH/EN)</string>\n</resources>\n"
   },
   {
-    path: 'app/src/main/assets/xposed_init',
-    label: 'assets/xposed_init',
-    language: 'text',
-    descriptionZh: 'Xposed 入口类完整限定名。',
-    descriptionEn: 'Fully qualified Xposed hook entry class name.',
-    content: `com.example.bardquotahook.QuotaHookEntry
-`,
+    "path": "app/src/main/res/values/arrays.xml",
+    "label": "res/values/arrays.xml",
+    "language": "xml",
+    "descriptionZh": "旧版 LSPosed 作用域声明 (bard + googlequicksearchbox)。",
+    "descriptionEn": "Legacy LSPosed scope array targeting bard and googlequicksearchbox.",
+    "content": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n    <string-array name=\"xposed_scope\">\n        <item>com.google.android.apps.bard</item>\n        <item>com.google.android.googlequicksearchbox</item>\n    </string-array>\n</resources>\n"
   },
   {
-    path: 'app/src/main/java/com/example/bardquotahook/MainActivity.kt',
-    label: 'MainActivity.kt',
-    language: 'kotlin',
-    descriptionZh: '模块设置引导页 (v1.7.0)：兼容 Android 11+/13+ 包可见性检测与四级回退启动 Gemini。',
-    descriptionEn: 'Module launcher & status UI (v1.7.0) with Android 11+/13+ package visibility check and 4-tier Gemini launch fallback.',
-    content: MAIN_ACTIVITY_KT,
+    "path": "app/src/main/assets/xposed_init",
+    "label": "assets/xposed_init",
+    "language": "text",
+    "descriptionZh": "Legacy Xposed API 82 入口类注册文件。",
+    "descriptionEn": "Legacy Xposed Bridge API 82 entry class descriptor.",
+    "content": "com.example.bardquotahook.QuotaHookEntry\n"
   },
   {
-    path: 'app/src/main/java/com/example/bardquotahook/QuotaHudLayout.kt',
-    label: 'QuotaHudLayout.kt',
-    language: 'kotlin',
-    descriptionZh: '单行横向自适应 HUD 布局代码：半透明圆角背景、深浅色高对比度动态主题、拖拽与点按中英切换。',
-    descriptionEn: 'Single-line horizontal HUD layout: translucent rounded background, dynamic Light/Dark colors, drag & ZH/EN toggle.',
-    content: QUOTA_HUD_LAYOUT_KT,
+    "path": "app/src/main/resources/META-INF/xposed/module.prop",
+    "label": "META-INF/xposed/module.prop",
+    "language": "properties",
+    "descriptionZh": "Modern LibXposed API 102 模块属性 (minApiVersion=101, targetApiVersion=102)。",
+    "descriptionEn": "Modern LibXposed API 102 module properties (Vector / Modern LSPosed).",
+    "content": "minApiVersion=101\ntargetApiVersion=102\nstaticScope=false\nautoHotReload=true\n"
   },
   {
-    path: 'app/src/main/java/com/example/bardquotahook/QuotaHookEntry.kt',
-    label: 'QuotaHookEntry.kt',
-    language: 'kotlin',
-    descriptionZh: '抗 R8 混淆核心 Hook (v1.7.0)：JSONObject + String(byte[]/char[]) 构造器拦截 + 状态化标签配对 + 全反射 Throwable 防崩保护。',
-    descriptionEn: 'R8-proof Xposed hook (v1.7.0): JSONObject + String(byte[]/char[]) constructors, stateful label pairing, and Throwable guards.',
-    content: QUOTA_HOOK_KT,
+    "path": "app/src/main/resources/META-INF/xposed/java_init.list",
+    "label": "META-INF/xposed/java_init.list",
+    "language": "text",
+    "descriptionZh": "Modern LibXposed API 102 Java 入口类注册表 (ModernQuotaModule)。",
+    "descriptionEn": "Modern LibXposed API 102 entry class list pointing to ModernQuotaModule.",
+    "content": "com.example.bardquotahook.ModernQuotaModule\n"
   },
+  {
+    "path": "app/src/main/resources/META-INF/xposed/scope.list",
+    "label": "META-INF/xposed/scope.list",
+    "language": "text",
+    "descriptionZh": "Modern LibXposed API 102 默认作用域列表 (bard + googlequicksearchbox)。",
+    "descriptionEn": "Modern LibXposed API 102 default scope list.",
+    "content": "com.google.android.apps.bard\ncom.google.android.googlequicksearchbox\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt",
+    "label": "ModernQuotaModule.kt",
+    "language": "kotlin",
+    "descriptionZh": "原生 LibXposed API 102 入口类 (继承 XposedModule)，解决 Vector / 新版 LSPosed 不加载问题。",
+    "descriptionEn": "Native LibXposed API 102 XposedModule subclass for Vector and modern LSPosed frameworks.",
+    "content": "package com.example.bardquotahook\n\nimport android.util.Log\nimport io.github.libxposed.api.XposedInterface\nimport io.github.libxposed.api.XposedInterface.ExceptionMode\nimport io.github.libxposed.api.XposedModule\nimport io.github.libxposed.api.XposedModuleInterface.HotReloadedParam\nimport io.github.libxposed.api.XposedModuleInterface.HotReloadingParam\nimport io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam\nimport io.github.libxposed.api.XposedModuleInterface.PackageReadyParam\nimport java.lang.reflect.Executable\n\n/**\n * Modern LibXposed API 101/102 Entry Point (Vector & Modern LSPosed).\n * Registered via `src/main/resources/META-INF/xposed/java_init.list`.\n */\nclass ModernQuotaModule : XposedModule() {\n\n    @Volatile\n    private var currentProcessName: String = \"unknown\"\n\n    override fun onModuleLoaded(param: ModuleLoadedParam) {\n        try {\n            currentProcessName = param.processName\n            log(\n                Log.INFO,\n                \"BardQuota\",\n                \"ModernQuotaModule loaded in proc=${param.processName} ($frameworkName $frameworkVersion API $apiVersion)\"\n            )\n        } catch (_: Throwable) {\n        }\n    }\n\n    override fun onHotReloading(param: HotReloadingParam): Boolean {\n        return true\n    }\n\n    override fun onHotReloaded(param: HotReloadedParam) {\n        try {\n            currentProcessName = param.processName\n            for (oldHandle in param.oldHookHandles) {\n                try {\n                    oldHandle.unhook()\n                } catch (_: Throwable) {\n                }\n            }\n        } catch (_: Throwable) {\n        }\n    }\n\n    override fun onPackageReady(param: PackageReadyParam) {\n        try {\n            val pkg = param.packageName\n            if (pkg == \"android\" || pkg == \"com.example.bardquotahook\") return\n\n            val moduleRef = this\n            val bridge = object : QuotaCoreEngine.HookBridge {\n                override val bridgeName: String\n                    get() = try {\n                        \"${moduleRef.frameworkName}-API-${moduleRef.apiVersion}\"\n                    } catch (_: Throwable) {\n                        \"LibXposed-102\"\n                    }\n\n                override fun log(msg: String) {\n                    try {\n                        moduleRef.log(Log.INFO, \"BardQuota\", msg)\n                    } catch (_: Throwable) {\n                    }\n                }\n\n                override fun hookExecutable(\n                    executable: Executable,\n                    before: ((thisObj: Any?, args: Array<Any?>) -> Unit)?,\n                    after: ((thisObj: Any?, args: Array<Any?>, result: Any?) -> Unit)?\n                ): (() -> Unit)? {\n                    return try {\n                        val handle = moduleRef.hook(executable)\n                            .setExceptionMode(ExceptionMode.PROTECTIVE)\n                            .intercept(XposedInterface.Hooker { chain ->\n                                val thisObj = chain.thisObject\n                                val rawArgs = chain.args\n                                val argsArr = Array<Any?>(rawArgs.size) { i -> rawArgs[i] }\n                                if (before != null) {\n                                    try {\n                                        before(thisObj, argsArr)\n                                    } catch (_: Throwable) {\n                                    }\n                                }\n                                val result = chain.proceed()\n                                if (after != null) {\n                                    try {\n                                        after(thisObj, argsArr, result)\n                                    } catch (_: Throwable) {\n                                    }\n                                }\n                                result\n                            })\n                        val unhookFn: () -> Unit = {\n                            try {\n                                handle.unhook()\n                            } catch (_: Throwable) {\n                            }\n                        }\n                        unhookFn\n                    } catch (t: Throwable) {\n                        try {\n                            moduleRef.log(\n                                Log.DEBUG,\n                                \"BardQuota\",\n                                \"Hook skipped ${executable.declaringClass.name}.${executable.name}: ${t.javaClass.simpleName}\"\n                            )\n                        } catch (_: Throwable) {\n                        }\n                        null\n                    }\n                }\n            }\n\n            QuotaCoreEngine.install(\n                packageName = pkg,\n                processName = currentProcessName,\n                classLoader = param.classLoader,\n                bridge = bridge\n            )\n        } catch (t: Throwable) {\n            try {\n                log(Log.ERROR, \"BardQuota\", \"onPackageReady err: ${t.message}\", t)\n            } catch (_: Throwable) {\n            }\n        }\n    }\n}\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/QuotaHookEntry.kt",
+    "label": "QuotaHookEntry.kt",
+    "language": "kotlin",
+    "descriptionZh": "兼容旧版 LSPosed (API 82-93) 的 IXposedHookLoadPackage 桥接入口。",
+    "descriptionEn": "Legacy XposedBridge API 82-93 adapter delegating to QuotaCoreEngine.",
+    "content": "package com.example.bardquotahook\n\nimport de.robv.android.xposed.IXposedHookLoadPackage\nimport de.robv.android.xposed.IXposedHookZygoteInit\nimport de.robv.android.xposed.XC_MethodHook\nimport de.robv.android.xposed.XposedBridge\nimport de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam\nimport java.lang.reflect.Executable\n\n/**\n * Legacy Xposed / LSPosed Bridge API 82-93 Entry Point.\n * Registered via `src/main/assets/xposed_init`.\n */\nclass QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {\n\n    override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {\n        try {\n            XposedBridge.log(\"[BardQuota] initZygote -> ${startupParam.modulePath}\")\n        } catch (_: Throwable) {\n        }\n    }\n\n    override fun handleLoadPackage(lpparam: LoadPackageParam) {\n        try {\n            val pkg = lpparam.packageName ?: return\n            if (pkg == \"android\" || pkg == \"com.example.bardquotahook\") return\n\n            val bridge = object : QuotaCoreEngine.HookBridge {\n                override val bridgeName: String = \"XposedBridge-API-82\"\n\n                override fun log(msg: String) {\n                    try {\n                        XposedBridge.log(msg)\n                    } catch (_: Throwable) {\n                    }\n                }\n\n                override fun hookExecutable(\n                    executable: Executable,\n                    before: ((thisObj: Any?, args: Array<Any?>) -> Unit)?,\n                    after: ((thisObj: Any?, args: Array<Any?>, result: Any?) -> Unit)?\n                ): (() -> Unit)? {\n                    return try {\n                        val unhook = XposedBridge.hookMethod(executable, object : XC_MethodHook() {\n                            override fun beforeHookedMethod(param: MethodHookParam) {\n                                if (before != null) {\n                                    val raw = param.args\n                                    val argsArr = if (raw != null) {\n                                        Array<Any?>(raw.size) { i -> raw[i] }\n                                    } else {\n                                        emptyArray()\n                                    }\n                                    try {\n                                        before(param.thisObject, argsArr)\n                                    } catch (_: Throwable) {\n                                    }\n                                }\n                            }\n\n                            override fun afterHookedMethod(param: MethodHookParam) {\n                                if (after != null) {\n                                    val raw = param.args\n                                    val argsArr = if (raw != null) {\n                                        Array<Any?>(raw.size) { i -> raw[i] }\n                                    } else {\n                                        emptyArray()\n                                    }\n                                    try {\n                                        after(param.thisObject, argsArr, param.result)\n                                    } catch (_: Throwable) {\n                                    }\n                                }\n                            }\n                        })\n                        val unhookFn: () -> Unit = {\n                            try {\n                                unhook.unhook()\n                            } catch (_: Throwable) {\n                            }\n                        }\n                        unhookFn\n                    } catch (_: Throwable) {\n                        null\n                    }\n                }\n            }\n\n            QuotaCoreEngine.install(\n                packageName = pkg,\n                processName = lpparam.processName ?: pkg,\n                classLoader = lpparam.classLoader,\n                bridge = bridge\n            )\n        } catch (_: Throwable) {\n        }\n    }\n}\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/QuotaCoreEngine.kt",
+    "label": "QuotaCoreEngine.kt",
+    "language": "kotlin",
+    "descriptionZh": "与框架解耦的核心 Hook 引擎：界面树扫描、Compose/A11y/WebView/Stream 拦截、跨应用额度接收与心跳回执。",
+    "descriptionEn": "Framework-agnostic hook engine: Compose/View/A11y/WebView/Stream sniffers, external sync receiver, and heartbeat telemetry.",
+    "content": "package com.example.bardquotahook\n\nimport android.annotation.SuppressLint\nimport android.app.Activity\nimport android.app.AndroidAppHelper\nimport android.content.BroadcastReceiver\nimport android.content.ComponentName\nimport android.content.Context\nimport android.content.Intent\nimport android.content.IntentFilter\nimport android.content.res.Configuration\nimport android.os.Build\nimport android.os.Handler\nimport android.os.Looper\nimport android.text.BoringLayout\nimport android.util.Log\nimport android.view.View\nimport android.view.ViewGroup\nimport android.webkit.WebView\nimport android.widget.LinearLayout\nimport android.widget.TextView\nimport org.json.JSONArray\nimport org.json.JSONObject\nimport org.json.JSONTokener\nimport java.io.BufferedReader\nimport java.lang.ref.WeakReference\nimport java.lang.reflect.Executable\nimport java.nio.ByteBuffer\nimport java.nio.CharBuffer\nimport java.nio.charset.CharsetDecoder\nimport java.util.concurrent.CopyOnWriteArrayList\nimport java.util.concurrent.atomic.AtomicBoolean\nimport java.util.concurrent.atomic.AtomicReference\n\nobject QuotaCoreEngine {\n\n    private const val TAG = \"BardQuota\"\n    private const val MODULE_PKG = \"com.example.bardquotahook\"\n    private const val TELEMETRY_RECEIVER_CLS = \"com.example.bardquotahook.HookTelemetryReceiver\"\n\n    interface HookBridge {\n        val bridgeName: String\n        fun log(msg: String)\n        fun hookExecutable(\n            executable: Executable,\n            before: ((thisObj: Any?, args: Array<Any?>) -> Unit)? = null,\n            after: ((thisObj: Any?, args: Array<Any?>, result: Any?) -> Unit)? = null\n        ): (() -> Unit)?\n    }\n\n    private val installed = AtomicBoolean(false)\n    @Volatile private var activeBridge: HookBridge? = null\n    @Volatile private var hostPackage: String = \"\"\n    @Volatile private var hostProcess: String = \"\"\n    @Volatile private var mainHandler: Handler? = null\n\n    private val inHookGuard = object : ThreadLocal<Boolean>() {\n        override fun initialValue(): Boolean = false\n    }\n\n    private val activeActivityRef = AtomicReference<WeakReference<Activity>>(WeakReference(null))\n    private val overlayContainerRef = AtomicReference<WeakReference<LinearLayout>>(WeakReference(null))\n    private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))\n    private val receiverRef = AtomicReference<WeakReference<BroadcastReceiver>>(WeakReference(null))\n    private val unhookActions = CopyOnWriteArrayList<() -> Unit>()\n\n    private val latestSnapshot = AtomicReference(QuotaHudLayout.Snapshot())\n\n    fun install(\n        packageName: String,\n        processName: String,\n        classLoader: ClassLoader?,\n        bridge: HookBridge\n    ) {\n        if (packageName == \"android\" || packageName == MODULE_PKG) return\n        if (!installed.compareAndSet(false, true)) return\n\n        activeBridge = bridge\n        hostPackage = packageName\n        hostProcess = processName\n\n        logInfo(\"Engine installed -> pkg=$packageName proc=$processName bridge=${bridge.bridgeName}\")\n\n        // 1. Lifecycle & In-App HUD + Cross-App Sync Receiver\n        safeTry(\"hookActivityLifecycle\") { hookActivityLifecycle(bridge) }\n\n        // 2. Compose / View / Accessibility / WebView UI Sniffers\n        safeTry(\"hookUiTextAndDescriptions\") { hookUiTextAndDescriptions(classLoader, bridge) }\n        safeTry(\"hookWebViewDom\") { hookWebViewDom(bridge) }\n\n        // 3. ART-Safe JSON / Stream Decoders (R8-Immune)\n        safeTry(\"hookJsonPayloads\") { hookJsonPayloads(bridge) }\n        safeTry(\"hookStreamDecoders\") { hookStreamDecoders(bridge) }\n\n        // Notify Gemini-Eye diagnostics activity if Application context is ready\n        postToMain(delayMs = 500L) {\n            sendHeartbeatToModuleApp()\n        }\n    }\n\n    private inline fun withReentrancyGuard(block: () -> Unit) {\n        if (inHookGuard.get() == true) return\n        inHookGuard.set(true)\n        try {\n            block()\n        } catch (t: Throwable) {\n            logDebug(\"Callback err: ${t.javaClass.simpleName}: ${t.message}\")\n        } finally {\n            inHookGuard.set(false)\n        }\n    }\n\n    private inline fun safeTry(label: String, block: () -> Unit) {\n        try {\n            block()\n        } catch (t: Throwable) {\n            logDebug(\"$label skipped: ${t.javaClass.simpleName}: ${t.message}\")\n        }\n    }\n\n    private fun logInfo(msg: String) {\n        try {\n            activeBridge?.log(\"[$TAG] $msg\")\n            Log.i(TAG, msg)\n        } catch (_: Throwable) {\n        }\n    }\n\n    private fun logDebug(msg: String) {\n        try {\n            Log.d(TAG, msg)\n        } catch (_: Throwable) {\n        }\n    }\n\n    private fun postToMain(delayMs: Long = 0L, action: () -> Unit) {\n        try {\n            val looper = Looper.getMainLooper() ?: return\n            val handler = mainHandler ?: Handler(looper).also { mainHandler = it }\n            val runnable = Runnable {\n                try {\n                    action()\n                } catch (t: Throwable) {\n                    logDebug(\"Main task err: ${t.message}\")\n                }\n            }\n            if (delayMs > 0L) handler.postDelayed(runnable, delayMs) else handler.post(runnable)\n        } catch (_: Throwable) {\n        }\n    }\n\n    private fun hookMethodSafe(\n        bridge: HookBridge,\n        clazz: Class<*>?,\n        name: String,\n        paramTypes: Array<Class<*>>,\n        before: ((Any?, Array<Any?>) -> Unit)? = null,\n        after: ((Any?, Array<Any?>, Any?) -> Unit)? = null\n    ) {\n        if (clazz == null) return\n        try {\n            val method = clazz.getDeclaredMethod(name, *paramTypes)\n            method.isAccessible = true\n            val unhook = bridge.hookExecutable(method, before, after)\n            if (unhook != null) unhookActions.add(unhook)\n        } catch (t: Throwable) {\n            logDebug(\"Method ${clazz.name}.$name not hooked: ${t.javaClass.simpleName}\")\n        }\n    }\n\n    private fun hookAllMethodsByName(\n        bridge: HookBridge,\n        clazz: Class<*>?,\n        name: String,\n        before: ((Any?, Array<Any?>) -> Unit)? = null,\n        after: ((Any?, Array<Any?>, Any?) -> Unit)? = null\n    ) {\n        if (clazz == null) return\n        try {\n            for (method in clazz.declaredMethods) {\n                if (method.name == name) {\n                    try {\n                        method.isAccessible = true\n                        val unhook = bridge.hookExecutable(method, before, after)\n                        if (unhook != null) unhookActions.add(unhook)\n                    } catch (_: Throwable) {\n                    }\n                }\n            }\n        } catch (t: Throwable) {\n            logDebug(\"AllMethods ${clazz.name}.$name skipped: ${t.javaClass.simpleName}\")\n        }\n    }\n\n    private fun hookConstructorSafe(\n        bridge: HookBridge,\n        clazz: Class<*>?,\n        paramTypes: Array<Class<*>>,\n        after: (Any?, Array<Any?>) -> Unit\n    ) {\n        if (clazz == null) return\n        try {\n            val ctor = clazz.getDeclaredConstructor(*paramTypes)\n            ctor.isAccessible = true\n            val unhook = bridge.hookExecutable(\n                executable = ctor,\n                before = null,\n                after = { thisObj, args, _ -> after(thisObj, args) }\n            )\n            if (unhook != null) unhookActions.add(unhook)\n        } catch (t: Throwable) {\n            logDebug(\"Ctor ${clazz.name} skipped: ${t.javaClass.simpleName}\")\n        }\n    }\n\n    // =========================================================================\n    // 1. Activity Lifecycle, HUD Attachment & Cross-App Sync\n    // =========================================================================\n\n    private fun hookActivityLifecycle(bridge: HookBridge) {\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = Activity::class.java,\n            name = \"onResume\",\n            paramTypes = emptyArray(),\n            after = { thisObj, _, _ ->\n                withReentrancyGuard {\n                    val activity = thisObj as? Activity ?: return@withReentrancyGuard\n                    if (activity.isFinishing || activity.isDestroyed) return@withReentrancyGuard\n                    activeActivityRef.set(WeakReference(activity))\n                    registerSyncReceiver(activity)\n                    attachOrUpdateOverlay()\n                    scheduleScreenInspection()\n                    sendHeartbeatToModuleApp(activity)\n                }\n            }\n        )\n\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = Activity::class.java,\n            name = \"onConfigurationChanged\",\n            paramTypes = arrayOf(Configuration::class.java),\n            after = { thisObj, _, _ ->\n                withReentrancyGuard {\n                    val activity = thisObj as? Activity ?: return@withReentrancyGuard\n                    if (activeActivityRef.get().get() === activity) {\n                        attachOrUpdateOverlay()\n                    }\n                }\n            }\n        )\n\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = Activity::class.java,\n            name = \"onDestroy\",\n            paramTypes = emptyArray(),\n            before = { thisObj, _ ->\n                withReentrancyGuard {\n                    val destroyed = thisObj as? Activity ?: return@withReentrancyGuard\n                    if (activeActivityRef.get().get() === destroyed) {\n                        unregisterSyncReceiver(destroyed)\n                        activeActivityRef.set(WeakReference(null))\n                        overlayContainerRef.set(WeakReference(null))\n                    }\n                }\n            }\n        )\n    }\n\n    // =========================================================================\n    // 2. Compose / TextView / Accessibility ContentDescription / WebView Hooks\n    // =========================================================================\n\n    private fun hookUiTextAndDescriptions(classLoader: ClassLoader?, bridge: HookBridge) {\n        hookAllMethodsByName(\n            bridge = bridge,\n            clazz = BoringLayout::class.java,\n            name = \"isBoring\",\n            before = cb@{ _, args ->\n                val cs = args.firstOrNull() as? CharSequence ?: return@cb\n                if (cs.length !in 2..200) return@cb\n                val str = cs.toString()\n                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb\n                withReentrancyGuard {\n                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), \"Compose\")\n                    if (snap != null) publishSnapshot(snap)\n                }\n            }\n        )\n\n        val staticBuilderCls = try {\n            Class.forName(\"android.text.StaticLayout\\$Builder\", false, classLoader ?: Activity::class.java.classLoader)\n        } catch (_: Throwable) {\n            null\n        }\n        hookAllMethodsByName(\n            bridge = bridge,\n            clazz = staticBuilderCls,\n            name = \"obtain\",\n            before = cb@{ _, args ->\n                val cs = args.firstOrNull() as? CharSequence ?: return@cb\n                if (cs.length !in 2..280) return@cb\n                val str = cs.toString()\n                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb\n                withReentrancyGuard {\n                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), \"Compose\")\n                    if (snap != null) publishSnapshot(snap)\n                }\n            }\n        )\n\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = TextView::class.java,\n            name = \"setText\",\n            paramTypes = arrayOf(CharSequence::class.java, TextView.BufferType::class.java),\n            before = cb@{ thisObj, args ->\n                val tv = thisObj as? TextView ?: return@cb\n                val tagStr = tv.tag as? String\n                if (tagStr != null && tagStr.startsWith(\"bard_quota_hud\")) return@cb\n                val cs = args.firstOrNull() as? CharSequence ?: return@cb\n                if (cs.length !in 2..240) return@cb\n                val str = cs.toString()\n                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb\n                withReentrancyGuard {\n                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), \"View\")\n                    if (snap != null) publishSnapshot(snap)\n                }\n            }\n        )\n\n        // Captures Accessibility semantics descriptions set on usage meters / progress bars\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = View::class.java,\n            name = \"setContentDescription\",\n            paramTypes = arrayOf(CharSequence::class.java),\n            before = cb@{ _, args ->\n                val cs = args.firstOrNull() as? CharSequence ?: return@cb\n                if (cs.length !in 3..240) return@cb\n                val str = cs.toString()\n                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb\n                withReentrancyGuard {\n                    val snap = QuotaTextParser.parseUiBlock(str, latestSnapshot.get(), \"A11y\")\n                    if (snap != null) publishSnapshot(snap)\n                }\n            }\n        )\n    }\n\n    private fun hookWebViewDom(bridge: HookBridge) {\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = View::class.java,\n            name = \"onAttachedToWindow\",\n            paramTypes = emptyArray(),\n            after = cb@{ thisObj, _, _ ->\n                val wv = thisObj as? WebView ?: return@cb\n                activeWebViewRef.set(WeakReference(wv))\n                scheduleWebViewPoll(900L)\n                scheduleWebViewPoll(2400L)\n            }\n        )\n\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = WebView::class.java,\n            name = \"loadUrl\",\n            paramTypes = arrayOf(String::class.java),\n            after = cb@{ thisObj, _, _ ->\n                val wv = thisObj as? WebView ?: return@cb\n                activeWebViewRef.set(WeakReference(wv))\n                scheduleWebViewPoll(1500L)\n                scheduleWebViewPoll(3200L)\n            }\n        )\n    }\n\n    // =========================================================================\n    // 3. ART-Safe JSON & Stream Decoding Hooks\n    // =========================================================================\n\n    private fun hookJsonPayloads(bridge: HookBridge) {\n        hookConstructorSafe(\n            bridge = bridge,\n            clazz = JSONObject::class.java,\n            paramTypes = arrayOf(String::class.java)\n        ) { thisObj, args ->\n            val raw = args.firstOrNull() as? String ?: return@hookConstructorSafe\n            if (!QuotaTextParser.fastHasQuotaKeyword(raw)) return@hookConstructorSafe\n            withReentrancyGuard {\n                val obj = thisObj as? JSONObject ?: return@withReentrancyGuard\n                val snap = QuotaTextParser.inspectJsonObject(obj, latestSnapshot.get(), \"JSONObj\")\n                if (snap != null) publishSnapshot(snap)\n            }\n        }\n\n        hookConstructorSafe(\n            bridge = bridge,\n            clazz = JSONObject::class.java,\n            paramTypes = arrayOf(JSONTokener::class.java)\n        ) { thisObj, _ ->\n            withReentrancyGuard {\n                val obj = thisObj as? JSONObject ?: return@withReentrancyGuard\n                val snap = QuotaTextParser.inspectJsonObject(obj, latestSnapshot.get(), \"JSONTok\")\n                if (snap != null) publishSnapshot(snap)\n            }\n        }\n\n        hookConstructorSafe(\n            bridge = bridge,\n            clazz = JSONArray::class.java,\n            paramTypes = arrayOf(String::class.java)\n        ) { thisObj, args ->\n            val raw = args.firstOrNull() as? String ?: return@hookConstructorSafe\n            if (!QuotaTextParser.fastHasQuotaKeyword(raw)) return@hookConstructorSafe\n            withReentrancyGuard {\n                val arr = thisObj as? JSONArray ?: return@withReentrancyGuard\n                val snap = QuotaTextParser.inspectJsonArray(arr, latestSnapshot.get(), \"JSONArr\")\n                if (snap != null) publishSnapshot(snap)\n            }\n        }\n    }\n\n    private fun hookStreamDecoders(bridge: HookBridge) {\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = CharsetDecoder::class.java,\n            name = \"decode\",\n            paramTypes = arrayOf(ByteBuffer::class.java),\n            after = cb@{ _, _, result ->\n                val cb = result as? CharBuffer ?: return@cb\n                val rem = cb.remaining()\n                if (rem !in 6..262_144) return@cb\n                val str = cb.toString()\n                if (!QuotaTextParser.fastHasQuotaKeyword(str)) return@cb\n                withReentrancyGuard {\n                    val snap = QuotaTextParser.parseRawPayload(str, latestSnapshot.get(), \"Decoder\")\n                    if (snap != null) publishSnapshot(snap)\n                }\n            }\n        )\n\n        hookMethodSafe(\n            bridge = bridge,\n            clazz = BufferedReader::class.java,\n            name = \"readLine\",\n            paramTypes = emptyArray(),\n            after = cb@{ _, _, result ->\n                val line = result as? String ?: return@cb\n                if (!QuotaTextParser.fastHasQuotaKeyword(line)) return@cb\n                withReentrancyGuard {\n                    val snap = QuotaTextParser.parseRawPayload(line, latestSnapshot.get(), \"Stream\")\n                    if (snap != null) publishSnapshot(snap)\n                }\n            }\n        )\n    }\n\n    // =========================================================================\n    // View Tree & Embedded WebView Inspection\n    // =========================================================================\n\n    private fun scheduleScreenInspection() {\n        postToMain(delayMs = 450L) { scanActiveDecorView() }\n        postToMain(delayMs = 1600L) { scanActiveDecorView() }\n        scheduleWebViewPoll(1100L)\n    }\n\n    private fun scanActiveDecorView() {\n        val activity = activeActivityRef.get().get() ?: return\n        if (activity.isFinishing || activity.isDestroyed) return\n        val decor = activity.window?.decorView ?: return\n        val sb = StringBuilder()\n        collectViewTexts(decor, sb, 0)\n        if (sb.isNotEmpty()) {\n            val text = sb.toString()\n            if (QuotaTextParser.fastHasQuotaKeyword(text)) {\n                val snap = QuotaTextParser.parseUiBlock(text, latestSnapshot.get(), \"ScreenScan\")\n                if (snap != null) publishSnapshot(snap)\n            }\n        }\n    }\n\n    private fun collectViewTexts(view: View, out: StringBuilder, depth: Int) {\n        if (depth > 18 || out.length > 24_000) return\n        val tagStr = view.tag as? String\n        if (tagStr != null && tagStr.startsWith(\"bard_quota_hud\")) return\n\n        if (view is WebView) {\n            activeWebViewRef.set(WeakReference(view))\n        }\n        if (view is TextView) {\n            val t = view.text\n            if (!t.isNullOrBlank()) {\n                out.append(t).append('\\n')\n            }\n        }\n        val desc = view.contentDescription\n        if (!desc.isNullOrBlank()) {\n            out.append(desc).append('\\n')\n        }\n        if (view is ViewGroup) {\n            val count = view.childCount\n            for (i in 0 until count) {\n                val child = view.getChildAt(i)\n                if (child != null) collectViewTexts(child, out, depth + 1)\n            }\n        }\n    }\n\n    private fun scheduleWebViewPoll(delayMs: Long = 900L) {\n        postToMain(delayMs = delayMs) {\n            val wv = activeWebViewRef.get().get() ?: return@postToMain\n            if (!wv.isShown) return@postToMain\n            safeTry(\"evaluateJavascript\") {\n                wv.evaluateJavascript(\n                    \"(function(){return document.body ? document.body.innerText : '';})()\"\n                ) { rawJsString ->\n                    safeTry(\"webViewDomResult\") {\n                        if (!rawJsString.isNullOrBlank() && rawJsString != \"null\") {\n                            val unescaped = rawJsString.trim('\"')\n                                .replace(\"\\\\n\", \"\\n\")\n                                .replace(\"\\\\\\\"\", \"\\\"\")\n                            val snap = QuotaTextParser.parseUiBlock(unescaped, latestSnapshot.get(), \"WebView\")\n                            if (snap != null) publishSnapshot(snap)\n                        }\n                    }\n                }\n            }\n        }\n    }\n\n    // =========================================================================\n    // Cross-Process & Cross-App Broadcast Sync + Heartbeat Telemetry\n    // =========================================================================\n\n    @SuppressLint(\"UnspecifiedRegisterReceiverFlag\")\n    private fun registerSyncReceiver(activity: Activity) {\n        if (receiverRef.get().get() != null) return\n        safeTry(\"registerSyncReceiver\") {\n            val appCtx = activity.applicationContext ?: return@safeTry\n            val receiver = object : BroadcastReceiver() {\n                override fun onReceive(context: Context?, intent: Intent?) {\n                    safeTry(\"onReceiveQuotaSync\") {\n                        val act = intent?.action ?: return@safeTry\n                        if (act != QuotaTextParser.ACTION_QUOTA_INTERNAL_SYNC &&\n                            act != QuotaTextParser.ACTION_QUOTA_EXTERNAL_SYNC\n                        ) {\n                            return@safeTry\n                        }\n                        if (intent.getBooleanExtra(\"ping\", false)) {\n                            sendHeartbeatToModuleApp(activity)\n                        }\n                        val prev = latestSnapshot.get()\n                        val five = intent.getStringExtra(\"five\") ?: prev.fiveHourQuota\n                        val week = intent.getStringExtra(\"week\") ?: prev.weeklyLimit\n                        val reset = intent.getStringExtra(\"reset\") ?: prev.resetTimer\n                        val src = intent.getStringExtra(\"src\") ?: \"WebSync\"\n                        if (five != \"--\" || week != \"--\" || reset != \"--\") {\n                            applyLocalSnapshot(QuotaHudLayout.Snapshot(five, week, reset, src))\n                        }\n                    }\n                }\n            }\n            val filter = IntentFilter().apply {\n                addAction(QuotaTextParser.ACTION_QUOTA_INTERNAL_SYNC)\n                addAction(QuotaTextParser.ACTION_QUOTA_EXTERNAL_SYNC)\n            }\n            if (Build.VERSION.SDK_INT >= 33) {\n                appCtx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)\n            } else {\n                appCtx.registerReceiver(receiver, filter)\n            }\n            receiverRef.set(WeakReference(receiver))\n        }\n    }\n\n    private fun unregisterSyncReceiver(activity: Activity) {\n        val receiver = receiverRef.get().get() ?: return\n        safeTry(\"unregisterSyncReceiver\") {\n            activity.applicationContext?.unregisterReceiver(receiver)\n        }\n        receiverRef.set(WeakReference(null))\n    }\n\n    private fun publishSnapshot(snapshot: QuotaHudLayout.Snapshot) {\n        val changed = applyLocalSnapshot(snapshot)\n        if (!changed) return\n\n        safeTry(\"broadcastInternalAndTelemetry\") {\n            val appCtx = AndroidAppHelper.currentApplication()\n                ?: activeActivityRef.get().get()?.applicationContext\n                ?: return@safeTry\n\n            val internalIntent = Intent(QuotaTextParser.ACTION_QUOTA_INTERNAL_SYNC).apply {\n                setPackage(appCtx.packageName)\n                putExtra(\"five\", snapshot.fiveHourQuota)\n                putExtra(\"week\", snapshot.weeklyLimit)\n                putExtra(\"reset\", snapshot.resetTimer)\n                putExtra(\"src\", snapshot.source)\n            }\n            appCtx.sendBroadcast(internalIntent)\n            sendHeartbeatToModuleApp(appCtx)\n        }\n    }\n\n    private fun sendHeartbeatToModuleApp(ctxOverride: Context? = null) {\n        safeTry(\"sendHeartbeatToModuleApp\") {\n            val ctx = ctxOverride\n                ?: AndroidAppHelper.currentApplication()\n                ?: activeActivityRef.get().get()?.applicationContext\n                ?: return@safeTry\n            val snap = latestSnapshot.get()\n            val hb = Intent(QuotaTextParser.ACTION_HOOK_HEARTBEAT).apply {\n                component = ComponentName(MODULE_PKG, TELEMETRY_RECEIVER_CLS)\n                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)\n                putExtra(\"pkg\", hostPackage.ifEmpty { ctx.packageName })\n                putExtra(\"proc\", hostProcess)\n                putExtra(\"bridge\", activeBridge?.bridgeName ?: \"Xposed\")\n                putExtra(\"five\", snap.fiveHourQuota)\n                putExtra(\"week\", snap.weeklyLimit)\n                putExtra(\"reset\", snap.resetTimer)\n                putExtra(\"src\", snap.source)\n            }\n            ctx.sendBroadcast(hb)\n        }\n    }\n\n    private fun applyLocalSnapshot(snapshot: QuotaHudLayout.Snapshot): Boolean {\n        val prev = latestSnapshot.get()\n        if (prev.fiveHourQuota == snapshot.fiveHourQuota &&\n            prev.weeklyLimit == snapshot.weeklyLimit &&\n            prev.resetTimer == snapshot.resetTimer\n        ) {\n            return false\n        }\n        logInfo(\"[${snapshot.source}] 5h=${snapshot.fiveHourQuota} | week=${snapshot.weeklyLimit} | reset=${snapshot.resetTimer}\")\n        latestSnapshot.set(snapshot)\n        attachOrUpdateOverlay()\n        return true\n    }\n\n    private fun attachOrUpdateOverlay() {\n        postToMain {\n            val activity = activeActivityRef.get().get() ?: return@postToMain\n            if (activity.isFinishing || activity.isDestroyed) return@postToMain\n\n            val root = activity.findViewById<ViewGroup>(android.R.id.content) ?: return@postToMain\n            var container = root.findViewWithTag<LinearLayout>(QuotaHudLayout.OVERLAY_TAG)\n                ?: overlayContainerRef.get().get()\n\n            if (container == null || container.parent == null) {\n                container = QuotaHudLayout.createContainer(\n                    context = activity,\n                    snapshotProvider = { latestSnapshot.get() },\n                    onTapRefresh = { scheduleScreenInspection() }\n                )\n                root.addView(container, QuotaHudLayout.defaultLayoutParams(activity))\n                overlayContainerRef.set(WeakReference(container))\n            }\n\n            withReentrancyGuard {\n                QuotaHudLayout.bind(activity, container, latestSnapshot.get())\n                container.bringToFront()\n            }\n        }\n    }\n}\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/QuotaTextParser.kt",
+    "label": "QuotaTextParser.kt",
+    "language": "kotlin",
+    "descriptionZh": "额度解析器：精准匹配 gemini.google.com/usage 百分比条 (% used / 已使用 %)、5h 与周限额双分区及重置时间。",
+    "descriptionEn": "Quota parser handling gemini.google.com/usage % used meters, 5h/weekly dual-section state machine, and RPC JSON.",
+    "content": "package com.example.bardquotahook\n\nimport org.json.JSONArray\nimport org.json.JSONObject\nimport org.json.JSONTokener\n\nobject QuotaTextParser {\n\n    const val ACTION_QUOTA_INTERNAL_SYNC = \"com.example.bardquotahook.ACTION_QUOTA_SYNC\"\n    const val ACTION_QUOTA_EXTERNAL_SYNC = \"com.example.bardquotahook.ACTION_QUOTA_EXTERNAL_SYNC\"\n    const val ACTION_HOOK_HEARTBEAT = \"com.example.bardquotahook.ACTION_HOOK_HEARTBEAT\"\n    const val PREFS_NAME = \"gemini_eye_state\"\n\n    enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }\n\n    private enum class SectionContext { NONE, FIVE_HOUR, WEEKLY }\n\n    @Volatile private var pendingSlot: MetricKind? = null\n    @Volatile private var pendingSlotTimestampMs: Long = 0L\n\n    private val keyRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\"[\"']?([a-zA-Z0-9_]*(?:quota|remaining|limit|reset|cap|usage|window)[a-zA-Z0-9_]*)[\"']?\\s*[:=]\\s*[\"']?([^\"',}\\]\\n]{1,40})[\"']?\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val ratioOrPctRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\"\"\"(\\d+\\s*/\\s*\\d+|\\d+(?:\\.\\d+)?\\s*%)\"\"\")\n    }\n\n    private val explicitUsedPctRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\"(?:(?:已使用|已用|剩余|可用)\\s*(\\d+(?:\\.\\d+)?\\s*%)|(\\d+(?:\\.\\d+)?\\s*%)\\s*(?:used|remaining|available|left|已使用|已用|剩余|可用))\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val countMetricRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\"(\\d+\\s*(?:次|条|left|remaining|used|prompts?|messages?|queries))\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val standaloneMetricRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\"^(?:已使用\\s*|已用\\s*|剩余\\s*|可用\\s*)?(\\d+\\s*/\\s*\\d+|\\d+(?:\\.\\d+)?\\s*%)(?:\\s*(?:used|remaining|available|left|已使用|已用|剩余|可用))?$\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val compactTimeRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|周一|周二|周三|周四|周五|周六|周日|星期[一二三四五六日天]|明天|明日|Tomorrow)\\s*,?\\s*\\d{1,2}:\\d{2}(?:\\s*[AP]M)?|\\d{1,2}:\\d{2}(?::\\d{2})?(?:\\s*[AP]M)?|\\d+\\s*(?:d|day|days|天)\\s*\\d*\\s*(?:h|hr|hrs|小时)?|\\d+\\s*(?:h|hr|hrs|小时|时)\\s*\\d*\\s*(?:m|min|mins|分钟|分)?|\\d+\\s*(?:m|min|mins|分钟|分))\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val usagePageHeaderRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\".*(usage\\s+limits?|用量限制|用量与限额|使用限额|compute\\s+allowance).*\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val fiveHourLabelRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\".*(5\\s*(-|\\s)?(hour|hr|h|小时)|5h|short[\\s-]*term|current\\s+(?:usage|session|window|cycle|allowance)|session\\s+(?:usage|limit)|当前(?:用量|会话|周期|窗口)|短期(?:限额|用量|额度)?|短周期|remaining\\s*prompts?|剩余\\s*\\d+).*\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val weeklyLabelRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\".*(weekly|week\\s+(?:limit|cap|usage)|每周|周限额|周上限|周额度|周用量|7\\s*(-|\\s)?(day|天)).*\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val resetLabelRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\".*(resets?\\b|重置|恢复|刷新|refreshes?\\s+(?:in|at)|available\\s+(?:in|at)|try\\s+again\\s+(?:in|after|at)|后重置|后恢复).*\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    private val exhaustedBannerRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {\n        Regex(\n            \"\"\".*(reached\\s+your\\s+(?:usage\\s+)?limit|out\\s+of\\s+(?:prompts|capacity)|quota\\s+exceeded|已达(?:到)?(?:用量|使用)?上限|额度已用尽).*\"\"\",\n            RegexOption.IGNORE_CASE\n        )\n    }\n\n    fun fastHasQuotaKeyword(text: String): Boolean {\n        val len = text.length\n        if (len < 3 || len > 262_144) return false\n        return text.contains('%') ||\n            text.contains(\"quota\", ignoreCase = true) ||\n            text.contains(\"remaining\", ignoreCase = true) ||\n            text.contains(\"limit\", ignoreCase = true) ||\n            text.contains(\"usage\", ignoreCase = true) ||\n            text.contains(\"reset\", ignoreCase = true) ||\n            text.contains(\"5-hour\", ignoreCase = true) ||\n            text.contains(\"weekly\", ignoreCase = true) ||\n            text.contains(\"小时\") ||\n            text.contains(\"已使用\") ||\n            text.contains(\"已用\") ||\n            text.contains(\"剩余\") ||\n            text.contains(\"限额\") ||\n            text.contains(\"额度\") ||\n            text.contains(\"重置\")\n    }\n\n    private fun extractMetricToken(line: String, kind: MetricKind): String? {\n        when (kind) {\n            MetricKind.FIVE_HOUR, MetricKind.WEEKLY -> {\n                val explicitMatch = explicitUsedPctRegex.find(line)\n                if (explicitMatch != null) {\n                    val g1 = explicitMatch.groupValues.getOrNull(1).orEmpty()\n                    val g2 = explicitMatch.groupValues.getOrNull(2).orEmpty()\n                    val pct = (if (g1.isNotEmpty()) g1 else g2).replace(\" \", \"\")\n                    if (pct.isNotEmpty()) return pct\n                }\n                val ratioMatch = ratioOrPctRegex.find(line)?.value?.replace(\" \", \"\")\n                if (ratioMatch != null) return ratioMatch\n                val countMatch = countMetricRegex.find(line)?.value?.trim()\n                if (countMatch != null) return countMatch.take(14)\n            }\n            MetricKind.RESET -> {\n                val timeMatch = compactTimeRegex.find(line)?.value?.trim()\n                if (timeMatch != null) return compactResetDisplay(timeMatch)\n            }\n        }\n        return null\n    }\n\n    private fun compactResetDisplay(raw: String): String {\n        val cleaned = raw\n            .replace(Regex(\"\"\"\\s+\"\"\"), \" \")\n            .replace(\"hours\", \"h\", ignoreCase = true)\n            .replace(\"hour\", \"h\", ignoreCase = true)\n            .replace(\"hrs\", \"h\", ignoreCase = true)\n            .replace(\"hr\", \"h\", ignoreCase = true)\n            .replace(\"minutes\", \"m\", ignoreCase = true)\n            .replace(\"minute\", \"m\", ignoreCase = true)\n            .replace(\"mins\", \"m\", ignoreCase = true)\n            .replace(\"min\", \"m\", ignoreCase = true)\n            .replace(\"小时\", \"h\")\n            .replace(\"分钟\", \"m\")\n            .replace(\"分\", \"m\")\n            .replace(\"h \", \"h\")\n            .trim()\n        return if (cleaned.length > 16) cleaned.take(15) + \"…\" else cleaned\n    }\n\n    private fun normalizeValue(raw: String, kind: MetricKind): String {\n        val singleLine = raw.replace(Regex(\"\\\\s+\"), \" \").trim()\n        if (singleLine.isEmpty()) return \"--\"\n        val token = extractMetricToken(singleLine, kind)\n        if (token != null) return token\n        return if (singleLine.length > 15) singleLine.take(14) + \"…\" else singleLine\n    }\n\n    /**\n     * Parses UI text from Compose layouts, TextViews, Accessibility descriptions,\n     * or `https://gemini.google.com/usage` innerText.\n     */\n    fun parseUiBlock(\n        block: String,\n        prev: QuotaHudLayout.Snapshot,\n        source: String\n    ): QuotaHudLayout.Snapshot? {\n        if (block.contains(\"5h \") && (block.contains(\"· 周 \") || block.contains(\"· Wk \"))) {\n            return null\n        }\n\n        var fiveHour = prev.fiveHourQuota\n        var weekly = prev.weeklyLimit\n        var primaryReset = prev.resetTimer\n        var weeklyResetCandidate: String? = null\n        var capturedPrimaryResetInPass = false\n        var hit = false\n\n        var section = SectionContext.NONE\n        var sawFirstMeterInBlock = false\n        val now = System.currentTimeMillis()\n\n        for (rawLine in block.lineSequence()) {\n            val line = rawLine.trim()\n            if (line.length !in 2..200) continue\n\n            // Check rate-limit exhaustion banners in chat\n            if (exhaustedBannerRegex.matches(line)) {\n                if (fiveHour == \"--\") {\n                    fiveHour = \"100%\"\n                    hit = true\n                }\n                val bannerReset = extractMetricToken(line, MetricKind.RESET)\n                if (bannerReset != null) {\n                    primaryReset = bannerReset\n                    capturedPrimaryResetInPass = true\n                    hit = true\n                }\n            }\n\n            // Pair standalone values (\"18%\", \"0% used\", \"32/50\") with recent Compose label node\n            val activeSlot = pendingSlot\n            if (activeSlot != null && (now - pendingSlotTimestampMs) <= 700L) {\n                if (activeSlot == MetricKind.RESET) {\n                    val resetToken = extractMetricToken(line, MetricKind.RESET)\n                    if (resetToken != null) {\n                        if (section != SectionContext.WEEKLY || !capturedPrimaryResetInPass) {\n                            primaryReset = resetToken\n                            if (section != SectionContext.WEEKLY) capturedPrimaryResetInPass = true\n                        }\n                        hit = true\n                        pendingSlot = null\n                        continue\n                    }\n                } else if (standaloneMetricRegex.matches(line)) {\n                    val token = extractMetricToken(line, activeSlot) ?: line.replace(\" \", \"\").take(12)\n                    if (activeSlot == MetricKind.FIVE_HOUR) {\n                        fiveHour = token\n                        sawFirstMeterInBlock = true\n                    } else {\n                        weekly = token\n                    }\n                    hit = true\n                    pendingSlot = null\n                    continue\n                }\n            }\n\n            if (usagePageHeaderRegex.matches(line) && section == SectionContext.NONE) {\n                section = SectionContext.FIVE_HOUR\n            }\n\n            if (weeklyLabelRegex.matches(line)) {\n                section = SectionContext.WEEKLY\n                val token = extractMetricToken(line, MetricKind.WEEKLY)\n                if (token != null) {\n                    weekly = token\n                    hit = true\n                    pendingSlot = null\n                } else {\n                    pendingSlot = MetricKind.WEEKLY\n                    pendingSlotTimestampMs = now\n                }\n                val inlineReset = if (resetLabelRegex.matches(line)) extractMetricToken(line, MetricKind.RESET) else null\n                if (inlineReset != null) {\n                    weeklyResetCandidate = inlineReset\n                    hit = true\n                }\n                continue\n            }\n\n            if (fiveHourLabelRegex.matches(line)) {\n                section = SectionContext.FIVE_HOUR\n                val token = extractMetricToken(line, MetricKind.FIVE_HOUR)\n                if (token != null) {\n                    fiveHour = token\n                    sawFirstMeterInBlock = true\n                    hit = true\n                    pendingSlot = null\n                } else {\n                    pendingSlot = MetricKind.FIVE_HOUR\n                    pendingSlotTimestampMs = now\n                }\n                val inlineReset = if (resetLabelRegex.matches(line)) extractMetricToken(line, MetricKind.RESET) else null\n                if (inlineReset != null) {\n                    primaryReset = inlineReset\n                    capturedPrimaryResetInPass = true\n                    hit = true\n                }\n                continue\n            }\n\n            // Explicit \"% used\" / \"已使用 X%\" meter lines on gemini.google.com/usage\n            val explicitPctMatch = explicitUsedPctRegex.find(line)\n            if (explicitPctMatch != null) {\n                val g1 = explicitPctMatch.groupValues.getOrNull(1).orEmpty()\n                val g2 = explicitPctMatch.groupValues.getOrNull(2).orEmpty()\n                val pct = (if (g1.isNotEmpty()) g1 else g2).replace(\" \", \"\")\n                if (pct.isNotEmpty()) {\n                    if (section == SectionContext.WEEKLY) {\n                        weekly = pct\n                    } else if (!sawFirstMeterInBlock) {\n                        fiveHour = pct\n                        sawFirstMeterInBlock = true\n                        section = SectionContext.FIVE_HOUR\n                    } else {\n                        weekly = pct\n                        section = SectionContext.WEEKLY\n                    }\n                    hit = true\n                    pendingSlot = null\n                }\n                if (resetLabelRegex.matches(line)) {\n                    val inlineReset = extractMetricToken(line, MetricKind.RESET)\n                    if (inlineReset != null) {\n                        if (section == SectionContext.WEEKLY) {\n                            weeklyResetCandidate = inlineReset\n                        } else {\n                            primaryReset = inlineReset\n                            capturedPrimaryResetInPass = true\n                        }\n                        hit = true\n                    }\n                }\n                continue\n            }\n\n            if (resetLabelRegex.matches(line)) {\n                val token = extractMetricToken(line, MetricKind.RESET)\n                if (token != null) {\n                    if (section == SectionContext.WEEKLY) {\n                        weeklyResetCandidate = token\n                    } else {\n                        primaryReset = token\n                        capturedPrimaryResetInPass = true\n                    }\n                    hit = true\n                    pendingSlot = null\n                } else {\n                    pendingSlot = MetricKind.RESET\n                    pendingSlotTimestampMs = now\n                }\n            }\n        }\n\n        if (!capturedPrimaryResetInPass && primaryReset == \"--\" && weeklyResetCandidate != null) {\n            primaryReset = weeklyResetCandidate\n        }\n\n        if (!hit) return null\n        if (fiveHour == prev.fiveHourQuota && weekly == prev.weeklyLimit && primaryReset == prev.resetTimer) {\n            return null\n        }\n        return QuotaHudLayout.Snapshot(fiveHour, weekly, primaryReset, source)\n    }\n\n    fun inspectJsonObject(\n        json: JSONObject,\n        prev: QuotaHudLayout.Snapshot,\n        source: String\n    ): QuotaHudLayout.Snapshot? {\n        val extracted = mutableMapOf<String, String>()\n        collectFromJson(json, extracted, 0)\n        if (extracted.isEmpty()) return null\n        return mergeExtractedFields(extracted, prev, source)\n    }\n\n    fun inspectJsonArray(\n        arr: JSONArray,\n        prev: QuotaHudLayout.Snapshot,\n        source: String\n    ): QuotaHudLayout.Snapshot? {\n        val extracted = mutableMapOf<String, String>()\n        collectFromJson(arr, extracted, 0)\n        if (extracted.isEmpty()) return null\n        return mergeExtractedFields(extracted, prev, source)\n    }\n\n    fun parseRawPayload(\n        payload: String,\n        prev: QuotaHudLayout.Snapshot,\n        source: String\n    ): QuotaHudLayout.Snapshot? {\n        val cleaned = payload\n            .removePrefix(\")]}'\\n\")\n            .removePrefix(\")]}'\")\n            .trim()\n\n        var working = prev\n        var changed = false\n\n        val firstBracket = cleaned.indexOfFirst { it == '{' || it == '[' }\n        if (firstBracket in 0..32) {\n            val candidate = cleaned.substring(firstBracket)\n            try {\n                when (val node = JSONTokener(candidate).nextValue()) {\n                    is JSONObject -> {\n                        val snap = inspectJsonObject(node, working, source)\n                        if (snap != null) {\n                            working = snap\n                            changed = true\n                        }\n                    }\n                    is JSONArray -> {\n                        val snap = inspectJsonArray(node, working, source)\n                        if (snap != null) {\n                            working = snap\n                            changed = true\n                        }\n                    }\n                }\n            } catch (_: Throwable) {\n            }\n        }\n\n        val unescaped = cleaned.replace(\"\\\\\\\"\", \"\\\"\")\n        val extracted = mutableMapOf<String, String>()\n        keyRegex.findAll(unescaped).take(40).forEach { match ->\n            extracted[match.groupValues[1].lowercase()] = match.groupValues[2]\n        }\n        if (extracted.isNotEmpty()) {\n            val snap = mergeExtractedFields(extracted, working, source)\n            if (snap != null) {\n                working = snap\n                changed = true\n            }\n        }\n\n        val uiSnap = parseUiBlock(unescaped, working, source)\n        if (uiSnap != null) {\n            working = uiSnap\n            changed = true\n        }\n\n        return if (changed) working else null\n    }\n\n    private fun collectFromJson(node: Any?, out: MutableMap<String, String>, depth: Int) {\n        if (depth > 6 || node == null) return\n        when (node) {\n            is JSONObject -> {\n                val keys = node.keys()\n                while (keys.hasNext()) {\n                    val key = keys.next()\n                    val value = node.opt(key)\n                    if (fastHasQuotaKeyword(key) && value != null && value !is JSONObject && value !is JSONArray) {\n                        out[key.lowercase()] = value.toString()\n                    } else {\n                        collectFromJson(value, out, depth + 1)\n                    }\n                }\n            }\n            is JSONArray -> {\n                val limit = minOf(node.length(), 40)\n                for (i in 0 until limit) {\n                    val elem = node.opt(i)\n                    if (elem is String && fastHasQuotaKeyword(elem)) {\n                        val trimmed = elem.trim()\n                        if (trimmed.startsWith(\"{\") || trimmed.startsWith(\"[\")) {\n                            try {\n                                collectFromJson(JSONTokener(trimmed).nextValue(), out, depth + 1)\n                            } catch (_: Throwable) {\n                                keyRegex.findAll(trimmed.replace(\"\\\\\\\"\", \"\\\"\")).take(20).forEach { m ->\n                                    out[m.groupValues[1].lowercase()] = m.groupValues[2]\n                                }\n                            }\n                        } else {\n                            keyRegex.findAll(trimmed.replace(\"\\\\\\\"\", \"\\\"\")).take(20).forEach { m ->\n                                out[m.groupValues[1].lowercase()] = m.groupValues[2]\n                            }\n                        }\n                    } else {\n                        collectFromJson(elem, out, depth + 1)\n                    }\n                }\n            }\n        }\n    }\n\n    private fun mergeExtractedFields(\n        fields: Map<String, String>,\n        prev: QuotaHudLayout.Snapshot,\n        source: String\n    ): QuotaHudLayout.Snapshot? {\n        var fiveHour = prev.fiveHourQuota\n        var weekly = prev.weeklyLimit\n        var reset = prev.resetTimer\n\n        var remainingVal: String? = null\n        var totalLimitVal: String? = null\n\n        for ((k, v) in fields) {\n            when {\n                k == \"remaining\" || k.endsWith(\"_remaining\") || k.startsWith(\"remaining_\") ->\n                    remainingVal = v\n                k == \"limit\" || k == \"quota_limit\" || k == \"max_quota\" ->\n                    totalLimitVal = v\n                k.contains(\"5h\") || k.contains(\"five\") || k.contains(\"window\") || k.contains(\"session\") || k.contains(\"quota\") ->\n                    fiveHour = normalizeValue(v, MetricKind.FIVE_HOUR)\n                k.contains(\"week\") || k.contains(\"cap\") ->\n                    weekly = normalizeValue(v, MetricKind.WEEKLY)\n                k.contains(\"reset\") || k.contains(\"expire\") || k.contains(\"refresh\") ->\n                    reset = normalizeValue(v, MetricKind.RESET)\n            }\n        }\n\n        if (remainingVal != null && totalLimitVal != null && remainingVal.all { it.isDigit() } && totalLimitVal.all { it.isDigit() }) {\n            fiveHour = \"$remainingVal/$totalLimitVal\"\n        } else if (remainingVal != null && fiveHour == prev.fiveHourQuota) {\n            fiveHour = normalizeValue(remainingVal, MetricKind.FIVE_HOUR)\n        } else if (totalLimitVal != null && weekly == prev.weeklyLimit) {\n            weekly = normalizeValue(totalLimitVal, MetricKind.WEEKLY)\n        }\n\n        if (fiveHour == prev.fiveHourQuota && weekly == prev.weeklyLimit && reset == prev.resetTimer) {\n            return null\n        }\n        return QuotaHudLayout.Snapshot(fiveHour, weekly, reset, source)\n    }\n}\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/QuotaHudLayout.kt",
+    "label": "QuotaHudLayout.kt",
+    "language": "kotlin",
+    "descriptionZh": "单行横向半透明圆角自适应 HUD 胶囊：支持深浅色高对比度动态配色、拖拽、点按中英切换与长按折叠。",
+    "descriptionEn": "Single-line horizontal translucent rounded HUD pill: adaptive Light/Dark palette, drag, ZH/EN toggle, long-press collapse.",
+    "content": "package com.example.bardquotahook\n\nimport android.annotation.SuppressLint\nimport android.content.Context\nimport android.content.res.Configuration\nimport android.graphics.Color\nimport android.graphics.Typeface\nimport android.graphics.drawable.GradientDrawable\nimport android.text.SpannableStringBuilder\nimport android.text.Spanned\nimport android.text.TextUtils\nimport android.text.style.ForegroundColorSpan\nimport android.text.style.StyleSpan\nimport android.util.TypedValue\nimport android.view.Gravity\nimport android.view.MotionEvent\nimport android.view.View\nimport android.view.ViewConfiguration\nimport android.view.ViewGroup\nimport android.widget.FrameLayout\nimport android.widget.LinearLayout\nimport android.widget.TextView\nimport kotlin.math.abs\nimport kotlin.math.roundToInt\n\nobject QuotaHudLayout {\n\n    const val OVERLAY_TAG = \"bard_quota_hud_container\"\n    private const val TAG_DOT = \"bard_quota_hud_dot\"\n    private const val TAG_METRICS = \"bard_quota_hud_metrics\"\n    private const val TAG_DIVIDER = \"bard_quota_hud_divider\"\n    private const val TAG_LANG = \"bard_quota_hud_lang\"\n\n    enum class Lang { ZH, EN }\n\n    data class Snapshot(\n        val fiveHourQuota: String = \"--\",\n        val weeklyLimit: String = \"--\",\n        val resetTimer: String = \"--\",\n        val source: String = \"init\"\n    ) {\n        val hasLiveData: Boolean\n            get() = fiveHourQuota != \"--\" || weeklyLimit != \"--\" || resetTimer != \"--\"\n    }\n\n    private data class Palette(\n        val backgroundFill: Int,\n        val borderStroke: Int,\n        val primaryText: Int,\n        val mutedLabelText: Int,\n        val accentLangText: Int,\n        val dividerColor: Int,\n        val liveDotColor: Int,\n        val idleDotColor: Int\n    )\n\n    @Volatile var currentLang: Lang = Lang.ZH\n    @Volatile var isCollapsed: Boolean = false\n    @Volatile var savedOffsetX: Float = 0f\n    @Volatile var savedOffsetY: Float = 0f\n\n    private fun resolvePalette(context: Context): Palette {\n        val nightMask = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK\n        val isDark = nightMask == Configuration.UI_MODE_NIGHT_YES\n        return if (isDark) {\n            Palette(\n                backgroundFill = Color.argb(216, 24, 24, 27),    // Translucent dark (#18181B @ ~85%)\n                borderStroke = Color.argb(68, 255, 255, 255),    // Subtle light hairline\n                primaryText = Color.parseColor(\"#F8FAFC\"),       // High-contrast light text\n                mutedLabelText = Color.parseColor(\"#94A3B8\"),    // Muted slate-400 label\n                accentLangText = Color.parseColor(\"#38BDF8\"),    // Sky-400 badge\n                dividerColor = Color.argb(56, 255, 255, 255),\n                liveDotColor = Color.parseColor(\"#34D399\"),\n                idleDotColor = Color.parseColor(\"#FBBF24\")\n            )\n        } else {\n            Palette(\n                backgroundFill = Color.argb(230, 255, 255, 255), // Translucent frosted white (~90%)\n                borderStroke = Color.argb(44, 15, 23, 42),       // Subtle dark hairline\n                primaryText = Color.parseColor(\"#0F172A\"),       // High-contrast dark text\n                mutedLabelText = Color.parseColor(\"#475569\"),    // Muted slate-600 label\n                accentLangText = Color.parseColor(\"#0284C7\"),    // Sky-600 badge\n                dividerColor = Color.argb(38, 15, 23, 42),\n                liveDotColor = Color.parseColor(\"#059669\"),\n                idleDotColor = Color.parseColor(\"#D97706\")\n            )\n        }\n    }\n\n    fun dp(context: Context, value: Float): Int {\n        return TypedValue.applyDimension(\n            TypedValue.COMPLEX_UNIT_DIP,\n            value,\n            context.resources.displayMetrics\n        ).roundToInt()\n    }\n\n    fun defaultLayoutParams(context: Context): FrameLayout.LayoutParams {\n        return FrameLayout.LayoutParams(\n            ViewGroup.LayoutParams.WRAP_CONTENT,\n            ViewGroup.LayoutParams.WRAP_CONTENT,\n            Gravity.TOP or Gravity.END\n        ).apply {\n            setMargins(dp(context, 12f), dp(context, 52f), dp(context, 12f), 0)\n        }\n    }\n\n    @SuppressLint(\"ClickableViewAccessibility\")\n    fun createContainer(\n        context: Context,\n        snapshotProvider: () -> Snapshot,\n        onTapRefresh: () -> Unit,\n        onWindowDrag: ((dx: Int, dy: Int) -> Unit)? = null\n    ): LinearLayout {\n        val touchSlop = ViewConfiguration.get(context).scaledTouchSlop\n        val maxMetricsWidth = (context.resources.displayMetrics.widthPixels * 0.78f).roundToInt()\n\n        val container = LinearLayout(context).apply {\n            tag = OVERLAY_TAG\n            orientation = LinearLayout.HORIZONTAL\n            gravity = Gravity.CENTER_VERTICAL\n            setPadding(dp(context, 11f), dp(context, 6f), dp(context, 11f), dp(context, 6f))\n            elevation = dp(context, 6f).toFloat()\n            if (onWindowDrag == null) {\n                translationX = savedOffsetX\n                translationY = savedOffsetY\n            }\n        }\n\n        val statusDot = View(context).apply {\n            tag = TAG_DOT\n            val size = dp(context, 6f)\n            layoutParams = LinearLayout.LayoutParams(size, size).apply {\n                marginEnd = dp(context, 7f)\n            }\n        }\n\n        val metricsText = TextView(context).apply {\n            tag = TAG_METRICS\n            isSingleLine = true\n            maxLines = 1\n            ellipsize = TextUtils.TruncateAt.END\n            includeFontPadding = false\n            maxWidth = maxMetricsWidth\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)\n            typeface = Typeface.MONOSPACE\n        }\n\n        val divider = View(context).apply {\n            tag = TAG_DIVIDER\n            layoutParams = LinearLayout.LayoutParams(dp(context, 1f), dp(context, 12f)).apply {\n                marginStart = dp(context, 8f)\n                marginEnd = dp(context, 7f)\n            }\n        }\n\n        val langBadge = TextView(context).apply {\n            tag = TAG_LANG\n            isSingleLine = true\n            maxLines = 1\n            includeFontPadding = false\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)\n            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)\n        }\n\n        container.addView(statusDot)\n        container.addView(metricsText)\n        container.addView(divider)\n        container.addView(langBadge)\n\n        var downRawX = 0f\n        var downRawY = 0f\n        var lastRawX = 0f\n        var lastRawY = 0f\n        var startTransX = 0f\n        var startTransY = 0f\n        var downTime = 0L\n        var dragging = false\n\n        container.setOnTouchListener { v, event ->\n            when (event.actionMasked) {\n                MotionEvent.ACTION_DOWN -> {\n                    downRawX = event.rawX\n                    downRawY = event.rawY\n                    lastRawX = event.rawX\n                    lastRawY = event.rawY\n                    startTransX = v.translationX\n                    startTransY = v.translationY\n                    downTime = System.currentTimeMillis()\n                    dragging = false\n                    true\n                }\n                MotionEvent.ACTION_MOVE -> {\n                    val totalDx = event.rawX - downRawX\n                    val totalDy = event.rawY - downRawY\n                    if (!dragging && (abs(totalDx) > touchSlop || abs(totalDy) > touchSlop)) {\n                        dragging = true\n                    }\n                    if (dragging) {\n                        if (onWindowDrag != null) {\n                            val stepX = (event.rawX - lastRawX).roundToInt()\n                            val stepY = (event.rawY - lastRawY).roundToInt()\n                            if (stepX != 0 || stepY != 0) {\n                                onWindowDrag(stepX, stepY)\n                                lastRawX = event.rawX\n                                lastRawY = event.rawY\n                            }\n                        } else {\n                            v.translationX = startTransX + totalDx\n                            v.translationY = startTransY + totalDy\n                            savedOffsetX = v.translationX\n                            savedOffsetY = v.translationY\n                        }\n                    }\n                    true\n                }\n                MotionEvent.ACTION_UP -> {\n                    if (!dragging) {\n                        val heldMs = System.currentTimeMillis() - downTime\n                        if (heldMs >= 450L) {\n                            isCollapsed = !isCollapsed\n                        } else if (isCollapsed) {\n                            isCollapsed = false\n                        } else {\n                            currentLang = if (currentLang == Lang.ZH) Lang.EN else Lang.ZH\n                        }\n                        bind(context, v as LinearLayout, snapshotProvider())\n                        onTapRefresh()\n                    }\n                    true\n                }\n                else -> false\n            }\n        }\n\n        return container\n    }\n\n    fun bind(context: Context, container: LinearLayout, snapshot: Snapshot) {\n        val palette = resolvePalette(context)\n\n        container.background = GradientDrawable().apply {\n            shape = GradientDrawable.RECTANGLE\n            cornerRadius = dp(context, 20f).toFloat()\n            setColor(palette.backgroundFill)\n            setStroke(maxOf(1, dp(context, 1f)), palette.borderStroke)\n        }\n\n        container.findViewWithTag<View>(TAG_DOT)?.background = GradientDrawable().apply {\n            shape = GradientDrawable.OVAL\n            setColor(if (snapshot.hasLiveData) palette.liveDotColor else palette.idleDotColor)\n        }\n\n        val metricsTv = container.findViewWithTag<TextView>(TAG_METRICS)\n        val divider = container.findViewWithTag<View>(TAG_DIVIDER)\n        val langTv = container.findViewWithTag<TextView>(TAG_LANG)\n\n        metricsTv?.text = buildSingleLineSpannable(snapshot, currentLang, isCollapsed, palette)\n\n        if (isCollapsed) {\n            divider?.visibility = View.GONE\n            langTv?.visibility = View.GONE\n        } else {\n            divider?.visibility = View.VISIBLE\n            divider?.setBackgroundColor(palette.dividerColor)\n            langTv?.visibility = View.VISIBLE\n            langTv?.setTextColor(palette.accentLangText)\n            langTv?.text = if (currentLang == Lang.ZH) \"ZH\" else \"EN\"\n        }\n    }\n\n    private fun buildSingleLineSpannable(\n        s: Snapshot,\n        lang: Lang,\n        collapsed: Boolean,\n        palette: Palette\n    ): CharSequence {\n        val sb = SpannableStringBuilder()\n\n        fun appendSegment(label: String, value: String, addSep: Boolean) {\n            val lStart = sb.length\n            sb.append(label)\n            sb.setSpan(\n                ForegroundColorSpan(palette.mutedLabelText),\n                lStart,\n                sb.length,\n                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE\n            )\n\n            val vStart = sb.length\n            sb.append(value)\n            sb.setSpan(\n                ForegroundColorSpan(palette.primaryText),\n                vStart,\n                sb.length,\n                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE\n            )\n            sb.setSpan(\n                StyleSpan(Typeface.BOLD),\n                vStart,\n                sb.length,\n                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE\n            )\n\n            if (addSep) {\n                val sepStart = sb.length\n                sb.append(\" · \")\n                sb.setSpan(\n                    ForegroundColorSpan(palette.mutedLabelText),\n                    sepStart,\n                    sb.length,\n                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE\n                )\n            }\n        }\n\n        if (collapsed) {\n            appendSegment(\"5h \", s.fiveHourQuota, false)\n            return sb\n        }\n\n        if (lang == Lang.ZH) {\n            appendSegment(\"5h \", s.fiveHourQuota, true)\n            appendSegment(\"周 \", s.weeklyLimit, true)\n            appendSegment(\"重置 \", s.resetTimer, false)\n        } else {\n            appendSegment(\"5h \", s.fiveHourQuota, true)\n            appendSegment(\"Wk \", s.weeklyLimit, true)\n            appendSegment(\"Rst \", s.resetTimer, false)\n        }\n        return sb\n    }\n}\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/HookTelemetryReceiver.kt",
+    "label": "HookTelemetryReceiver.kt",
+    "language": "kotlin",
+    "descriptionZh": "接收宿主 Hook 实时心跳，并将内置网页抓取的真实额度广播同步至 Gemini 悬浮胶囊。",
+    "descriptionEn": "Receives live Xposed heartbeats and broadcasts WebView-synced usage quotas directly into Gemini.",
+    "content": "package com.example.bardquotahook\n\nimport android.content.BroadcastReceiver\nimport android.content.Context\nimport android.content.Intent\nimport java.lang.ref.WeakReference\nimport java.util.concurrent.atomic.AtomicReference\n\nclass HookTelemetryReceiver : BroadcastReceiver() {\n\n    companion object {\n        private val uiListenerRef = AtomicReference<WeakReference<() -> Unit>>(WeakReference(null))\n\n        fun setUiListener(listener: (() -> Unit)?) {\n            uiListenerRef.set(WeakReference(listener))\n        }\n\n        fun saveSnapshot(\n            context: Context,\n            snapshot: QuotaHudLayout.Snapshot,\n            pkg: String? = null,\n            proc: String? = null,\n            bridge: String? = null\n        ) {\n            try {\n                val prefs = context.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)\n                val editor = prefs.edit()\n                if (pkg != null) {\n                    editor.putString(\"last_pkg\", pkg)\n                    editor.putLong(\"last_hb_ms\", System.currentTimeMillis())\n                }\n                if (proc != null) editor.putString(\"last_proc\", proc)\n                if (bridge != null) editor.putString(\"last_bridge\", bridge)\n                if (snapshot.hasLiveData) {\n                    editor.putString(\"five\", snapshot.fiveHourQuota)\n                    editor.putString(\"week\", snapshot.weeklyLimit)\n                    editor.putString(\"reset\", snapshot.resetTimer)\n                    editor.putString(\"src\", snapshot.source)\n                    editor.putLong(\"last_quota_ms\", System.currentTimeMillis())\n                }\n                editor.apply()\n            } catch (_: Throwable) {\n            }\n        }\n\n        fun loadSnapshot(context: Context): QuotaHudLayout.Snapshot {\n            return try {\n                val prefs = context.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)\n                QuotaHudLayout.Snapshot(\n                    fiveHourQuota = prefs.getString(\"five\", \"--\") ?: \"--\",\n                    weeklyLimit = prefs.getString(\"week\", \"--\") ?: \"--\",\n                    resetTimer = prefs.getString(\"reset\", \"--\") ?: \"--\",\n                    source = prefs.getString(\"src\", \"init\") ?: \"init\"\n                )\n            } catch (_: Throwable) {\n                QuotaHudLayout.Snapshot()\n            }\n        }\n\n        fun pushExternalQuotaToHostApps(context: Context, snapshot: QuotaHudLayout.Snapshot) {\n            saveSnapshot(context, snapshot)\n            OverlayHudController.updateSnapshot(context, snapshot)\n\n            val targets = arrayOf(\n                \"com.google.android.apps.bard\",\n                \"com.google.android.googlequicksearchbox\"\n            )\n            for (pkg in targets) {\n                try {\n                    val intent = Intent(QuotaTextParser.ACTION_QUOTA_EXTERNAL_SYNC).apply {\n                        setPackage(pkg)\n                        putExtra(\"five\", snapshot.fiveHourQuota)\n                        putExtra(\"week\", snapshot.weeklyLimit)\n                        putExtra(\"reset\", snapshot.resetTimer)\n                        putExtra(\"src\", snapshot.source)\n                    }\n                    context.sendBroadcast(intent)\n                } catch (_: Throwable) {\n                }\n            }\n            uiListenerRef.get().get()?.invoke()\n        }\n    }\n\n    override fun onReceive(context: Context?, intent: Intent?) {\n        if (context == null || intent?.action != QuotaTextParser.ACTION_HOOK_HEARTBEAT) return\n        try {\n            val pkg = intent.getStringExtra(\"pkg\") ?: \"\"\n            val proc = intent.getStringExtra(\"proc\") ?: \"\"\n            val bridge = intent.getStringExtra(\"bridge\") ?: \"Xposed\"\n            val five = intent.getStringExtra(\"five\") ?: \"--\"\n            val week = intent.getStringExtra(\"week\") ?: \"--\"\n            val reset = intent.getStringExtra(\"reset\") ?: \"--\"\n            val src = intent.getStringExtra(\"src\") ?: \"Hook\"\n\n            val incoming = QuotaHudLayout.Snapshot(five, week, reset, src)\n            saveSnapshot(context, incoming, pkg = pkg, proc = proc, bridge = bridge)\n            if (incoming.hasLiveData) {\n                OverlayHudController.updateSnapshot(context, incoming)\n            }\n            uiListenerRef.get().get()?.invoke()\n        } catch (_: Throwable) {\n        }\n    }\n}\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/OverlayHudController.kt",
+    "label": "OverlayHudController.kt",
+    "language": "kotlin",
+    "descriptionZh": "免 Hook 系统级悬浮胶囊兜底控制器 (SYSTEM_ALERT_WINDOW + 后台定时同步 gemini.google.com/usage)。",
+    "descriptionEn": "Optional SYSTEM_ALERT_WINDOW floating capsule fallback with background gemini.google.com/usage auto-sync.",
+    "content": "package com.example.bardquotahook\n\nimport android.annotation.SuppressLint\nimport android.content.Context\nimport android.graphics.PixelFormat\nimport android.os.Handler\nimport android.os.Looper\nimport android.provider.Settings\nimport android.view.Gravity\nimport android.view.WindowManager\nimport android.webkit.CookieManager\nimport android.webkit.WebView\nimport android.webkit.WebViewClient\nimport android.widget.LinearLayout\nimport java.lang.ref.WeakReference\nimport java.util.concurrent.atomic.AtomicReference\n\n/**\n * Optional System-Wide Floating Capsule Fallback (`TYPE_APPLICATION_OVERLAY`).\n * Works even when Magisk DenyList / Shamiko blocks Xposed injection into Google App,\n * and silently refreshes `https://gemini.google.com/usage` in the background while active.\n */\nobject OverlayHudController {\n\n    private const val USAGE_URL = \"https://gemini.google.com/usage\"\n\n    private val containerRef = AtomicReference<WeakReference<LinearLayout>>(WeakReference(null))\n    private val bgWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))\n    private val latestSnapshot = AtomicReference(QuotaHudLayout.Snapshot())\n\n    @Volatile private var wmParams: WindowManager.LayoutParams? = null\n    @Volatile private var mainHandler: Handler? = null\n    @Volatile var isShowing: Boolean = false\n        private set\n\n    private fun runOnUi(delayMs: Long = 0L, block: () -> Unit) {\n        try {\n            val looper = Looper.getMainLooper() ?: return\n            val handler = mainHandler ?: Handler(looper).also { mainHandler = it }\n            val r = Runnable {\n                try {\n                    block()\n                } catch (_: Throwable) {\n                }\n            }\n            if (delayMs > 0L) handler.postDelayed(r, delayMs) else handler.post(r)\n        } catch (_: Throwable) {\n        }\n    }\n\n    fun show(context: Context): Boolean {\n        val appCtx = context.applicationContext\n        if (!Settings.canDrawOverlays(appCtx)) return false\n        if (isShowing && containerRef.get().get() != null) {\n            refreshNow(appCtx)\n            return true\n        }\n\n        val saved = HookTelemetryReceiver.loadSnapshot(appCtx)\n        latestSnapshot.set(saved)\n\n        runOnUi {\n            val wm = appCtx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return@runOnUi\n            val params = WindowManager.LayoutParams(\n                WindowManager.LayoutParams.WRAP_CONTENT,\n                WindowManager.LayoutParams.WRAP_CONTENT,\n                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,\n                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or\n                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,\n                PixelFormat.TRANSLUCENT\n            ).apply {\n                gravity = Gravity.TOP or Gravity.END\n                x = QuotaHudLayout.dp(appCtx, 12f)\n                y = QuotaHudLayout.dp(appCtx, 56f)\n            }\n            wmParams = params\n\n            val pill = QuotaHudLayout.createContainer(\n                context = appCtx,\n                snapshotProvider = { latestSnapshot.get() },\n                onTapRefresh = { refreshNow(appCtx) },\n                onWindowDrag = { dx, dy ->\n                    // Gravity.END inverts horizontal X offset direction\n                    params.x = maxOf(0, params.x - dx)\n                    params.y = maxOf(0, params.y + dy)\n                    try {\n                        wm.updateViewLayout(containerRef.get().get(), params)\n                    } catch (_: Throwable) {\n                    }\n                }\n            )\n            QuotaHudLayout.bind(appCtx, pill, latestSnapshot.get())\n            try {\n                wm.addView(pill, params)\n                containerRef.set(WeakReference(pill))\n                isShowing = true\n                ensureBackgroundPoller(appCtx)\n            } catch (_: Throwable) {\n                isShowing = false\n            }\n        }\n        return true\n    }\n\n    fun hide(context: Context) {\n        val appCtx = context.applicationContext\n        runOnUi {\n            val wm = appCtx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager\n            val pill = containerRef.get().get()\n            if (wm != null && pill != null) {\n                try {\n                    wm.removeView(pill)\n                } catch (_: Throwable) {\n                }\n            }\n            containerRef.set(WeakReference(null))\n            isShowing = false\n\n            val wv = bgWebViewRef.get().get()\n            if (wv != null) {\n                try {\n                    wv.stopLoading()\n                    wv.destroy()\n                } catch (_: Throwable) {\n                }\n            }\n            bgWebViewRef.set(WeakReference(null))\n        }\n    }\n\n    fun updateSnapshot(context: Context, snapshot: QuotaHudLayout.Snapshot) {\n        latestSnapshot.set(snapshot)\n        val appCtx = context.applicationContext\n        runOnUi {\n            val pill = containerRef.get().get() ?: return@runOnUi\n            QuotaHudLayout.bind(appCtx, pill, snapshot)\n        }\n    }\n\n    @SuppressLint(\"SetJavaScriptEnabled\")\n    fun refreshNow(context: Context) {\n        val appCtx = context.applicationContext\n        runOnUi {\n            var wv = bgWebViewRef.get().get()\n            if (wv == null) {\n                try {\n                    wv = WebView(appCtx).apply {\n                        settings.javaScriptEnabled = true\n                        settings.domStorageEnabled = true\n                        CookieManager.getInstance().setAcceptCookie(true)\n                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)\n                        webViewClient = object : WebViewClient() {\n                            override fun onPageFinished(view: WebView?, url: String?) {\n                                scrapeWebView(appCtx, view, 1200L)\n                                scrapeWebView(appCtx, view, 3200L)\n                            }\n                        }\n                    }\n                    bgWebViewRef.set(WeakReference(wv))\n                } catch (_: Throwable) {\n                    return@runOnUi\n                }\n            }\n            try {\n                wv.loadUrl(USAGE_URL)\n            } catch (_: Throwable) {\n            }\n        }\n    }\n\n    private fun ensureBackgroundPoller(appCtx: Context) {\n        refreshNow(appCtx)\n        schedulePeriodicLoop(appCtx)\n    }\n\n    private fun schedulePeriodicLoop(appCtx: Context) {\n        runOnUi(delayMs = 90_000L) {\n            if (!isShowing) return@runOnUi\n            refreshNow(appCtx)\n            schedulePeriodicLoop(appCtx)\n        }\n    }\n\n    private fun scrapeWebView(appCtx: Context, webView: WebView?, delayMs: Long) {\n        if (webView == null) return\n        runOnUi(delayMs = delayMs) {\n            try {\n                webView.evaluateJavascript(\n                    \"(function(){return document.body ? document.body.innerText : '';})()\"\n                ) { raw ->\n                    try {\n                        if (!raw.isNullOrBlank() && raw != \"null\") {\n                            val text = raw.trim('\"')\n                                .replace(\"\\\\n\", \"\\n\")\n                                .replace(\"\\\\\\\"\", \"\\\"\")\n                            val snap = QuotaTextParser.parseUiBlock(text, latestSnapshot.get(), \"UsageWeb\")\n                            if (snap != null) {\n                                HookTelemetryReceiver.pushExternalQuotaToHostApps(appCtx, snap)\n                            }\n                        }\n                    } catch (_: Throwable) {\n                    }\n                }\n            } catch (_: Throwable) {\n            }\n        }\n    }\n}\n"
+  },
+  {
+    "path": "app/src/main/java/com/example/bardquotahook/MainActivity.kt",
+    "label": "MainActivity.kt",
+    "language": "kotlin",
+    "descriptionZh": "v1.8.0 控制台：实时显示 Hook 连接诊断、内置 gemini.google.com/usage 登录直抓面板与免 Hook 悬浮窗开关。",
+    "descriptionEn": "v1.8.0 dashboard: live hook heartbeat diagnostics, embedded gemini.google.com/usage WebView sync, and system overlay toggle.",
+    "content": "package com.example.bardquotahook\n\nimport android.annotation.SuppressLint\nimport android.app.Activity\nimport android.content.ComponentName\nimport android.content.Context\nimport android.content.Intent\nimport android.content.pm.PackageManager\nimport android.graphics.Color\nimport android.graphics.Typeface\nimport android.graphics.drawable.GradientDrawable\nimport android.net.Uri\nimport android.os.Build\nimport android.os.Bundle\nimport android.os.Handler\nimport android.os.Looper\nimport android.provider.Settings\nimport android.util.TypedValue\nimport android.view.Gravity\nimport android.view.View\nimport android.webkit.CookieManager\nimport android.webkit.WebView\nimport android.webkit.WebViewClient\nimport android.widget.Button\nimport android.widget.FrameLayout\nimport android.widget.LinearLayout\nimport android.widget.ScrollView\nimport android.widget.TextView\n\nclass MainActivity : Activity() {\n\n    companion object {\n        private const val USAGE_URL = \"https://gemini.google.com/usage\"\n    }\n\n    private var hookStatusView: TextView? = null\n    private var quotaPreviewView: TextView? = null\n    private var overlayToggleBtn: Button? = null\n    private var syncWebBtn: Button? = null\n    private var webContainer: FrameLayout? = null\n    private var embeddedWebView: WebView? = null\n    private val uiHandler = Handler(Looper.getMainLooper())\n    private var webExpanded = false\n\n    private fun dp(v: Float): Int = QuotaHudLayout.dp(this, v)\n\n    private fun isPkgInstalled(pkg: String): Boolean {\n        return try {\n            if (Build.VERSION.SDK_INT >= 33) {\n                packageManager.getPackageInfo(pkg, PackageManager.PackageInfoFlags.of(0))\n            } else {\n                @Suppress(\"DEPRECATION\")\n                packageManager.getPackageInfo(pkg, 0)\n            }\n            true\n        } catch (_: Throwable) {\n            packageManager.getLaunchIntentForPackage(pkg) != null\n        }\n    }\n\n    private fun pingHookedProcesses() {\n        val targets = arrayOf(\n            \"com.google.android.apps.bard\",\n            \"com.google.android.googlequicksearchbox\"\n        )\n        for (pkg in targets) {\n            try {\n                val ping = Intent(QuotaTextParser.ACTION_QUOTA_EXTERNAL_SYNC).apply {\n                    setPackage(pkg)\n                    putExtra(\"ping\", true)\n                }\n                sendBroadcast(ping)\n            } catch (_: Throwable) {\n            }\n        }\n    }\n\n    private fun launchGeminiWithFallback() {\n        val candidates = listOf(\n            packageManager.getLaunchIntentForPackage(\"com.google.android.apps.bard\"),\n            Intent(Intent.ACTION_MAIN).apply {\n                component = ComponentName(\n                    \"com.google.android.apps.bard\",\n                    \"com.google.android.apps.bard.shellapp.BardEntryPointActivity\"\n                )\n            },\n            packageManager.getLaunchIntentForPackage(\"com.google.android.googlequicksearchbox\"),\n            Intent(Intent.ACTION_VIEW, Uri.parse(\"https://gemini.google.com/app\"))\n        )\n\n        for (intent in candidates) {\n            if (intent == null) continue\n            val started = runCatching {\n                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)\n                startActivity(intent)\n                true\n            }.getOrDefault(false)\n            if (started) return\n        }\n    }\n\n    private fun makeCardDrawable(bgHex: String, borderHex: String): GradientDrawable {\n        return GradientDrawable().apply {\n            setColor(Color.parseColor(bgHex))\n            cornerRadius = dp(14f).toFloat()\n            setStroke(maxOf(1, dp(1f)), Color.parseColor(borderHex))\n        }\n    }\n\n    private fun makeBtnDrawable(bgHex: String): GradientDrawable {\n        return GradientDrawable().apply {\n            setColor(Color.parseColor(bgHex))\n            cornerRadius = dp(12f).toFloat()\n        }\n    }\n\n    private fun refreshStatusTexts() {\n        val prefs = getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)\n        val lastHb = prefs.getLong(\"last_hb_ms\", 0L)\n        val lastPkg = prefs.getString(\"last_pkg\", \"\") ?: \"\"\n        val lastBridge = prefs.getString(\"last_bridge\", \"\") ?: \"\"\n        val snap = HookTelemetryReceiver.loadSnapshot(this)\n\n        val hookLine = if (lastHb > 0L) {\n            val secAgo = maxOf(0L, (System.currentTimeMillis() - lastHb) / 1000L)\n            \"✅ Xposed 已连接 · 引擎: $lastBridge\\n宿主: $lastPkg (${secAgo}s 前活跃)\"\n        } else {\n            \"⚠️ 尚未收到宿主 Hook 回执：\\n\" +\n                \"• Vector / LSPosed API 102 用户：本版已补齐 META-INF/xposed/* 原生入口，请重启或强行停止 Google 与 Gemini。\\n\" +\n                \"• Magisk / Shamiko 用户：若在「排除列表 (DenyList)」中勾选了 Google 或 Gemini，Zygisk 会剥离所有模块导致无法 Hook！请将它们移出排除列表，或直接开启下方「免 Hook 全局悬浮胶囊」。\"\n        }\n        hookStatusView?.text = hookLine\n\n        quotaPreviewView?.text =\n            \"当前缓存额度 · 5h: ${snap.fiveHourQuota}  |  周: ${snap.weeklyLimit}  |  重置: ${snap.resetTimer}  (来源: ${snap.source})\"\n\n        val overlayOn = OverlayHudController.isShowing\n        overlayToggleBtn?.text = if (overlayOn) {\n            \"关闭全局悬浮胶囊 (当前运行中 · 自动同步)\"\n        } else {\n            \"开启免 Hook 全局悬浮胶囊 (过 DenyList 保底方案)\"\n        }\n        overlayToggleBtn?.background = makeBtnDrawable(if (overlayOn) \"#059669\" else \"#334155\")\n    }\n\n    @SuppressLint(\"SetJavaScriptEnabled\")\n    private fun toggleOrReloadUsageWebView() {\n        val frame = webContainer ?: return\n        if (!webExpanded) {\n            webExpanded = true\n            frame.visibility = View.VISIBLE\n            syncWebBtn?.text = \"刷新 gemini.google.com/usage 并提取最新额度\"\n\n            if (embeddedWebView == null) {\n                try {\n                    val wv = WebView(this).apply {\n                        settings.javaScriptEnabled = true\n                        settings.domStorageEnabled = true\n                        CookieManager.getInstance().setAcceptCookie(true)\n                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)\n                        webViewClient = object : WebViewClient() {\n                            override fun onPageFinished(view: WebView?, url: String?) {\n                                extractFromEmbeddedWebView(900L)\n                                extractFromEmbeddedWebView(2600L)\n                            }\n                        }\n                    }\n                    embeddedWebView = wv\n                    frame.addView(\n                        wv,\n                        FrameLayout.LayoutParams(\n                            FrameLayout.LayoutParams.MATCH_PARENT,\n                            dp(340f)\n                        )\n                    )\n                } catch (_: Throwable) {\n                    return\n                }\n            }\n            embeddedWebView?.loadUrl(USAGE_URL)\n        } else {\n            embeddedWebView?.reload()\n            extractFromEmbeddedWebView(1200L)\n        }\n    }\n\n    private fun extractFromEmbeddedWebView(delayMs: Long) {\n        uiHandler.postDelayed({\n            val wv = embeddedWebView ?: return@postDelayed\n            if (isFinishing || isDestroyed) return@postDelayed\n            try {\n                wv.evaluateJavascript(\n                    \"(function(){return document.body ? document.body.innerText : '';})()\"\n                ) { raw ->\n                    try {\n                        if (!raw.isNullOrBlank() && raw != \"null\") {\n                            val text = raw.trim('\"')\n                                .replace(\"\\\\n\", \"\\n\")\n                                .replace(\"\\\\\\\"\", \"\\\"\")\n                            val prev = HookTelemetryReceiver.loadSnapshot(this@MainActivity)\n                            val snap = QuotaTextParser.parseUiBlock(text, prev, \"UsageWeb\")\n                            if (snap != null) {\n                                HookTelemetryReceiver.pushExternalQuotaToHostApps(this@MainActivity, snap)\n                                refreshStatusTexts()\n                            }\n                        }\n                    } catch (_: Throwable) {\n                    }\n                }\n            } catch (_: Throwable) {\n            }\n        }, delayMs)\n    }\n\n    override fun onCreate(savedInstanceState: Bundle?) {\n        super.onCreate(savedInstanceState)\n\n        val bardInstalled = isPkgInstalled(\"com.google.android.apps.bard\")\n        val gsaInstalled = isPkgInstalled(\"com.google.android.googlequicksearchbox\")\n\n        val scroll = ScrollView(this).apply {\n            setBackgroundColor(Color.parseColor(\"#0F172A\"))\n        }\n\n        val container = LinearLayout(this).apply {\n            orientation = LinearLayout.VERTICAL\n            val padH = dp(18f)\n            val padV = dp(24f)\n            setPadding(padH, padV, padH, padV)\n        }\n\n        val titleView = TextView(this).apply {\n            text = \"Gemini-Eye 用量监控 (v1.8.0 · 双引擎)\"\n            setTextColor(Color.WHITE)\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)\n            typeface = Typeface.DEFAULT_BOLD\n        }\n\n        val pkgView = TextView(this).apply {\n            text = \"包检测 · Gemini: ${if (bardInstalled) \"已安装\" else \"未安装\"} | Google 主程序: ${if (gsaInstalled) \"已安装\" else \"未检测到\"} | API 102 + API 82\"\n            setTextColor(Color.parseColor(\"#38BDF8\"))\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)\n            setPadding(0, dp(6f), 0, dp(14f))\n        }\n\n        // 1. Live Hook Diagnostics Card\n        val diagCard = LinearLayout(this).apply {\n            orientation = LinearLayout.VERTICAL\n            background = makeCardDrawable(\"#1E293B\", \"#334155\")\n            val p = dp(14f)\n            setPadding(p, p, p, p)\n        }\n\n        val statusTv = TextView(this).apply {\n            setTextColor(Color.parseColor(\"#E2E8F0\"))\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)\n            setLineSpacing(dp(3f).toFloat(), 1.1f)\n        }\n        hookStatusView = statusTv\n\n        val quotaTv = TextView(this).apply {\n            setTextColor(Color.parseColor(\"#34D399\"))\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)\n            typeface = Typeface.MONOSPACE\n            setPadding(0, dp(10f), 0, dp(10f))\n        }\n        quotaPreviewView = quotaTv\n\n        val pingBtn = Button(this).apply {\n            text = \"主动检测 Hook 连接状态 (Ping 宿主)\"\n            isAllCaps = false\n            setTextColor(Color.WHITE)\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)\n            background = makeBtnDrawable(\"#0284C7\")\n            setOnClickListener {\n                pingHookedProcesses()\n                uiHandler.postDelayed({ refreshStatusTexts() }, 500L)\n            }\n        }\n\n        diagCard.addView(statusTv)\n        diagCard.addView(quotaTv)\n        diagCard.addView(pingBtn)\n\n        // 2. Direct gemini.google.com/usage Live Sync Card\n        val syncCard = LinearLayout(this).apply {\n            orientation = LinearLayout.VERTICAL\n            background = makeCardDrawable(\"#1E293B\", \"#334155\")\n            val p = dp(14f)\n            setPadding(p, p, p, p)\n            layoutParams = LinearLayout.LayoutParams(\n                LinearLayout.LayoutParams.MATCH_PARENT,\n                LinearLayout.LayoutParams.WRAP_CONTENT\n            ).apply {\n                topMargin = dp(14f)\n            }\n        }\n\n        val syncDesc = TextView(this).apply {\n            text = \"为什么聊天界面默认显示 -- ？\\nGoogle 聊天流采用二进制 Protobuf 且不附带额度字段；真实百分比仅在 gemini.google.com/usage 提供。点击下方按钮登录一次 Google 账号，即可直接抓取实时 5h % / 周限额 % 并自动推送至 Gemini 悬浮胶囊！\"\n            setTextColor(Color.parseColor(\"#CBD5E1\"))\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)\n            setLineSpacing(dp(3f).toFloat(), 1.1f)\n        }\n\n        val webBtn = Button(this).apply {\n            text = \"展开内置网页登录并同步 gemini.google.com/usage\"\n            isAllCaps = false\n            setTextColor(Color.WHITE)\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)\n            background = makeBtnDrawable(\"#2563EB\")\n            layoutParams = LinearLayout.LayoutParams(\n                LinearLayout.LayoutParams.MATCH_PARENT,\n                LinearLayout.LayoutParams.WRAP_CONTENT\n            ).apply {\n                topMargin = dp(10f)\n            }\n            setOnClickListener { toggleOrReloadUsageWebView() }\n        }\n        syncWebBtn = webBtn\n\n        val webHolder = FrameLayout(this).apply {\n            visibility = View.GONE\n            layoutParams = LinearLayout.LayoutParams(\n                LinearLayout.LayoutParams.MATCH_PARENT,\n                LinearLayout.LayoutParams.WRAP_CONTENT\n            ).apply {\n                topMargin = dp(10f)\n            }\n        }\n        webContainer = webHolder\n\n        syncCard.addView(syncDesc)\n        syncCard.addView(webBtn)\n        syncCard.addView(webHolder)\n\n        // 3. System Overlay Fallback Button (Works even without Xposed / under DenyList)\n        val overlayBtn = Button(this).apply {\n            isAllCaps = false\n            setTextColor(Color.WHITE)\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)\n            layoutParams = LinearLayout.LayoutParams(\n                LinearLayout.LayoutParams.MATCH_PARENT,\n                LinearLayout.LayoutParams.WRAP_CONTENT\n            ).apply {\n                topMargin = dp(14f)\n            }\n            setPadding(dp(12f), dp(12f), dp(12f), dp(12f))\n            setOnClickListener {\n                if (OverlayHudController.isShowing) {\n                    OverlayHudController.hide(this@MainActivity)\n                    uiHandler.postDelayed({ refreshStatusTexts() }, 200L)\n                } else if (!Settings.canDrawOverlays(this@MainActivity)) {\n                    val permIntent = Intent(\n                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,\n                        Uri.parse(\"package:$packageName\")\n                    )\n                    runCatching { startActivity(permIntent) }\n                } else {\n                    OverlayHudController.show(this@MainActivity)\n                    uiHandler.postDelayed({ refreshStatusTexts() }, 250L)\n                }\n            }\n        }\n        overlayToggleBtn = overlayBtn\n\n        // 4. Launch Gemini Button\n        val launchBtn = Button(this).apply {\n            text = \"启动 Gemini / Launch Gemini\"\n            isAllCaps = false\n            setTextColor(Color.WHITE)\n            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)\n            gravity = Gravity.CENTER\n            background = makeBtnDrawable(\"#4F46E5\")\n            layoutParams = LinearLayout.LayoutParams(\n                LinearLayout.LayoutParams.MATCH_PARENT,\n                LinearLayout.LayoutParams.WRAP_CONTENT\n            ).apply {\n                topMargin = dp(12f)\n            }\n            setPadding(dp(12f), dp(13f), dp(12f), dp(13f))\n            setOnClickListener { launchGeminiWithFallback() }\n        }\n\n        container.addView(titleView)\n        container.addView(pkgView)\n        container.addView(diagCard)\n        container.addView(syncCard)\n        container.addView(overlayBtn)\n        container.addView(launchBtn)\n        scroll.addView(container)\n        setContentView(scroll)\n\n        HookTelemetryReceiver.setUiListener {\n            runOnUiThread { refreshStatusTexts() }\n        }\n        pingHookedProcesses()\n        refreshStatusTexts()\n    }\n\n    override fun onResume() {\n        super.onResume()\n        pingHookedProcesses()\n        refreshStatusTexts()\n    }\n\n    override fun onDestroy() {\n        HookTelemetryReceiver.setUiListener(null)\n        embeddedWebView?.let { wv ->\n            runCatching {\n                wv.stopLoading()\n                wv.destroy()\n            }\n        }\n        embeddedWebView = null\n        super.onDestroy()\n    }\n}\n"
+  }
 ];

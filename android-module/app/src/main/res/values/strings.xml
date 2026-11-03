@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Gemini 用量监控 Hook</string>
+    <string name="module_description">Gemini 用量实时监控 · 双引擎兼容 LibXposed API 102 &amp; LSPosed API 82 单行自适应胶囊 (ZH/EN)</string>
+</resources>

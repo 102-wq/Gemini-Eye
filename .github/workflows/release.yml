@@ -44,7 +44,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.7.${{ github.run_number }}
-          name: Gemini-Eye v1.7.${{ github.run_number }}
-          body: "**v1.7 R8-Obfuscation Bypass & Adaptive Single-Line HUD**: Added R8-immune `org.json.JSONObject` / `JSONArray` + `java.lang.String` (`byte[]` & `char[]`) constructor hooks and stateful Compose label-value pairing to capture `quota` / `remaining` payloads across obfuscated builds, upgraded to Xposed API 102 (`io.github.libxposed:api:102.0.0`), and separated `QuotaHudLayout.kt` for the single-line Light/Dark adaptive translucent HUD."
+          tag_name: v1.8.${{ github.run_number }}
+          name: Gemini-Eye v1.8.${{ github.run_number }}
+          body: "**v1.8 True Dual-API Hook (LibXposed API 102 + Legacy Xposed 82) & Live Usage Sync**: Added `META-INF/xposed/{module.prop,java_init.list,scope.list}` + `ModernQuotaModule` (`io.github.libxposed.api.XposedModule`) alongside `assets/xposed_init` (`QuotaHookEntry`) so both Vector / Modern LSPosed API 102 and Legacy LSPosed hook reliably; refactored `QuotaTextParser` to parse `gemini.google.com/usage` percentage meters (`% used` / `已使用 %`); added built-in `gemini.google.com/usage` WebView live sync + cross-app broadcast + optional `SYSTEM_ALERT_WINDOW` floating capsule fallback for Magisk DenyList/Shamiko setups."
           files: Gemini-Eye.apk
