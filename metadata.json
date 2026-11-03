@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Quota Hook Builder",
+  "description": "Android LSPosed/Xposed Kotlin project generator and bilingual Usage Limits HUD builder for Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

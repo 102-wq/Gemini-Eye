@@ -1,0 +1,2 @@
+-keep class com.example.bardquotahook.QuotaHookEntry { *; }
+-keep class * implements de.robv.android.xposed.IXposedHookLoadPackage { *; }
