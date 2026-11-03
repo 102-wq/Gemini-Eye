@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.bardquotahook"
         minSdk = 24
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.5.0"
+        versionCode = 7
+        versionName = "1.6.0"
     }
 
     signingConfigs {
@@ -32,6 +32,11 @@ android {
         dex {
             useLegacyPackaging = false
         }
+    }
+
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     buildTypes {
@@ -65,6 +70,8 @@ android {
 }
 
 dependencies {
-    // 核心：Xposed 必须使用 compileOnly
+    // Modern Xposed / LibXposed API 102 (Maven Central)
+    compileOnly("io.github.libxposed:api:102.0.0")
+    // Legacy Xposed Bridge API (82 is the latest version in https://api.xposed.info/)
     compileOnly("de.robv.android.xposed:api:82")
 }

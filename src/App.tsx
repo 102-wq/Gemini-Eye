@@ -74,6 +74,7 @@ export default function App() {
   const [zipDownloaded, setZipDownloaded] = useState(false);
 
   const [selectedSampleId, setSelectedSampleId] = useState<string>('compose');
+  const [simDarkTheme, setSimDarkTheme] = useState<boolean>(true);
   const [hudOffset, setHudOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const dragRef = useRef<{
     startX: number;
@@ -174,9 +175,9 @@ export default function App() {
             BardQuotaHook
           </div>
           <div className="mt-1 text-xs text-slate-500">
-            <span>LSPosed API 82</span>
+            <span>Xposed API 102</span>
             <span aria-hidden="true"> · </span>
-            <span>AGP 8.5</span>
+            <span>v1.6.0</span>
           </div>
         </div>
 
@@ -207,7 +208,7 @@ export default function App() {
           >
             <FileCode className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? 'Android 工程源码 (10)' : 'Android Source Files (10)'}
+              {isZh ? `Android 工程源码 (${PROJECT_FILES.length})` : `Android Source Files (${PROJECT_FILES.length})`}
             </span>
           </button>
 
@@ -594,63 +595,112 @@ git push -u origin main`}
               </div>
 
               {/* Simulated Gemini Android Screen */}
-              <div className="lg:col-span-6 flex justify-center">
-                <div className="w-full max-w-sm bg-white border border-slate-300 rounded-3xl overflow-hidden shadow-xs relative h-[520px] select-none flex flex-col">
+              <div className="lg:col-span-6 flex flex-col items-center gap-3">
+                <div className="w-full max-w-sm flex items-center justify-between px-1">
+                  <span className="text-xs font-medium text-slate-600">
+                    {isZh ? '宿主界面深浅色动态主题测试' : 'Host App Dynamic Theme'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setSimDarkTheme((d) => !d)}
+                    className="px-3 py-1 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 transition-colors cursor-pointer"
+                  >
+                    {simDarkTheme
+                      ? isZh
+                        ? '当前：深色模式 (点击切浅色)'
+                        : 'Dark Mode (Switch to Light)'
+                      : isZh
+                      ? '当前：浅色模式 (点击切深色)'
+                      : 'Light Mode (Switch to Dark)'}
+                  </button>
+                </div>
+
+                <div
+                  className={`w-full max-w-sm border rounded-3xl overflow-hidden shadow-xs relative h-[520px] select-none flex flex-col transition-colors ${
+                    simDarkTheme
+                      ? 'bg-zinc-950 border-zinc-800 text-zinc-100'
+                      : 'bg-white border-slate-300 text-slate-900'
+                  }`}
+                >
                   {/* Mock Status Bar */}
-                  <div className="px-6 py-3 flex items-center justify-between text-xs font-mono text-slate-500 border-b border-slate-100">
+                  <div
+                    className={`px-6 py-3 flex items-center justify-between text-xs font-mono border-b ${
+                      simDarkTheme
+                        ? 'text-zinc-400 border-zinc-800/80'
+                        : 'text-slate-500 border-slate-100'
+                    }`}
+                  >
                     <span>09:41</span>
                     <span>Gemini · Usage Limits</span>
                   </div>
 
                   {/* Mock Gemini Usage Limits Page */}
-                  <div className="p-6 space-y-5 flex-1 bg-slate-50/60">
-                    <div>
-                      <div className="text-base font-bold text-slate-900">
+                  <div
+                    className={`p-6 space-y-5 flex-1 ${
+                      simDarkTheme ? 'bg-zinc-900/50' : 'bg-slate-50/60'
+                    }`}
+                  >
+                    <div className="pt-8">
+                      <div className="text-base font-bold">
                         {isZh ? 'Gemini 用量与限额' : 'Gemini Usage Limits'}
                       </div>
-                      <div className="mt-1 text-xs text-slate-500">
-                        com.google.android.googlequicksearchbox (Robin)
+                      <div
+                        className={`mt-1 text-xs ${
+                          simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
+                        }`}
+                      >
+                        com.google.android.googlequicksearchbox ({activeSample.source})
                       </div>
                     </div>
 
-                    <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+                    <div
+                      className={`border rounded-xl p-4 space-y-3 ${
+                        simDarkTheme
+                          ? 'bg-zinc-900 border-zinc-800'
+                          : 'bg-white border-slate-200'
+                      }`}
+                    >
                       <div className="flex justify-between text-xs">
-                        <span className="text-slate-500">
+                        <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
                           {isZh ? '5 小时对话窗口' : '5-hour window'}
                         </span>
-                        <span className="font-mono font-semibold text-slate-900">
+                        <span className="font-mono font-semibold">
                           {activeSample.parsed.fiveHourQuota}
                         </span>
                       </div>
                       <div className="flex justify-between text-xs">
-                        <span className="text-slate-500">
+                        <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
                           {isZh ? '每周总限额' : 'Weekly cap'}
                         </span>
-                        <span className="font-mono font-semibold text-slate-900">
+                        <span className="font-mono font-semibold">
                           {activeSample.parsed.weeklyLimit}
                         </span>
                       </div>
                       <div className="flex justify-between text-xs">
-                        <span className="text-slate-500">
+                        <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
                           {isZh ? '下次重置计时' : 'Next reset'}
                         </span>
-                        <span className="font-mono font-semibold text-slate-900">
+                        <span className="font-mono font-semibold">
                           {activeSample.parsed.resetTimer}
                         </span>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <div
+                      className={`flex items-center gap-2 text-xs ${
+                        simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
+                      }`}
+                    >
                       <Layers className="w-3.5 h-3.5 shrink-0" />
                       <span>
                         {isZh
-                          ? '提示：按住深色悬浮窗可任意拖动，轻点可切换中英文'
-                          : 'Tip: Drag the dark HUD badge or tap once to switch ZH/EN'}
+                          ? '单行半透明胶囊悬浮窗：支持拖拽、单击切换 ZH/EN、自动随系统深浅色变色'
+                          : 'Single-line translucent pill HUD: draggable, tap to toggle ZH/EN, adaptive Light/Dark'}
                       </span>
                     </div>
                   </div>
 
-                  {/* Injected Xposed Floating TextView Overlay */}
+                  {/* Refactored Compact Single-Line Horizontal Adaptive HUD Pill */}
                   <button
                     type="button"
                     onPointerDown={onHudPointerDown}
@@ -659,27 +709,45 @@ git push -u origin main`}
                     style={{
                       transform: `translate(${hudOffset.x}px, ${hudOffset.y}px)`,
                     }}
-                    className="absolute top-16 right-4 text-left px-3.5 py-2.5 rounded-xl bg-neutral-900/90 text-white border border-white/25 shadow-md text-[11px] font-mono leading-relaxed cursor-grab active:cursor-grabbing touch-none"
+                    className={`absolute top-12 right-3 max-w-[92%] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full backdrop-blur-md border shadow-md text-[11.5px] font-mono whitespace-nowrap overflow-hidden cursor-grab active:cursor-grabbing touch-none transition-colors ${
+                      simDarkTheme
+                        ? 'bg-zinc-900/85 border-white/25 text-slate-50'
+                        : 'bg-white/90 border-slate-900/15 text-slate-900'
+                    }`}
                   >
-                    {hudLang === 'zh' ? (
-                      <>
-                        <div className="font-semibold text-amber-200">
-                          用量监控 [{activeSample.parsed.source} | 点按切EN]
-                        </div>
-                        <div>5小时额度: {activeSample.parsed.fiveHourQuota}</div>
-                        <div>每周限额: {activeSample.parsed.weeklyLimit}</div>
-                        <div>重置时间: {activeSample.parsed.resetTimer}</div>
-                      </>
-                    ) : (
-                      <>
-                        <div className="font-semibold text-sky-200">
-                          Usage Limits [{activeSample.parsed.source} | Tap-&gt;中文]
-                        </div>
-                        <div>5h Quota: {activeSample.parsed.fiveHourQuota}</div>
-                        <div>Weekly Limit: {activeSample.parsed.weeklyLimit}</div>
-                        <div>Reset Timer: {activeSample.parsed.resetTimer}</div>
-                      </>
-                    )}
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        simDarkTheme ? 'bg-emerald-400' : 'bg-emerald-600'
+                      }`}
+                    />
+                    <span className="truncate">
+                      <span className={simDarkTheme ? 'text-slate-400' : 'text-slate-600'}>
+                        5h{' '}
+                      </span>
+                      <span className="font-bold">{activeSample.parsed.fiveHourQuota}</span>
+                      <span className={simDarkTheme ? 'text-slate-400' : 'text-slate-600'}>
+                        {' · '}
+                        {hudLang === 'zh' ? '周 ' : 'Wk '}
+                      </span>
+                      <span className="font-bold">{activeSample.parsed.weeklyLimit}</span>
+                      <span className={simDarkTheme ? 'text-slate-400' : 'text-slate-600'}>
+                        {' · '}
+                        {hudLang === 'zh' ? '重置 ' : 'Rst '}
+                      </span>
+                      <span className="font-bold">{activeSample.parsed.resetTimer}</span>
+                    </span>
+                    <span
+                      className={`w-px h-3 mx-0.5 shrink-0 ${
+                        simDarkTheme ? 'bg-white/20' : 'bg-slate-900/15'
+                      }`}
+                    />
+                    <span
+                      className={`text-[10.5px] font-sans font-bold shrink-0 ${
+                        simDarkTheme ? 'text-sky-400' : 'text-sky-600'
+                      }`}
+                    >
+                      {hudLang === 'zh' ? 'ZH' : 'EN'}
+                    </span>
                   </button>
                 </div>
               </div>

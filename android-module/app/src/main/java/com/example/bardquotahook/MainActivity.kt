@@ -72,7 +72,7 @@ class MainActivity : Activity() {
         }
 
         val titleView = TextView(this).apply {
-            text = "Gemini-Eye 用量监控 (v1.5.0)"
+            text = "Gemini-Eye 用量监控 (v1.6.0)"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
             typeface = Typeface.DEFAULT_BOLD
@@ -87,12 +87,12 @@ class MainActivity : Activity() {
 
         val guideCard = TextView(this).apply {
             text = """
-                多进程增强版 (v1.5.0) 配置说明：
+                防崩增强版 (v1.6.0 · Xposed API 102) 配置说明：
                 
                 1. 在 LSPosed 作用域页面点击右上角「⋮」->「隐藏」-> 取消勾选「系统应用」。
                 2. 同时勾选「Gemini」与「Google (com.google.android.googlequicksearchbox)」。
                 3. 在系统设置中「强行停止」Google 应用，再点击下方按钮启动 Gemini。
-                4. 进入 Gemini 内的额度/订阅/限制页面后，后台进程与 UI 进程会自动跨进程同步用量数据到右上角悬浮窗。
+                4. 顶部单行半透明胶囊悬浮窗自动适配深色/浅色主题：点按切换中英 (ZH/EN)，拖动调整位置，长按折叠。
             """.trimIndent()
             setTextColor(Color.parseColor("#E2E8F0"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)

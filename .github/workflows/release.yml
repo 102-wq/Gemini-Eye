@@ -44,7 +44,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.5.${{ github.run_number }}
-          name: Gemini-Eye v1.5.${{ github.run_number }}
-          body: "**v1.5 Multi-Process & Android 11+ Visibility Update**: Fixed Android 11+ `<queries>` package visibility false-positive in HUD launcher, added cross-process `BroadcastReceiver` IPC for `:interactor`/`:search` background processes, and added R8-immune ART `StringFactory` + Compose `BoringLayout` + Cronet `ByteBuffer` quota extractors."
+          tag_name: v1.6.${{ github.run_number }}
+          name: Gemini-Eye v1.6.${{ github.run_number }}
+          body: "**v1.6 Crash-Safe & Adaptive Single-Line HUD Update**: Wrapped all reflection/hooks in `try-catch (Throwable)` with re-entrancy guards, added non-destructive OkHttp (`peekBody`)/Retrofit/Okio/Cronet/JSON network response fallbacks, upgraded Xposed API 102 (`io.github.libxposed:api:102.0.0`), and refactored the HUD into a compact single-line horizontal Light/Dark adaptive translucent pill."
           files: Gemini-Eye.apk
