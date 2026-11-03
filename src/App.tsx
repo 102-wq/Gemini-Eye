@@ -1,15 +1,30 @@
-import React, { useMemo, useRef, useState } from 'react';
-import { Check, Copy, Download, FileCode, FolderGit2, Layers, Search, Smartphone } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Check,
+  Copy,
+  Download,
+  ExternalLink,
+  FileCode,
+  FolderGit2,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Smartphone,
+} from 'lucide-react';
 import { PROJECT_FILES } from './moduleFiles';
 import { buildZipBlob } from './zipBuilder';
 
 type UiLang = 'zh' | 'en';
-type ActiveView = 'fix' | 'files' | 'simulator';
+type HudTheme = 'MIUIX' | 'MD3';
+type ActiveView = 'simulator' | 'files' | 'spec';
 
 interface HudSnapshot {
+  fiveHourPct: number;
   fiveHourQuota: string;
+  fiveHourReset: string;
+  weeklyPct: number;
   weeklyLimit: string;
-  resetTimer: string;
+  weeklyReset: string;
   source: string;
 }
 
@@ -22,42 +37,51 @@ const SAMPLE_PAYLOADS: Array<{
   parsed: HudSnapshot;
 }> = [
   {
-    id: 'usage-web',
-    labelZh: 'gemini.google.com/usage 实时百分比提取 (UsageWeb)',
-    labelEn: 'gemini.google.com/usage Live % Sync (UsageWeb)',
+    id: 'reference-spec',
+    labelZh: '基准胶囊规范示例 · 15% (1h52m) / 29% (23h52m)',
+    labelEn: 'Reference Capsule Spec · 15% (1h52m) / 29% (23h52m)',
     source: 'UsageWeb',
-    raw: 'Usage limits\nCurrent usage\n18% used\nResets in 3 hr 42 min\nWeekly limit\n7% used\nResets Sun 12:00 PM',
+    raw: 'Usage limits\n5-hour window\n15% used · Resets in 1 hr 52 min\nWeekly limit\n29% used · Resets in 23 hr 52 min',
     parsed: {
-      fiveHourQuota: '18%',
-      weeklyLimit: '7%',
-      resetTimer: '3h42m',
+      fiveHourPct: 15,
+      fiveHourQuota: '15%',
+      fiveHourReset: '1h52m',
+      weeklyPct: 29,
+      weeklyLimit: '29%',
+      weeklyReset: '23h52m',
       source: 'UsageWeb',
     },
   },
   {
-    id: 'compose',
-    labelZh: 'Compose 用量设置页渲染嗅探 (BoringLayout / StaticLayout)',
-    labelEn: 'Compose Usage Settings Sniff (BoringLayout / StaticLayout)',
+    id: 'compose-cn',
+    labelZh: '中文用量页嗅探 · 42% (3h18m) / 64% (4d12h)',
+    labelEn: 'CN Usage Sniff · 42% (3h18m) / 64% (4d12h)',
     source: 'Compose',
-    raw: '用量与限额\n当前用量\n已使用 24%\n4 小时 15 分钟后重置\n每周限额\n已使用 11%',
+    raw: '用量与限额\n当前 5 小时窗口\n已使用 42%\n3 小时 18 分钟后重置\n每周限额\n已使用 64%\n4 天 12 小时后重置',
     parsed: {
-      fiveHourQuota: '24%',
-      weeklyLimit: '11%',
-      resetTimer: '4h15m',
+      fiveHourPct: 42,
+      fiveHourQuota: '42%',
+      fiveHourReset: '3h18m',
+      weeklyPct: 64,
+      weeklyLimit: '64%',
+      weeklyReset: '4d12h',
       source: 'Compose',
     },
   },
   {
-    id: 'json',
-    labelZh: 'RPC / JSON 解码流提取 (CharsetDecoder / JSONObject)',
-    labelEn: 'RPC / JSON Stream Decode (CharsetDecoder / JSONObject)',
-    source: 'Decoder',
-    raw: ')]}\'\n[["wrb.fr","robin", "{\\"five_hour_quota\\":\\"32/50\\",\\"weekly_limit\\":\\"140/350\\",\\"reset_in\\":\\"01:42:00\\"}"]]',
+    id: 'high-load',
+    labelZh: '高负载预警阈值测试 · 84% (28m) / 92% (11h05m)',
+    labelEn: 'High-Usage Threshold · 84% (28m) / 92% (11h05m)',
+    source: 'SharedPrefs',
+    raw: '{"five_hour_quota":"84%","five_reset":"28m","weekly_limit":"92%","weekly_reset":"11h05m"}',
     parsed: {
-      fiveHourQuota: '32/50',
-      weeklyLimit: '140/350',
-      resetTimer: '01:42:00',
-      source: 'Decoder',
+      fiveHourPct: 84,
+      fiveHourQuota: '84%',
+      fiveHourReset: '28m',
+      weeklyPct: 92,
+      weeklyLimit: '92%',
+      weeklyReset: '11h05m',
+      source: 'SharedPrefs',
     },
   },
 ];
@@ -65,17 +89,29 @@ const SAMPLE_PAYLOADS: Array<{
 export default function App() {
   const [uiLang, setUiLang] = useState<UiLang>('zh');
   const [hudLang, setHudLang] = useState<UiLang>('zh');
-  const [activeView, setActiveView] = useState<ActiveView>('fix');
+  const [hudTheme, setHudTheme] = useState<HudTheme>('MIUIX');
+  const [activeView, setActiveView] = useState<ActiveView>('simulator');
   const [selectedPath, setSelectedPath] = useState<string>(
-    'app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt'
+    'app/src/main/java/com/example/bardquotahook/QuotaHudView.kt'
   );
   const [fileQuery, setFileQuery] = useState('');
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const [zipDownloaded, setZipDownloaded] = useState(false);
 
-  const [selectedSampleId, setSelectedSampleId] = useState<string>('usage-web');
-  const [simDarkTheme, setSimDarkTheme] = useState<boolean>(true);
-  const hudBtnRef = useRef<HTMLButtonElement | null>(null);
+  const [selectedSampleId, setSelectedSampleId] = useState<string>('reference-spec');
+  const [simDarkTheme, setSimDarkTheme] = useState<boolean>(false);
+  const [xposedBound, setXposedBound] = useState<boolean>(true);
+  const [systemOverlayEnabled, setSystemOverlayEnabled] = useState<boolean>(false);
+  const [isRefreshingHud, setIsRefreshingHud] = useState<boolean>(false);
+  const [usageSheetOpen, setUsageSheetOpen] = useState<boolean>(false);
+  const [lastSyncNote, setLastSyncNote] = useState<string>('');
+
+  const hudCapsuleRef = useRef<HTMLDivElement | null>(null);
+  const bar5hRef = useRef<HTMLDivElement | null>(null);
+  const barWeeklyRef = useRef<HTMLDivElement | null>(null);
+  const settingsBar5hRef = useRef<HTMLDivElement | null>(null);
+  const settingsBarWeeklyRef = useRef<HTMLDivElement | null>(null);
+
   const hudPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const dragRef = useRef<{
     startX: number;
@@ -85,6 +121,8 @@ export default function App() {
     moved: boolean;
     pointerDown: boolean;
   }>({ startX: 0, startY: 0, origX: 0, origY: 0, moved: false, pointerDown: false });
+
+  const isZh = uiLang === 'zh';
 
   const filteredFiles = useMemo(() => {
     const q = fileQuery.trim().toLowerCase();
@@ -104,6 +142,23 @@ export default function App() {
     [selectedSampleId]
   );
 
+  // Enforce Single-HUD Exclusion when ModernQuotaModule (API 102) binds to Gemini
+  useEffect(() => {
+    if (xposedBound && systemOverlayEnabled) {
+      setSystemOverlayEnabled(false);
+    }
+  }, [xposedBound, systemOverlayEnabled]);
+
+  // Update mini progress bar fill widths via DOM refs (no inline style props)
+  useEffect(() => {
+    const w5 = `${Math.max(8, Math.min(100, activeSample.parsed.fiveHourPct))}%`;
+    const wWk = `${Math.max(8, Math.min(100, activeSample.parsed.weeklyPct))}%`;
+    if (bar5hRef.current) bar5hRef.current.style.width = w5;
+    if (barWeeklyRef.current) barWeeklyRef.current.style.width = wWk;
+    if (settingsBar5hRef.current) settingsBar5hRef.current.style.width = w5;
+    if (settingsBarWeeklyRef.current) settingsBarWeeklyRef.current.style.width = wWk;
+  }, [activeSample, activeView, xposedBound, systemOverlayEnabled]);
+
   const handleDownloadZip = () => {
     const blob = buildZipBlob(
       PROJECT_FILES.map((f) => ({
@@ -114,7 +169,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'Gemini-Eye-v1.8.0-Android-Project.zip';
+    link.download = 'Gemini-Eye-v1.9.0-Android-Project.zip';
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -129,7 +184,30 @@ export default function App() {
     setTimeout(() => setCopiedPath(null), 1800);
   };
 
-  const onHudPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+  const triggerSimulatedRefresh = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isRefreshingHud) return;
+    setIsRefreshingHud(true);
+    setLastSyncNote(
+      isZh
+        ? '已发送 ACTION_REQUEST_QUOTA_REFRESH -> 后台同步 gemini.google.com/usage 并写入 SharedPreferences'
+        : 'Dispatched ACTION_REQUEST_QUOTA_REFRESH -> synced gemini.google.com/usage to SharedPreferences'
+    );
+    setTimeout(() => {
+      setIsRefreshingHud(false);
+    }, 650);
+  };
+
+  const triggerOpenUsageWebpage = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setUsageSheetOpen(true);
+  };
+
+  const onHudPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    if (target.closest('[data-hud-action="true"]')) {
+      return;
+    }
     e.currentTarget.setPointerCapture(e.pointerId);
     dragRef.current = {
       startX: e.clientX,
@@ -141,33 +219,74 @@ export default function App() {
     };
   };
 
-  const onHudPointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+  const onHudPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragRef.current.pointerDown) return;
     const dx = e.clientX - dragRef.current.startX;
     const dy = e.clientY - dragRef.current.startY;
-    if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
       dragRef.current.moved = true;
     }
     if (dragRef.current.moved) {
-      const nextX = Math.max(-150, Math.min(20, dragRef.current.origX + dx));
-      const nextY = Math.max(-40, Math.min(240, dragRef.current.origY + dy));
+      const nextX = Math.max(-48, Math.min(24, dragRef.current.origX + dx));
+      const nextY = Math.max(-24, Math.min(240, dragRef.current.origY + dy));
       hudPosRef.current = { x: nextX, y: nextY };
-      if (hudBtnRef.current) {
-        hudBtnRef.current.style.translate = `${nextX}px ${nextY}px`;
+      if (hudCapsuleRef.current) {
+        hudCapsuleRef.current.style.translate = `${nextX}px ${nextY}px`;
       }
     }
   };
 
   const onHudPointerUp = () => {
-    if (!dragRef.current.pointerDown) return;
-    const wasMoved = dragRef.current.moved;
     dragRef.current.pointerDown = false;
-    if (!wasMoved) {
-      setHudLang((prev) => (prev === 'zh' ? 'en' : 'zh'));
-    }
   };
 
-  const isZh = uiLang === 'zh';
+  const pickBarColorClass = (pct: number) => {
+    if (pct >= 90) return simDarkTheme ? 'bg-red-400' : 'bg-red-500';
+    if (pct >= 75) return simDarkTheme ? 'bg-amber-400' : 'bg-amber-500';
+    if (hudTheme === 'MD3') {
+      return simDarkTheme ? 'bg-violet-300' : 'bg-violet-600';
+    }
+    return simDarkTheme ? 'bg-sky-400' : 'bg-blue-500';
+  };
+
+  const capsuleContainerClass = useMemo(() => {
+    if (hudTheme === 'MIUIX') {
+      return simDarkTheme
+        ? 'bg-zinc-900/80 backdrop-blur-xl border-white/20 text-slate-50 shadow-lg shadow-black/40'
+        : 'bg-white/85 backdrop-blur-xl border-slate-900/12 text-slate-900 shadow-lg shadow-slate-900/12';
+    }
+    // MD3 Material You Dynamic Tonal Surface
+    return simDarkTheme
+      ? 'bg-[#292533]/95 border-[#938F99]/40 text-[#E6E1E5] shadow-md shadow-black/40'
+      : 'bg-[#F5EFFB]/95 border-[#CAC4D0]/70 text-[#1D1B20] shadow-md shadow-indigo-950/10';
+  }, [hudTheme, simDarkTheme]);
+
+  const capsuleLabelClass = useMemo(() => {
+    if (hudTheme === 'MIUIX') {
+      return simDarkTheme ? 'text-slate-400' : 'text-slate-500';
+    }
+    return simDarkTheme ? 'text-[#CAC4D0]' : 'text-[#49454F]';
+  }, [hudTheme, simDarkTheme]);
+
+  const capsuleTrackClass = useMemo(() => {
+    if (hudTheme === 'MIUIX') {
+      return simDarkTheme ? 'bg-white/20' : 'bg-slate-900/15';
+    }
+    return simDarkTheme ? 'bg-[#4A4458]' : 'bg-[#E8DEF8]';
+  }, [hudTheme, simDarkTheme]);
+
+  const capsuleIconClass = useMemo(() => {
+    if (hudTheme === 'MIUIX') {
+      return simDarkTheme
+        ? 'text-slate-300 hover:bg-white/15 active:bg-white/25'
+        : 'text-slate-600 hover:bg-slate-900/10 active:bg-slate-900/15';
+    }
+    return simDarkTheme
+      ? 'text-violet-300 hover:bg-violet-300/15 active:bg-violet-300/25'
+      : 'text-violet-700 hover:bg-violet-700/10 active:bg-violet-700/20';
+  }, [hudTheme, simDarkTheme]);
+
+  const showAnyHudInSim = xposedBound || systemOverlayEnabled;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col lg:flex-row">
@@ -178,25 +297,25 @@ export default function App() {
             Gemini-Eye
           </div>
           <div className="mt-1 text-xs text-slate-500">
-            <span>LibXposed API 102 + API 82</span>
+            <span>QuotaHudView · API 102 + 82</span>
             <span aria-hidden="true"> · </span>
-            <span>v1.8.0</span>
+            <span>v1.9.0</span>
           </div>
         </div>
 
         <nav className="p-3 space-y-1 border-b border-slate-200">
           <button
             type="button"
-            onClick={() => setActiveView('fix')}
+            onClick={() => setActiveView('simulator')}
             className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
-              activeView === 'fix'
+              activeView === 'simulator'
                 ? 'bg-slate-900 text-white'
                 : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
             }`}
           >
-            <FolderGit2 className="w-4 h-4 shrink-0" />
+            <Smartphone className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? 'v1.8.0 根因诊断与升级方案' : 'v1.8.0 Root Cause & Fix'}
+              {isZh ? '单行胶囊交互预览 (MIUIX/MD3)' : 'Capsule HUD Simulator'}
             </span>
           </button>
 
@@ -219,23 +338,23 @@ export default function App() {
 
           <button
             type="button"
-            onClick={() => setActiveView('simulator')}
+            onClick={() => setActiveView('spec')}
             className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
-              activeView === 'simulator'
+              activeView === 'spec'
                 ? 'bg-slate-900 text-white'
                 : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
             }`}
           >
-            <Smartphone className="w-4 h-4 shrink-0" />
+            <FolderGit2 className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? '双语悬浮胶囊交互预览' : 'Bilingual HUD Simulator'}
+              {isZh ? 'v1.9.0 重构架构说明' : 'v1.9.0 Refactor Architecture'}
             </span>
           </button>
         </nav>
 
         <div className="p-3 flex-1 overflow-y-auto hidden lg:block">
           <div className="px-2 pb-2 text-xs font-medium text-slate-500">
-            {isZh ? '工程文件目录' : 'Project File Tree'}
+            {isZh ? '核心文件直达' : 'Project File Tree'}
           </div>
           <div className="space-y-0.5">
             {PROJECT_FILES.map((file) => {
@@ -265,22 +384,22 @@ export default function App() {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
-        <header className="flex items-center justify-between gap-8 px-6 py-3.5 bg-white border-b border-slate-200">
+        <header className="flex items-center justify-between gap-6 px-6 py-3.5 bg-white border-b border-slate-200">
           <div className="flex items-center gap-2 text-sm text-slate-600 min-w-0">
             <span className="font-semibold text-slate-900 whitespace-nowrap">
-              {isZh ? 'Gemini 用量监控模块' : 'Gemini Quota Module'}
+              {isZh ? 'Gemini 单行胶囊监控模块' : 'Gemini Capsule HUD Module'}
             </span>
             <span aria-hidden="true">/</span>
             <span className="truncate">
-              {activeView === 'fix'
+              {activeView === 'simulator'
                 ? isZh
-                  ? '修复不触发 Hook 与拿不到额度 (v1.8.0)'
-                  : 'Fixing Hook & Quota Acquisition (v1.8.0)'
+                  ? 'QuotaHudView 单行胶囊 · 双语 i18n · 单 HUD 互斥 · MIUIX vs MD3'
+                  : 'QuotaHudView Single-Row Pill · i18n · Single-HUD Exclusion · MIUIX vs MD3'
                 : activeView === 'files'
                 ? currentFile.path
                 : isZh
-                ? '单行自适应胶囊与解析器预览'
-                : 'Single-Line HUD & Parser Simulator'}
+                ? 'v1.9.0 架构规范与同步机制'
+                : 'v1.9.0 Architecture & Sync Spec'}
             </span>
           </div>
 
@@ -293,23 +412,50 @@ export default function App() {
             <span>
               {zipDownloaded
                 ? isZh
-                  ? '已导出 v1.8.0 工程 .zip'
-                  : 'v1.8.0 .zip Downloaded'
+                  ? '已导出 v1.9.0 工程 .zip'
+                  : 'v1.9.0 .zip Downloaded'
                 : isZh
-                ? '下载 v1.8.0 Android 工程 (.zip)'
-                : 'Download v1.8.0 Project (.zip)'}
+                ? '导出 v1.9.0 Android 工程 (.zip)'
+                : 'Export v1.9.0 Project (.zip)'}
             </span>
           </button>
         </header>
 
         {/* Workspace Toolbar */}
-        <div className="px-6 py-3 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-2 text-xs text-slate-600">
-            <span>META-INF/xposed (API 102)</span>
+        <div className="px-6 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaHudView.kt');
+                setActiveView('files');
+              }}
+              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
+            >
+              QuotaHudView.kt
+            </button>
             <span aria-hidden="true">·</span>
-            <span>assets/xposed_init (API 82)</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt');
+                setActiveView('files');
+              }}
+              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
+            >
+              ModernQuotaModule.kt
+            </button>
             <span aria-hidden="true">·</span>
-            <span>gemini.google.com/usage Live Sync</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/MainActivity.kt');
+                setActiveView('files');
+              }}
+              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
+            >
+              MainActivity.kt
+            </button>
           </div>
 
           <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
@@ -322,7 +468,7 @@ export default function App() {
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              简体中文 (默认)
+              中文工作台
             </button>
             <button
               type="button"
@@ -338,110 +484,416 @@ export default function App() {
           </div>
         </div>
 
-        {/* View Content */}
+        {/* Main Workspace Body */}
         <main className="p-6 max-w-6xl w-full mx-auto flex-1">
-          {activeView === 'fix' && (
-            <div className="space-y-8">
-              <div>
-                <h1 className="text-2xl font-bold tracking-tight text-slate-900 text-balance">
-                  {isZh
-                    ? 'v1.8.0 彻底解决「仍不触发 Hook」与「拿不到真实额度」三大根因'
-                    : 'v1.8.0: Resolving Both “Still Doesn’t Hook” and “Can’t Get Quota”'}
-                </h1>
-                <p className="mt-2 text-sm text-slate-600 max-w-3xl leading-relaxed">
-                  {isZh
-                    ? '通过对 v1.7.12 已发布 APK 反编译核查与 LibXposed API 102 源码对齐，定位到现代框架入口缺失、Magisk 排除列表卸载以及聊天二进制流不含百分比三大核心原因，并在 v1.8.0 中一次性全部补齐。'
-                    : 'Inspecting the compiled v1.7.12 APK against io.github.libxposed:api:102.0.0 revealed three exact root causes across modern Xposed loaders, Magisk DenyList behavior, and Gemini’s usage endpoint.'}
-                </p>
+          {activeView === 'simulator' && (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+              {/* Left Column: Controls & SharedPreferences Sync State */}
+              <div className="lg:col-span-6 space-y-5">
+                <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+                  <div className="text-sm font-semibold text-slate-900">
+                    {isZh
+                      ? '1. 双语标签 (i18n) 与双主题引擎 (MIUIX vs MD3)'
+                      : '1. Dual Language (i18n) & Theme Engine (MIUIX vs MD3)'}
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <div className="text-xs text-slate-500 mb-1.5">
+                        {isZh ? 'HUD 语言切换 (i18n)' : 'HUD Language (i18n)'}
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-lg">
+                        <button
+                          type="button"
+                          onClick={() => setHudLang('zh')}
+                          className={`py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                            hudLang === 'zh'
+                              ? 'bg-slate-900 text-white'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          5h / 每周 (CN)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setHudLang('en')}
+                          className={`py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                            hudLang === 'en'
+                              ? 'bg-slate-900 text-white'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          5h / Weekly (EN)
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="text-xs text-slate-500 mb-1.5">
+                        {isZh ? '胶囊视觉引擎' : 'Capsule Theme Engine'}
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-lg">
+                        <button
+                          type="button"
+                          onClick={() => setHudTheme('MIUIX')}
+                          className={`py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                            hudTheme === 'MIUIX'
+                              ? 'bg-sky-600 text-white'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          MIUIX 毛玻璃
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setHudTheme('MD3')}
+                          className={`py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                            hudTheme === 'MD3'
+                              ? 'bg-violet-600 text-white'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          MD3 动态取色
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Single-HUD Exclusion Control */}
+                <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-slate-900">
+                      {isZh
+                        ? '2. 单 HUD 互斥机制 (ModernQuotaModule API 102)'
+                        : '2. Single-HUD Exclusion (ModernQuotaModule API 102)'}
+                    </div>
+                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                  </div>
+
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    {isZh
+                      ? '当 ModernQuotaModule (Xposed API 102) 成功绑定 Gemini 并发送心跳时，自动关闭并锁定 App 系统全局悬浮窗，确保仅渲染唯一的 Gemini 应用内单行胶囊。'
+                      : 'When ModernQuotaModule (Xposed API 102) binds to Gemini, OverlayHudController automatically disables the App System Overlay so only one in-app HUD renders.'}
+                  </p>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setXposedBound((v) => !v)}
+                      className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors text-left cursor-pointer ${
+                        xposedBound
+                          ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                          : 'bg-slate-50 border-slate-200 text-slate-700'
+                      }`}
+                    >
+                      <div className="font-semibold">
+                        {xposedBound
+                          ? isZh
+                            ? 'ModernQuotaModule: 已绑定'
+                            : 'ModernQuotaModule: Bound'
+                          : isZh
+                          ? 'ModernQuotaModule: 未绑定'
+                          : 'ModernQuotaModule: Unbound'}
+                      </div>
+                      <div className="text-[11px] opacity-80 mt-0.5">
+                        {xposedBound
+                          ? isZh
+                            ? '应用内单胶囊已接管'
+                            : 'In-app single HUD active'
+                          : isZh
+                          ? '点击模拟 Xposed 注入绑定'
+                          : 'Click to simulate Xposed bind'}
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={xposedBound}
+                      onClick={() => setSystemOverlayEnabled((v) => !v)}
+                      className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors text-left ${
+                        xposedBound
+                          ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
+                          : systemOverlayEnabled
+                          ? 'bg-blue-50 border-blue-300 text-blue-900 cursor-pointer'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 cursor-pointer'
+                      }`}
+                    >
+                      <div className="font-semibold">
+                        {xposedBound
+                          ? isZh
+                            ? '系统悬浮窗：已自动互斥关闭'
+                            : 'System Overlay: Auto-Disabled'
+                          : systemOverlayEnabled
+                          ? isZh
+                            ? '系统悬浮窗：开启中'
+                            : 'System Overlay: Enabled'
+                          : isZh
+                          ? '系统悬浮窗：已关闭'
+                          : 'System Overlay: Off'}
+                      </div>
+                      <div className="text-[11px] opacity-80 mt-0.5">
+                        {xposedBound
+                          ? isZh
+                            ? '防止重影双胶囊'
+                            : 'Prevents duplicate HUDs'
+                          : isZh
+                          ? '仅在未 Hook 时允许开启'
+                          : 'Fallback when unhooked'}
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                {/* SharedPreferences Sample Selector */}
+                <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+                  <div className="text-sm font-semibold text-slate-900">
+                    {isZh
+                      ? '3. 实时同步数据源 (SharedPreferences: gemini_eye_state)'
+                      : '3. SharedPreferences Real-Time Sync Data'}
+                  </div>
+
+                  <div className="space-y-2">
+                    {SAMPLE_PAYLOADS.map((sample) => {
+                      const selected = sample.id === activeSample.id;
+                      return (
+                        <button
+                          key={sample.id}
+                          type="button"
+                          onClick={() => setSelectedSampleId(sample.id)}
+                          className={`w-full text-left p-3 rounded-lg border transition-colors cursor-pointer ${
+                            selected
+                              ? 'bg-slate-900 text-white border-slate-900'
+                              : 'bg-slate-50 text-slate-800 border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2 text-xs font-medium">
+                            <span>{isZh ? sample.labelZh : sample.labelEn}</span>
+                            <span className="font-mono opacity-75">{sample.source}</span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Identical Settings App Mirror */}
+                  <div className="pt-2 border-t border-slate-100">
+                    <div className="text-[11px] text-slate-500 mb-2">
+                      {isZh
+                        ? 'MainActivity 设置页共享数值镜像 (与 Gemini 内置 HUD 100% 实时一致)：'
+                        : 'MainActivity Settings Mirror (Identical SharedPreferences values):'}
+                    </div>
+                    <div className="px-3 py-2 rounded-lg bg-slate-900 text-slate-100 font-mono text-xs flex flex-wrap items-center justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="text-slate-400">5h</span>
+                        <span className="w-6 h-1.5 rounded-full bg-white/20 overflow-hidden inline-block">
+                          <span ref={settingsBar5hRef} className="block h-full rounded-full bg-sky-400" />
+                        </span>
+                        <span>
+                          {activeSample.parsed.fiveHourQuota} ({activeSample.parsed.fiveHourReset})
+                        </span>
+                      </span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="text-slate-400">{hudLang === 'zh' ? '每周' : 'Weekly'}</span>
+                        <span className="w-6 h-1.5 rounded-full bg-white/20 overflow-hidden inline-block">
+                          <span ref={settingsBarWeeklyRef} className="block h-full rounded-full bg-sky-400" />
+                        </span>
+                        <span>
+                          {activeSample.parsed.weeklyLimit} ({activeSample.parsed.weeklyReset})
+                        </span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
               </div>
 
-              <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200">
-                <div className="p-5">
-                  <div className="text-sm font-semibold text-slate-900">
-                    {isZh
-                      ? '01. 为什么在 API 102 框架 (Vector / 新版 LSPosed) 上不触发 Hook？'
-                      : '01. Why API 102 Frameworks (Vector / Modern LSPosed) Ignored v1.7.12'}
-                  </div>
-                  <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
-                    {isZh
-                      ? 'v1.7.12 虽然在 Gradle 添加了 io.github.libxposed:api:102.0.0 依赖，但 APK 内仅有旧版 assets/xposed_init，缺少现代 API 102 强制要求的 META-INF/xposed/module.prop (minApiVersion=101, targetApiVersion=102)、java_init.list、scope.list 以及继承 XposedModule 的入口类。v1.8.0 新增 ModernQuotaModule.kt + QuotaCoreEngine.kt 双引擎架构，新旧框架通吃且互不冲突。'
-                      : 'v1.7.12 only bundled legacy assets/xposed_init and lacked META-INF/xposed/{module.prop,java_init.list,scope.list} and an io.github.libxposed.api.XposedModule entry class. v1.8.0 implements ModernQuotaModule.kt + QuotaHookEntry.kt sharing QuotaCoreEngine.kt.'}
-                  </p>
-                </div>
-
-                <div className="p-5">
-                  <div className="text-sm font-semibold text-slate-900">
-                    {isZh
-                      ? '02. Magisk 排除列表 (DenyList) / Shamiko 隐藏导致 Google 进程被剥离模块'
-                      : '02. Magisk DenyList / Shamiko Unmounting Xposed Inside Google App'}
-                  </div>
-                  <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
-                    {isZh
-                      ? '很多 Root 设备为了过 Play Integrity 会在 Magisk 排除列表或 Shamiko 中勾选 Google (com.google.android.googlequicksearchbox) 或 Gemini，这会导致 Zygisk 在启动该进程时直接卸载所有 Xposed 模块！v1.8.0 在 MainActivity 新增实时 Hook 心跳回执检测 (Ping)，并内置「免 Hook 全局悬浮胶囊 (SYSTEM_ALERT_WINDOW)」，即便不移出排除列表也能照常在屏幕右上角显示同款自适应悬浮窗。'
-                      : 'If Google App or Gemini is checked in Magisk DenyList / Shamiko, Zygisk unmounts all Xposed modules in that process. v1.8.0 adds live Hook Heartbeat Ping diagnostics in MainActivity plus a one-tap SYSTEM_ALERT_WINDOW floating capsule fallback.'}
-                  </p>
-                </div>
-
-                <div className="p-5">
-                  <div className="text-sm font-semibold text-slate-900">
-                    {isZh
-                      ? '03. 为什么普通聊天拿不到额度？内置 gemini.google.com/usage 实时提取与跨进程推送'
-                      : '03. Why Chat Traffic Lacks Quota & Built-in gemini.google.com/usage Live Sync'}
-                  </div>
-                  <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
-                    {isZh
-                      ? 'Gemini 聊天流走原生 Cronet 二进制 Protobuf 且不返回百分比，同时 Android ART 会将 String 构造器内联替换为 StringFactory 导致传统 String Hook 失效。真实 5 小时百分比 (如 "18% used") 与周限额位于 gemini.google.com/usage。v1.8.0 重构了 QuotaTextParser 精准识别双分区 "% used / 已使用 %"，并在 Gemini-Eye 应用内嵌入支持持久化 Cookie 的 gemini.google.com/usage 同步器，登录一次即可实时抓取并通过广播直接刷新 Gemini 悬浮胶囊！'
-                      : 'Gemini chat uses binary Protobuf without usage percentages, and ART intrinsifies String constructors. Real 5-hour & weekly "% used" meters live at gemini.google.com/usage. v1.8.0 upgrades QuotaTextParser for "% used" meters and embeds a persistent-cookie gemini.google.com/usage live WebView sync that broadcasts directly into the Gemini HUD.'}
-                  </p>
-                </div>
-              </div>
-
-              {/* Action Plan */}
-              <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-4">
-                  <div>
-                    <h2 className="text-base font-semibold text-slate-900">
-                      {isZh
-                        ? '同步 v1.8.0 到你的 GitHub 仓库 (102-wq/Gemini-Eye)'
-                        : 'Deploy v1.8.0 to Your GitHub Repository (102-wq/Gemini-Eye)'}
-                    </h2>
-                    <p className="mt-1 text-xs text-slate-500">
-                      {isZh
-                        ? '保持相同固定签名密钥 (signing.p12)，可直接覆盖安装升级，无需卸载旧版'
-                        : 'Uses the exact same persistent signing.p12 key so you can upgrade in-place'}
-                    </p>
-                  </div>
-
+              {/* Right Column: Simulated Gemini Host Screen with Exact Single-Line Capsule */}
+              <div className="lg:col-span-6 flex flex-col items-center gap-3">
+                <div className="w-full max-w-md flex items-center justify-between px-1">
+                  <span className="text-xs font-medium text-slate-600">
+                    {isZh ? 'Gemini 宿主深浅色自适应测试' : 'Gemini Host Light / Dark Mode'}
+                  </span>
                   <button
                     type="button"
-                    onClick={() => {
-                      setSelectedPath('app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt');
-                      setActiveView('files');
-                    }}
-                    className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    onClick={() => setSimDarkTheme((d) => !d)}
+                    className="px-3 py-1 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 transition-colors cursor-pointer"
                   >
-                    <FileCode className="w-4 h-4" />
-                    <span>{isZh ? '查看 v1.8.0 新增源码' : 'Inspect v1.8.0 Source'}</span>
+                    {simDarkTheme
+                      ? isZh
+                        ? '当前：深色宿主 (切换浅色)'
+                        : 'Host: Dark (Switch to Light)'
+                      : isZh
+                      ? '当前：浅色宿主 (切换深色)'
+                      : 'Host: Light (Switch to Dark)'}
                   </button>
                 </div>
 
-                <ol className="space-y-2.5 text-sm text-slate-700 list-decimal list-inside leading-relaxed">
-                  <li>
-                    {isZh
-                      ? '将当前工作区变更推送至 GitHub（或下载右上角 v1.8.0 .zip 解压覆盖 android-module/），等待 GitHub Actions 自动生成 Gemini-Eye v1.8.x Release APK。'
-                      : 'Push this workspace update to GitHub (or export the v1.8.0 .zip) and let GitHub Actions publish the signed Gemini-Eye v1.8.x APK.'}
-                  </li>
-                  <li>
-                    {isZh
-                      ? '安装 APK 后打开「Gemini 用量监控 Hook」桌面图标：查看顶部「Xposed 已连接」回执；若使用 Shamiko / Magisk 排除列表，请将 Google 与 Gemini 移出排除列表，或直接点击「开启免 Hook 全局悬浮胶囊」。'
-                      : 'Open the Gemini-Eye app to verify the live Xposed Heartbeat indicator; if Google App is on Magisk DenyList, either remove it from DenyList or tap “Enable Hook-Free System Floating Capsule”.'}
-                  </li>
-                  <li>
-                    {isZh
-                      ? '点击应用内「展开内置网页登录并同步 gemini.google.com/usage」登录一次账号，即可提取实时 5h %、周限额 % 与重置倒计时并自动推送至 Gemini 右上角单行胶囊！'
-                      : 'Tap “Sync gemini.google.com/usage” inside Gemini-Eye once to sign in and stream real 5h %, weekly %, and reset timer directly to the HUD pill.'}
-                  </li>
-                </ol>
+                <div
+                  className={`w-full max-w-md border rounded-3xl overflow-hidden shadow-sm relative h-[520px] select-none flex flex-col transition-colors ${
+                    simDarkTheme
+                      ? 'bg-zinc-950 border-zinc-800 text-zinc-100'
+                      : 'bg-[#F8FAFC] border-slate-300 text-slate-900'
+                  }`}
+                >
+                  {/* Simulated Android Status Bar */}
+                  <div
+                    className={`px-6 py-2.5 flex items-center justify-between text-xs font-mono border-b ${
+                      simDarkTheme
+                        ? 'text-zinc-400 border-zinc-800/80 bg-zinc-950'
+                        : 'text-slate-500 border-slate-200/80 bg-white'
+                    }`}
+                  >
+                    <span>09:41</span>
+                    <span>
+                      {xposedBound ? 'Gemini · In-App Xposed HUD' : 'Gemini · Unhooked'}
+                    </span>
+                  </div>
+
+                  {/* Simulated Gemini Body */}
+                  <div className="p-6 pt-16 space-y-4 flex-1">
+                    <div>
+                      <div className="text-base font-bold">
+                        {isZh ? '你好，有什么可以帮你？' : 'Hello, how can I help today?'}
+                      </div>
+                      <div
+                        className={`mt-1 text-xs ${
+                          simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
+                        }`}
+                      >
+                        {isZh
+                          ? '可按住上方单行胶囊任意拖拽，或点击胶囊右侧「↻ 刷新」与「↗ 用量网页」图标按钮。'
+                          : 'Drag the single-line capsule above, or click its right-side Refresh (↻) and External Link (↗) buttons.'}
+                      </div>
+                    </div>
+
+                    {lastSyncNote && (
+                      <div
+                        className={`p-3 rounded-xl border text-xs leading-relaxed ${
+                          simDarkTheme
+                            ? 'bg-emerald-950/50 border-emerald-800/60 text-emerald-200'
+                            : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                        }`}
+                      >
+                        {lastSyncNote}
+                      </div>
+                    )}
+
+                    {usageSheetOpen && (
+                      <div
+                        className={`p-4 rounded-2xl border space-y-2.5 ${
+                          simDarkTheme
+                            ? 'bg-zinc-900 border-zinc-700 text-zinc-100'
+                            : 'bg-white border-slate-200 text-slate-900 shadow-xs'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-mono font-semibold text-blue-500">
+                            https://gemini.google.com/usage
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setUsageSheetOpen(false)}
+                            className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                          >
+                            {isZh ? '关闭' : 'Close'}
+                          </button>
+                        </div>
+                        <div className="text-xs space-y-1">
+                          <div>
+                            5-hour quota: <strong>{activeSample.parsed.fiveHourQuota}</strong> (resets in{' '}
+                            {activeSample.parsed.fiveHourReset})
+                          </div>
+                          <div>
+                            Weekly quota: <strong>{activeSample.parsed.weeklyLimit}</strong> (resets in{' '}
+                            {activeSample.parsed.weeklyReset})
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* EXACT SINGLE-LINE CAPSULE HUD (`QuotaHudView.kt` Spec) */}
+                  {showAnyHudInSim && (
+                    <div
+                      ref={hudCapsuleRef}
+                      onPointerDown={onHudPointerDown}
+                      onPointerMove={onHudPointerMove}
+                      onPointerUp={onHudPointerUp}
+                      className={`absolute top-12 right-2.5 max-w-[96%] inline-flex items-center px-2.5 py-1.5 rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none transition-colors ${capsuleContainerClass}`}
+                    >
+                      {/* Left Section: 5h + Mini Progress Bar + "15% (1h52m)" */}
+                      <span className={`font-semibold ${capsuleLabelClass}`}>5h</span>
+                      <span
+                        className={`w-6 h-[5px] mx-1.5 rounded-full overflow-hidden shrink-0 ${capsuleTrackClass}`}
+                      >
+                        <span
+                          ref={bar5hRef}
+                          className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
+                            activeSample.parsed.fiveHourPct
+                          )}`}
+                        />
+                      </span>
+                      <span className="font-medium tabular-nums">
+                        {activeSample.parsed.fiveHourQuota} ({activeSample.parsed.fiveHourReset})
+                      </span>
+
+                      {/* Subtle Divider 1 */}
+                      <span
+                        className={`w-px h-3 mx-2 shrink-0 ${
+                          simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
+                        }`}
+                      />
+
+                      {/* Middle Section: "每周" / "Weekly" + Mini Progress Bar + "29% (23h52m)" */}
+                      <span className={`font-semibold ${capsuleLabelClass}`}>
+                        {hudLang === 'zh' ? '每周' : 'Weekly'}
+                      </span>
+                      <span
+                        className={`w-6 h-[5px] mx-1.5 rounded-full overflow-hidden shrink-0 ${capsuleTrackClass}`}
+                      >
+                        <span
+                          ref={barWeeklyRef}
+                          className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
+                            activeSample.parsed.weeklyPct
+                          )}`}
+                        />
+                      </span>
+                      <span className="font-medium tabular-nums">
+                        {activeSample.parsed.weeklyLimit} ({activeSample.parsed.weeklyReset})
+                      </span>
+
+                      {/* Subtle Divider 2 */}
+                      <span
+                        className={`w-px h-3 ml-2 mr-1 shrink-0 ${
+                          simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
+                        }`}
+                      />
+
+                      {/* Right Section: Refresh Icon Button + External Link Icon Button */}
+                      <button
+                        type="button"
+                        data-hud-action="true"
+                        onClick={triggerSimulatedRefresh}
+                        title={isZh ? '触发后台 API 同步' : 'Trigger Background API Sync'}
+                        className={`w-5 h-5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
+                      >
+                        <RefreshCw
+                          className={`w-3 h-3 ${isRefreshingHud ? 'animate-spin' : ''}`}
+                        />
+                      </button>
+
+                      <button
+                        type="button"
+                        data-hud-action="true"
+                        onClick={triggerOpenUsageWebpage}
+                        title={isZh ? '打开用量网页' : 'Open Usage Webpage'}
+                        className={`w-5 h-5 ml-0.5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -455,7 +907,7 @@ export default function App() {
                     type="text"
                     value={fileQuery}
                     onChange={(e) => setFileQuery(e.target.value)}
-                    placeholder={isZh ? '筛选工程文件名...' : 'Filter project files...'}
+                    placeholder={isZh ? '搜索 QuotaHudView / ModernQuotaModule...' : 'Filter files...'}
                     className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-slate-400"
                   />
                 </div>
@@ -511,209 +963,66 @@ export default function App() {
                   </button>
                 </div>
 
-                <pre className="p-5 bg-slate-950 text-slate-100 text-xs font-mono overflow-x-auto max-h-[620px] leading-relaxed">
+                <pre className="p-5 bg-slate-950 text-slate-100 text-xs font-mono overflow-x-auto max-h-[640px] leading-relaxed">
                   {currentFile.content}
                 </pre>
               </div>
             </div>
           )}
 
-          {activeView === 'simulator' && (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-              <div className="lg:col-span-6 space-y-5">
-                <div>
-                  <h2 className="text-lg font-bold text-slate-900">
-                    {isZh ? '多源额度嗅探与自适应单行胶囊验证' : 'Multi-Source Quota Parser & HUD Test'}
-                  </h2>
-                  <p className="mt-1 text-sm text-slate-600 leading-relaxed">
+          {activeView === 'spec' && (
+            <div className="space-y-6">
+              <div>
+                <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+                  {isZh
+                    ? 'v1.9.0 单行胶囊重构与单 HUD 互斥架构说明'
+                    : 'v1.9.0 Capsule HUD Refactor & Single-HUD Exclusion Spec'}
+                </h1>
+                <p className="mt-1.5 text-sm text-slate-600 max-w-3xl leading-relaxed">
+                  {isZh
+                    ? '严格对齐参考布局规范，将悬浮窗与数据同步重构为纯代码 Canvas 矢量绘制的 QuotaHudView 单行胶囊，消除宿主 R.drawable 资源查找崩溃隐患。'
+                    : 'Rebuilt around programmatic Canvas vector rendering in QuotaHudView so zero host resource ID lookups occur inside Gemini.'}
+                </p>
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200">
+                <div className="p-5">
+                  <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '选择下方真实 gemini.google.com/usage 或 Compose 数据格式查看解析结果；在右侧手机预览框中可按住拖动胶囊，或单击在「简体中文」与「English」之间实时切换。'
-                      : 'Select a payload format below to test v1.8.0 extraction; drag the floating HUD inside the phone frame or single-tap it to toggle Simplified Chinese and English.'}
+                      ? '01. 单行胶囊精确三段式结构 (QuotaHudView.kt)'
+                      : '01. Exact Three-Section Single-Row Capsule (QuotaHudView.kt)'}
+                  </div>
+                  <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
+                    {isZh
+                      ? '左侧为 5h 标签 + 迷你水平圆角进度条 + 百分比与重置倒计时（如 "15% (1h52m)"）；中段为 每周/Weekly 标签 + 迷你水平圆角进度条 + 百分比与重置倒计时（如 "29% (23h52m)"）；右侧为 Canvas 绘制的旋转刷新图标按钮（触发 ACTION_REQUEST_QUOTA_REFRESH 后台静默同步）与外链图标按钮（直达 gemini.google.com/usage）。内置 onInterceptTouchEvent 滑动阈值判定，兼顾任意拖拽与图标精准点击。'
+                      : 'Left: "5h" + mini rounded progress bar + "15% (1h52m)". Middle: "每周"/"Weekly" + mini rounded progress bar + "29% (23h52m)". Right: Canvas-drawn Refresh icon button (triggers background sync) and External Link button (opens gemini.google.com/usage), with touchSlop drag vs click disambiguation.'}
                   </p>
                 </div>
 
-                <div className="space-y-2.5">
-                  {SAMPLE_PAYLOADS.map((sample) => {
-                    const selected = sample.id === activeSample.id;
-                    return (
-                      <button
-                        key={sample.id}
-                        type="button"
-                        onClick={() => setSelectedSampleId(sample.id)}
-                        className={`w-full text-left p-4 rounded-xl border transition-colors cursor-pointer ${
-                          selected
-                            ? 'bg-white border-slate-900'
-                            : 'bg-white border-slate-200 hover:border-slate-300'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <span className="text-sm font-semibold text-slate-900">
-                            {isZh ? sample.labelZh : sample.labelEn}
-                          </span>
-                          <span className="text-xs font-mono text-slate-500">
-                            source={sample.source}
-                          </span>
-                        </div>
-                        <pre className="mt-2.5 p-3 rounded-lg bg-slate-50 text-xs font-mono text-slate-700 overflow-x-auto whitespace-pre-wrap">
-                          {sample.raw}
-                        </pre>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Simulated Gemini Android Screen */}
-              <div className="lg:col-span-6 flex flex-col items-center gap-3">
-                <div className="w-full max-w-sm flex items-center justify-between px-1">
-                  <span className="text-xs font-medium text-slate-600">
-                    {isZh ? '宿主界面深浅色动态主题测试' : 'Host App Dynamic Theme'}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setSimDarkTheme((d) => !d)}
-                    className="px-3 py-1 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 transition-colors cursor-pointer"
-                  >
-                    {simDarkTheme
-                      ? isZh
-                        ? '当前：深色模式 (点击切浅色)'
-                        : 'Dark Mode (Switch to Light)'
-                      : isZh
-                      ? '当前：浅色模式 (点击切深色)'
-                      : 'Light Mode (Switch to Dark)'}
-                  </button>
+                <div className="p-5">
+                  <div className="text-sm font-semibold text-slate-900">
+                    {isZh
+                      ? '02. 中英双语切换 (i18n) 与 MIUIX / MD3 双主题引擎'
+                      : '02. Bilingual i18n (ZH/EN) & Dual Theme Engine (MIUIX vs MD3)'}
+                  </div>
+                  <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
+                    {isZh
+                      ? '支持在设置页一键切换中文 ("5h" / "每周") 与英文 ("5h" / "Weekly")。主题引擎提供 MIUIX（连续超椭圆圆角胶囊、半透明微光毛玻璃边框，Android 12+ 悬浮窗支持原生 FLAG_BLUR_BEHIND 高斯背景模糊）与 MD3（调用 Android 12+ android.R.color.system_accent1_* / system_neutral1_* Material You 动态壁纸取色及 API 26-30 色调回退）。'
+                      : 'Supports live switching between CN ("5h" / "每周") and EN ("5h" / "Weekly"), plus MIUIX frosted glass (with Android 12+ compositor blur support) vs MD3 Material You Monet dynamic system colors.'}
+                  </p>
                 </div>
 
-                <div
-                  className={`w-full max-w-sm border rounded-3xl overflow-hidden shadow-xs relative h-[520px] select-none flex flex-col transition-colors ${
-                    simDarkTheme
-                      ? 'bg-zinc-950 border-zinc-800 text-zinc-100'
-                      : 'bg-white border-slate-300 text-slate-900'
-                  }`}
-                >
-                  <div
-                    className={`px-6 py-3 flex items-center justify-between text-xs font-mono border-b ${
-                      simDarkTheme
-                        ? 'text-zinc-400 border-zinc-800/80'
-                        : 'text-slate-500 border-slate-100'
-                    }`}
-                  >
-                    <span>09:41</span>
-                    <span>Gemini · Usage Limits</span>
+                <div className="p-5">
+                  <div className="text-sm font-semibold text-slate-900">
+                    {isZh
+                      ? '03. 单 HUD 独占互斥与 SharedPreferences 实时共享'
+                      : '03. Single-HUD Exclusion & SharedPreferences Real-Time Sync'}
                   </div>
-
-                  <div
-                    className={`p-6 space-y-5 flex-1 ${
-                      simDarkTheme ? 'bg-zinc-900/50' : 'bg-slate-50/60'
-                    }`}
-                  >
-                    <div className="pt-8">
-                      <div className="text-base font-bold">
-                        {isZh ? 'Gemini 用量与限额' : 'Gemini Usage Limits'}
-                      </div>
-                      <div
-                        className={`mt-1 text-xs ${
-                          simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
-                        }`}
-                      >
-                        com.google.android.googlequicksearchbox ({activeSample.source})
-                      </div>
-                    </div>
-
-                    <div
-                      className={`border rounded-xl p-4 space-y-3 ${
-                        simDarkTheme
-                          ? 'bg-zinc-900 border-zinc-800'
-                          : 'bg-white border-slate-200'
-                      }`}
-                    >
-                      <div className="flex justify-between text-xs">
-                        <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
-                          {isZh ? '5 小时窗口已用' : '5-hour window'}
-                        </span>
-                        <span className="font-mono font-semibold">
-                          {activeSample.parsed.fiveHourQuota}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-xs">
-                        <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
-                          {isZh ? '每周总限额已用' : 'Weekly cap'}
-                        </span>
-                        <span className="font-mono font-semibold">
-                          {activeSample.parsed.weeklyLimit}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-xs">
-                        <span className={simDarkTheme ? 'text-zinc-400' : 'text-slate-500'}>
-                          {isZh ? '下次重置倒计时' : 'Next reset'}
-                        </span>
-                        <span className="font-mono font-semibold">
-                          {activeSample.parsed.resetTimer}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div
-                      className={`flex items-center gap-2 text-xs ${
-                        simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
-                      }`}
-                    >
-                      <Layers className="w-3.5 h-3.5 shrink-0" />
-                      <span>
-                        {isZh
-                          ? '单行半透明圆角胶囊：支持拖拽、单击切换 ZH/EN、自动随宿主深浅色变色'
-                          : 'Single-line translucent pill HUD: draggable, tap to toggle ZH/EN, adaptive Light/Dark'}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Compact Single-Line Horizontal Adaptive HUD Pill */}
-                  <button
-                    ref={hudBtnRef}
-                    type="button"
-                    onPointerDown={onHudPointerDown}
-                    onPointerMove={onHudPointerMove}
-                    onPointerUp={onHudPointerUp}
-                    className={`absolute top-12 right-3 max-w-[92%] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full backdrop-blur-md border shadow-md text-[11.5px] font-mono whitespace-nowrap overflow-hidden cursor-grab active:cursor-grabbing touch-none transition-colors ${
-                      simDarkTheme
-                        ? 'bg-zinc-900/85 border-white/25 text-slate-50'
-                        : 'bg-white/90 border-slate-900/15 text-slate-900'
-                    }`}
-                  >
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                        simDarkTheme ? 'bg-emerald-400' : 'bg-emerald-600'
-                      }`}
-                    />
-                    <span className="truncate">
-                      <span className={simDarkTheme ? 'text-slate-400' : 'text-slate-600'}>
-                        5h{' '}
-                      </span>
-                      <span className="font-bold">{activeSample.parsed.fiveHourQuota}</span>
-                      <span className={simDarkTheme ? 'text-slate-400' : 'text-slate-600'}>
-                        {' · '}
-                        {hudLang === 'zh' ? '周 ' : 'Wk '}
-                      </span>
-                      <span className="font-bold">{activeSample.parsed.weeklyLimit}</span>
-                      <span className={simDarkTheme ? 'text-slate-400' : 'text-slate-600'}>
-                        {' · '}
-                        {hudLang === 'zh' ? '重置 ' : 'Rst '}
-                      </span>
-                      <span className="font-bold">{activeSample.parsed.resetTimer}</span>
-                    </span>
-                    <span
-                      className={`w-px h-3 mx-0.5 shrink-0 ${
-                        simDarkTheme ? 'bg-white/20' : 'bg-slate-900/15'
-                      }`}
-                    />
-                    <span
-                      className={`text-[10.5px] font-sans font-bold shrink-0 ${
-                        simDarkTheme ? 'text-sky-400' : 'text-sky-600'
-                      }`}
-                    >
-                      {hudLang === 'zh' ? 'ZH' : 'EN'}
-                    </span>
-                  </button>
+                  <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
+                    {isZh
+                      ? '当 ModernQuotaModule (Xposed API 102) 绑定 Gemini 后立即广播 ACTION_HOOK_HEARTBEAT，HookTelemetryReceiver 自动调用 OverlayHudController.enforceSingleHudExclusivity 关闭并禁用 App 系统全局悬浮窗，仅保留唯一的 Gemini 应用内胶囊；同时通过 SharedPreferences ("gemini_eye_state") 与跨进程广播保持 HUD 与设置页预览数值 100% 实时一致。'
+                      : 'When ModernQuotaModule (API 102) binds to Gemini, ACTION_HOOK_HEARTBEAT triggers OverlayHudController.enforceSingleHudExclusivity to auto-disable the App System Overlay while syncing identical quota snapshots across SharedPreferences ("gemini_eye_state").'}
+                  </p>
                 </div>
               </div>
             </div>

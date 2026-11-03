@@ -3,7 +3,6 @@ package com.example.bardquotahook
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ComponentName
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -33,16 +32,35 @@ class MainActivity : Activity() {
         private const val USAGE_URL = "https://gemini.google.com/usage"
     }
 
+    private var titleView: TextView? = null
+    private var pkgView: TextView? = null
+    private var previewCaptionView: TextView? = null
+    private var liveCapsulePreview: QuotaHudView? = null
+
+    private var settingsSectionTitle: TextView? = null
+    private var langZhBtn: Button? = null
+    private var langEnBtn: Button? = null
+    private var themeMiuixBtn: Button? = null
+    private var themeMd3Btn: Button? = null
+
     private var hookStatusView: TextView? = null
     private var quotaPreviewView: TextView? = null
-    private var overlayToggleBtn: Button? = null
+    private var pingBtn: Button? = null
+
+    private var syncDescView: TextView? = null
     private var syncWebBtn: Button? = null
     private var webContainer: FrameLayout? = null
     private var embeddedWebView: WebView? = null
+
+    private var overlayToggleBtn: Button? = null
+    private var launchGeminiBtn: Button? = null
+
     private val uiHandler = Handler(Looper.getMainLooper())
     private var webExpanded = false
+    private var bardInstalled = false
+    private var gsaInstalled = false
 
-    private fun dp(v: Float): Int = QuotaHudLayout.dp(this, v)
+    private fun dp(v: Float): Int = QuotaHudView.dp(this, v)
 
     private fun isPkgInstalled(pkg: String): Boolean {
         return try {
@@ -59,20 +77,7 @@ class MainActivity : Activity() {
     }
 
     private fun pingHookedProcesses() {
-        val targets = arrayOf(
-            "com.google.android.apps.bard",
-            "com.google.android.googlequicksearchbox"
-        )
-        for (pkg in targets) {
-            try {
-                val ping = Intent(QuotaTextParser.ACTION_QUOTA_EXTERNAL_SYNC).apply {
-                    setPackage(pkg)
-                    putExtra("ping", true)
-                }
-                sendBroadcast(ping)
-            } catch (_: Throwable) {
-            }
-        }
+        HookTelemetryReceiver.syncStateToHostApps(this, includePing = true)
     }
 
     private fun launchGeminiWithFallback() {
@@ -102,45 +107,143 @@ class MainActivity : Activity() {
     private fun makeCardDrawable(bgHex: String, borderHex: String): GradientDrawable {
         return GradientDrawable().apply {
             setColor(Color.parseColor(bgHex))
-            cornerRadius = dp(14f).toFloat()
+            cornerRadius = dp(16f).toFloat()
             setStroke(maxOf(1, dp(1f)), Color.parseColor(borderHex))
         }
     }
 
-    private fun makeBtnDrawable(bgHex: String): GradientDrawable {
+    private fun makeBtnDrawable(bgHex: String, borderHex: String? = null): GradientDrawable {
         return GradientDrawable().apply {
             setColor(Color.parseColor(bgHex))
             cornerRadius = dp(12f).toFloat()
+            if (borderHex != null) {
+                setStroke(maxOf(1, dp(1f)), Color.parseColor(borderHex))
+            }
         }
     }
 
-    private fun refreshStatusTexts() {
-        val prefs = getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
-        val lastHb = prefs.getLong("last_hb_ms", 0L)
-        val lastPkg = prefs.getString("last_pkg", "") ?: ""
-        val lastBridge = prefs.getString("last_bridge", "") ?: ""
+    private fun refreshAllUi() {
+        val ui = HookTelemetryReceiver.loadUiPrefs(this)
         val snap = HookTelemetryReceiver.loadSnapshot(this)
+        val zh = ui.lang == QuotaHudView.Lang.ZH
 
-        val hookLine = if (lastHb > 0L) {
-            val secAgo = maxOf(0L, (System.currentTimeMillis() - lastHb) / 1000L)
-            "✅ Xposed 已连接 · 引擎: $lastBridge\n宿主: $lastPkg (${secAgo}s 前活跃)"
-        } else {
-            "⚠️ 尚未收到宿主 Hook 回执：\n" +
-                "• Vector / LSPosed API 102 用户：本版已补齐 META-INF/xposed/* 原生入口，请重启或强行停止 Google 与 Gemini。\n" +
-                "• Magisk / Shamiko 用户：若在「排除列表 (DenyList)」中勾选了 Google 或 Gemini，Zygisk 会剥离所有模块导致无法 Hook！请将它们移出排除列表，或直接开启下方「免 Hook 全局悬浮胶囊」。"
+        // Enforce Single-HUD Exclusion immediately if Xposed bound
+        if (ui.xposedBound && OverlayHudController.isShowing) {
+            OverlayHudController.enforceSingleHudExclusivity(this)
         }
-        hookStatusView?.text = hookLine
 
+        titleView?.text = if (zh) {
+            "Gemini-Eye 用量胶囊 (v1.9.0)"
+        } else {
+            "Gemini-Eye Quota HUD (v1.9.0)"
+        }
+
+        pkgView?.text = if (zh) {
+            "宿主检测 · Gemini: ${if (bardInstalled) "已安装" else "未安装"} | Google: ${if (gsaInstalled) "已安装" else "未安装"} | API 102 + 82"
+        } else {
+            "Targets · Gemini: ${if (bardInstalled) "Installed" else "Missing"} | Google: ${if (gsaInstalled) "Installed" else "Missing"} | API 102 + 82"
+        }
+
+        previewCaptionView?.text = if (zh) {
+            "实时单行胶囊预览（与 Gemini 应用内悬浮窗共享同一份 SharedPreferences 实时数值）"
+        } else {
+            "Live Single-Line Capsule Preview (Synced via SharedPreferences with In-App HUD)"
+        }
+
+        liveCapsulePreview?.applyPreferences(ui.lang, ui.theme)
+        liveCapsulePreview?.updateSnapshot(snap)
+
+        settingsSectionTitle?.text = if (zh) {
+            "界面语言 (i18n) 与双主题引擎 (MIUIX / MD3)"
+        } else {
+            "Language (i18n) & Dual Theme Engine (MIUIX / MD3)"
+        }
+
+        langZhBtn?.apply {
+            text = "中文 (5h / 每周)"
+            background = if (zh) makeBtnDrawable("#2563EB") else makeBtnDrawable("#0F172A", "#334155")
+            setTextColor(if (zh) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+        langEnBtn?.apply {
+            text = "English (5h / Weekly)"
+            background = if (!zh) makeBtnDrawable("#2563EB") else makeBtnDrawable("#0F172A", "#334155")
+            setTextColor(if (!zh) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+
+        val isMiuix = ui.theme == QuotaHudView.ThemeMode.MIUIX
+        themeMiuixBtn?.apply {
+            text = if (zh) "MIUIX 毛玻璃胶囊" else "MIUIX Frosted Pill"
+            background = if (isMiuix) makeBtnDrawable("#0284C7") else makeBtnDrawable("#0F172A", "#334155")
+            setTextColor(if (isMiuix) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+        themeMd3Btn?.apply {
+            text = if (zh) "MD3 动态取色" else "MD3 Material You"
+            background = if (!isMiuix) makeBtnDrawable("#7C3AED") else makeBtnDrawable("#0F172A", "#334155")
+            setTextColor(if (!isMiuix) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+
+        val hookText = if (ui.xposedBound) {
+            val secAgo = maxOf(0L, (System.currentTimeMillis() - ui.lastHeartbeatMs) / 1000L)
+            if (zh) {
+                "✅ 单 HUD 互斥已激活 · 引擎: ${ui.lastBridge}\n宿主: ${ui.lastPkg} (${secAgo}s 前心跳) · 系统全局悬浮窗已自动禁用"
+            } else {
+                "✅ Single-HUD Bound · Engine: ${ui.lastBridge}\nHost: ${ui.lastPkg} (${secAgo}s ago) · System Overlay Auto-Disabled"
+            }
+        } else {
+            if (zh) {
+                "⚠️ 暂未收到 Gemini 进程 Xposed 心跳：\n• 请在 LSPosed / Vector 中启用本模块并勾选 Gemini 与 Google，强行停止后重新打开。\n• 若使用 Shamiko / DenyList 隐藏了 Google，可临时使用下方系统悬浮窗保底。"
+            } else {
+                "⚠️ Waiting for Gemini Xposed heartbeat:\n• Enable Gemini-Eye in LSPosed / Vector for Gemini & Google, then force-stop Gemini.\n• If Magisk DenyList blocks Xposed, you may use the fallback System Overlay below."
+            }
+        }
+        hookStatusView?.text = hookText
+
+        val wkLabel = if (zh) "每周" else "Weekly"
         quotaPreviewView?.text =
-            "当前缓存额度 · 5h: ${snap.fiveHourQuota}  |  周: ${snap.weeklyLimit}  |  重置: ${snap.resetTimer}  (来源: ${snap.source})"
+            "5h: ${snap.formatFiveHourDisplay()}   |   $wkLabel: ${snap.formatWeeklyDisplay()}   [${snap.source}]"
+
+        pingBtn?.text = if (zh) {
+            "立即刷新额度并同步至宿主 HUD"
+        } else {
+            "Sync Quota & Push to Host HUD Now"
+        }
+
+        syncDescView?.text = if (zh) {
+            "内置 gemini.google.com/usage 实时同步：登录一次 Google 账号后，点击胶囊右侧「↻ 刷新图标」即可在后台静默拉取最新 5h 百分比、每周百分比及各自重置倒计时。"
+        } else {
+            "Built-in gemini.google.com/usage Sync: Sign in once below so tapping the HUD's Refresh icon (↻) silently fetches live 5h %, Weekly %, and reset countdowns in the background."
+        }
+
+        syncWebBtn?.text = if (webExpanded) {
+            if (zh) "重新加载 gemini.google.com/usage 并提取最新数值" else "Reload gemini.google.com/usage & Extract Quota"
+        } else {
+            if (zh) "展开内置用量网页登录同步 (gemini.google.com/usage)" else "Open Embedded Login & Sync (gemini.google.com/usage)"
+        }
 
         val overlayOn = OverlayHudController.isShowing
-        overlayToggleBtn?.text = if (overlayOn) {
-            "关闭全局悬浮胶囊 (当前运行中 · 自动同步)"
-        } else {
-            "开启免 Hook 全局悬浮胶囊 (过 DenyList 保底方案)"
+        overlayToggleBtn?.apply {
+            if (ui.xposedBound) {
+                isEnabled = false
+                text = if (zh) {
+                    "单 HUD 独占模式生效中 (已由 Xposed 应用内胶囊接管)"
+                } else {
+                    "Single-HUD Exclusive Active (Managed by In-App Xposed HUD)"
+                }
+                background = makeBtnDrawable("#1E293B", "#334155")
+                setTextColor(Color.parseColor("#94A3B8"))
+            } else {
+                isEnabled = true
+                setTextColor(Color.WHITE)
+                text = if (overlayOn) {
+                    if (zh) "关闭系统全局悬浮胶囊 (运行中)" else "Disable System Overlay HUD (Running)"
+                } else {
+                    if (zh) "开启免 Hook 系统悬浮胶囊 (仅未注入时可用)" else "Enable Fallback System Overlay (When Unhooked)"
+                }
+                background = makeBtnDrawable(if (overlayOn) "#059669" else "#334155")
+            }
         }
-        overlayToggleBtn?.background = makeBtnDrawable(if (overlayOn) "#059669" else "#334155")
+
+        launchGeminiBtn?.text = if (zh) "启动 Gemini 应用" else "Launch Gemini App"
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -149,7 +252,6 @@ class MainActivity : Activity() {
         if (!webExpanded) {
             webExpanded = true
             frame.visibility = View.VISIBLE
-            syncWebBtn?.text = "刷新 gemini.google.com/usage 并提取最新额度"
 
             if (embeddedWebView == null) {
                 try {
@@ -182,12 +284,13 @@ class MainActivity : Activity() {
             embeddedWebView?.reload()
             extractFromEmbeddedWebView(1200L)
         }
+        refreshAllUi()
     }
 
     private fun extractFromEmbeddedWebView(delayMs: Long) {
-        uiHandler.postDelayed({
-            val wv = embeddedWebView ?: return@postDelayed
-            if (isFinishing || isDestroyed) return@postDelayed
+        uiHandler.postDelayed(r@{
+            val wv = embeddedWebView ?: return@r
+            if (isFinishing || isDestroyed) return@r
             try {
                 wv.evaluateJavascript(
                     "(function(){return document.body ? document.body.innerText : '';})()"
@@ -201,7 +304,7 @@ class MainActivity : Activity() {
                             val snap = QuotaTextParser.parseUiBlock(text, prev, "UsageWeb")
                             if (snap != null) {
                                 HookTelemetryReceiver.pushExternalQuotaToHostApps(this@MainActivity, snap)
-                                refreshStatusTexts()
+                                refreshAllUi()
                             }
                         }
                     } catch (_: Throwable) {
@@ -215,45 +318,189 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val bardInstalled = isPkgInstalled("com.google.android.apps.bard")
-        val gsaInstalled = isPkgInstalled("com.google.android.googlequicksearchbox")
+        bardInstalled = isPkgInstalled("com.google.android.apps.bard")
+        gsaInstalled = isPkgInstalled("com.google.android.googlequicksearchbox")
 
         val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#0F172A"))
+            setBackgroundColor(Color.parseColor("#0B1120"))
         }
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            val padH = dp(18f)
-            val padV = dp(24f)
+            val padH = dp(16f)
+            val padV = dp(22f)
             setPadding(padH, padV, padH, padV)
         }
 
-        val titleView = TextView(this).apply {
-            text = "Gemini-Eye 用量监控 (v1.8.0 · 双引擎)"
+        val headerTitle = TextView(this).apply {
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)
             typeface = Typeface.DEFAULT_BOLD
         }
+        titleView = headerTitle
 
-        val pkgView = TextView(this).apply {
-            text = "包检测 · Gemini: ${if (bardInstalled) "已安装" else "未安装"} | Google 主程序: ${if (gsaInstalled) "已安装" else "未检测到"} | API 102 + API 82"
+        val headerSub = TextView(this).apply {
             setTextColor(Color.parseColor("#38BDF8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(6f), 0, dp(14f))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setPadding(0, dp(5f), 0, dp(12f))
+        }
+        pkgView = headerSub
+
+        // 0. Live Single-Line Capsule HUD Preview Card
+        val previewCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            background = makeCardDrawable("#131C31", "#263554")
+            val p = dp(14f)
+            setPadding(p, p, p, p)
         }
 
-        // 1. Live Hook Diagnostics Card
+        val previewCap = TextView(this).apply {
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(10f))
+        }
+        previewCaptionView = previewCap
+
+        val hudPreview = QuotaHudView(
+            context = this,
+            onRefreshClick = {
+                OverlayHudController.triggerHeadlessSync(this@MainActivity)
+                pingHookedProcesses()
+            },
+            onOpenUsageClick = {
+                QuotaHudView.openUsageWebpage(this@MainActivity)
+            },
+            draggableInFrame = false
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        liveCapsulePreview = hudPreview
+
+        previewCard.addView(previewCap)
+        previewCard.addView(hudPreview)
+
+        // 1. Dual Language (i18n) & Dual Theme Engine (MIUIX vs MD3) Card
+        val prefCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = makeCardDrawable("#1E293B", "#334155")
+            val p = dp(14f)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(12f)
+            }
+        }
+
+        val prefTitle = TextView(this).apply {
+            setTextColor(Color.parseColor("#F1F5F9"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(10f))
+        }
+        settingsSectionTitle = prefTitle
+
+        val langRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+        }
+
+        val btnZh = Button(this).apply {
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            layoutParams = LinearLayout.LayoutParams(0, dp(38f), 1f).apply {
+                marginEnd = dp(5f)
+            }
+            setOnClickListener {
+                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, lang = QuotaHudView.Lang.ZH)
+                refreshAllUi()
+            }
+        }
+        langZhBtn = btnZh
+
+        val btnEn = Button(this).apply {
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            layoutParams = LinearLayout.LayoutParams(0, dp(38f), 1f).apply {
+                marginStart = dp(5f)
+            }
+            setOnClickListener {
+                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, lang = QuotaHudView.Lang.EN)
+                refreshAllUi()
+            }
+        }
+        langEnBtn = btnEn
+
+        langRow.addView(btnZh)
+        langRow.addView(btnEn)
+
+        val themeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8f)
+            }
+        }
+
+        val btnMiuix = Button(this).apply {
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            layoutParams = LinearLayout.LayoutParams(0, dp(38f), 1f).apply {
+                marginEnd = dp(5f)
+            }
+            setOnClickListener {
+                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, theme = QuotaHudView.ThemeMode.MIUIX)
+                refreshAllUi()
+            }
+        }
+        themeMiuixBtn = btnMiuix
+
+        val btnMd3 = Button(this).apply {
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            layoutParams = LinearLayout.LayoutParams(0, dp(38f), 1f).apply {
+                marginStart = dp(5f)
+            }
+            setOnClickListener {
+                HookTelemetryReceiver.saveUiPrefs(this@MainActivity, theme = QuotaHudView.ThemeMode.MD3)
+                refreshAllUi()
+            }
+        }
+        themeMd3Btn = btnMd3
+
+        themeRow.addView(btnMiuix)
+        themeRow.addView(btnMd3)
+
+        prefCard.addView(prefTitle)
+        prefCard.addView(langRow)
+        prefCard.addView(themeRow)
+
+        // 2. Live Hook & Shared Quota Telemetry Card
         val diagCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeCardDrawable("#1E293B", "#334155")
             val p = dp(14f)
             setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(12f)
+            }
         }
 
         val statusTv = TextView(this).apply {
             setTextColor(Color.parseColor("#E2E8F0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setLineSpacing(dp(3f).toFloat(), 1.1f)
         }
         hookStatusView = statusTv
@@ -266,23 +513,25 @@ class MainActivity : Activity() {
         }
         quotaPreviewView = quotaTv
 
-        val pingBtn = Button(this).apply {
-            text = "主动检测 Hook 连接状态 (Ping 宿主)"
+        val btnPing = Button(this).apply {
             isAllCaps = false
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             background = makeBtnDrawable("#0284C7")
             setOnClickListener {
+                liveCapsulePreview?.triggerRefreshSpin()
+                OverlayHudController.triggerHeadlessSync(this@MainActivity)
                 pingHookedProcesses()
-                uiHandler.postDelayed({ refreshStatusTexts() }, 500L)
+                uiHandler.postDelayed({ refreshAllUi() }, 500L)
             }
         }
+        pingBtn = btnPing
 
         diagCard.addView(statusTv)
         diagCard.addView(quotaTv)
-        diagCard.addView(pingBtn)
+        diagCard.addView(btnPing)
 
-        // 2. Direct gemini.google.com/usage Live Sync Card
+        // 3. Direct gemini.google.com/usage Live Login & Sync Card
         val syncCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeCardDrawable("#1E293B", "#334155")
@@ -292,22 +541,21 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dp(14f)
+                topMargin = dp(12f)
             }
         }
 
         val syncDesc = TextView(this).apply {
-            text = "为什么聊天界面默认显示 -- ？\nGoogle 聊天流采用二进制 Protobuf 且不附带额度字段；真实百分比仅在 gemini.google.com/usage 提供。点击下方按钮登录一次 Google 账号，即可直接抓取实时 5h % / 周限额 % 并自动推送至 Gemini 悬浮胶囊！"
             setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setLineSpacing(dp(3f).toFloat(), 1.1f)
         }
+        syncDescView = syncDesc
 
         val webBtn = Button(this).apply {
-            text = "展开内置网页登录并同步 gemini.google.com/usage"
             isAllCaps = false
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             background = makeBtnDrawable("#2563EB")
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -334,22 +582,26 @@ class MainActivity : Activity() {
         syncCard.addView(webBtn)
         syncCard.addView(webHolder)
 
-        // 3. System Overlay Fallback Button (Works even without Xposed / under DenyList)
+        // 4. Single-HUD Exclusive System Overlay Button
         val overlayBtn = Button(this).apply {
             isAllCaps = false
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dp(14f)
+                topMargin = dp(12f)
             }
             setPadding(dp(12f), dp(12f), dp(12f), dp(12f))
             setOnClickListener {
+                if (HookTelemetryReceiver.isXposedActivelyBound(this@MainActivity)) {
+                    OverlayHudController.enforceSingleHudExclusivity(this@MainActivity)
+                    refreshAllUi()
+                    return@setOnClickListener
+                }
                 if (OverlayHudController.isShowing) {
                     OverlayHudController.hide(this@MainActivity)
-                    uiHandler.postDelayed({ refreshStatusTexts() }, 200L)
+                    uiHandler.postDelayed({ refreshAllUi() }, 200L)
                 } else if (!Settings.canDrawOverlays(this@MainActivity)) {
                     val permIntent = Intent(
                         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -358,32 +610,34 @@ class MainActivity : Activity() {
                     runCatching { startActivity(permIntent) }
                 } else {
                     OverlayHudController.show(this@MainActivity)
-                    uiHandler.postDelayed({ refreshStatusTexts() }, 250L)
+                    uiHandler.postDelayed({ refreshAllUi() }, 250L)
                 }
             }
         }
         overlayToggleBtn = overlayBtn
 
-        // 4. Launch Gemini Button
+        // 5. Launch Gemini Button
         val launchBtn = Button(this).apply {
-            text = "启动 Gemini / Launch Gemini"
             isAllCaps = false
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
             gravity = Gravity.CENTER
             background = makeBtnDrawable("#4F46E5")
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dp(12f)
+                topMargin = dp(10f)
             }
             setPadding(dp(12f), dp(13f), dp(12f), dp(13f))
             setOnClickListener { launchGeminiWithFallback() }
         }
+        launchGeminiBtn = launchBtn
 
-        container.addView(titleView)
-        container.addView(pkgView)
+        container.addView(headerTitle)
+        container.addView(headerSub)
+        container.addView(previewCard)
+        container.addView(prefCard)
         container.addView(diagCard)
         container.addView(syncCard)
         container.addView(overlayBtn)
@@ -392,16 +646,16 @@ class MainActivity : Activity() {
         setContentView(scroll)
 
         HookTelemetryReceiver.setUiListener {
-            runOnUiThread { refreshStatusTexts() }
+            runOnUiThread { refreshAllUi() }
         }
         pingHookedProcesses()
-        refreshStatusTexts()
+        refreshAllUi()
     }
 
     override fun onResume() {
         super.onResume()
         pingHookedProcesses()
-        refreshStatusTexts()
+        refreshAllUi()
     }
 
     override fun onDestroy() {

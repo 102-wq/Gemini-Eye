@@ -27,6 +27,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
             val bridge = object : QuotaCoreEngine.HookBridge {
                 override val bridgeName: String = "XposedBridge-API-82"
+                override val isModernApi102: Boolean = false
 
                 override fun log(msg: String) {
                     try {

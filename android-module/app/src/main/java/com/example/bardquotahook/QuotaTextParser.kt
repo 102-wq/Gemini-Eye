@@ -9,6 +9,7 @@ object QuotaTextParser {
     const val ACTION_QUOTA_INTERNAL_SYNC = "com.example.bardquotahook.ACTION_QUOTA_SYNC"
     const val ACTION_QUOTA_EXTERNAL_SYNC = "com.example.bardquotahook.ACTION_QUOTA_EXTERNAL_SYNC"
     const val ACTION_HOOK_HEARTBEAT = "com.example.bardquotahook.ACTION_HOOK_HEARTBEAT"
+    const val ACTION_REQUEST_QUOTA_REFRESH = "com.example.bardquotahook.ACTION_REQUEST_QUOTA_REFRESH"
     const val PREFS_NAME = "gemini_eye_state"
 
     enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }
@@ -27,6 +28,14 @@ object QuotaTextParser {
 
     private val ratioOrPctRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
         Regex("""(\d+\s*/\s*\d+|\d+(?:\.\d+)?\s*%)""")
+    }
+
+    private val pctNumRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        Regex("""(\d+(?:\.\d+)?)\s*%""")
+    }
+
+    private val ratioNumRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        Regex("""(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)""")
     }
 
     private val explicitUsedPctRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
@@ -92,6 +101,24 @@ object QuotaTextParser {
         )
     }
 
+    fun parseProgressFraction(metric: String): Float {
+        if (metric == "--" || metric.isBlank()) return 0f
+        val pctMatch = pctNumRegex.find(metric)
+        if (pctMatch != null) {
+            val pct = pctMatch.groupValues.getOrNull(1)?.toFloatOrNull() ?: 0f
+            return (pct / 100f).coerceIn(0f, 1f)
+        }
+        val ratioMatch = ratioNumRegex.find(metric)
+        if (ratioMatch != null) {
+            val num = ratioMatch.groupValues.getOrNull(1)?.toFloatOrNull() ?: 0f
+            val den = ratioMatch.groupValues.getOrNull(2)?.toFloatOrNull() ?: 0f
+            if (den > 0f) {
+                return (num / den).coerceIn(0f, 1f)
+            }
+        }
+        return 0f
+    }
+
     fun fastHasQuotaKeyword(text: String): Boolean {
         val len = text.length
         if (len < 3 || len > 262_144) return false
@@ -138,6 +165,8 @@ object QuotaTextParser {
     private fun compactResetDisplay(raw: String): String {
         val cleaned = raw
             .replace(Regex("""\s+"""), " ")
+            .replace("days", "d", ignoreCase = true)
+            .replace("day", "d", ignoreCase = true)
             .replace("hours", "h", ignoreCase = true)
             .replace("hour", "h", ignoreCase = true)
             .replace("hrs", "h", ignoreCase = true)
@@ -146,12 +175,14 @@ object QuotaTextParser {
             .replace("minute", "m", ignoreCase = true)
             .replace("mins", "m", ignoreCase = true)
             .replace("min", "m", ignoreCase = true)
+            .replace("天", "d")
             .replace("小时", "h")
             .replace("分钟", "m")
             .replace("分", "m")
+            .replace("d ", "d")
             .replace("h ", "h")
             .trim()
-        return if (cleaned.length > 16) cleaned.take(15) + "…" else cleaned
+        return if (cleaned.length > 15) cleaned.take(14) + "…" else cleaned
     }
 
     private fun normalizeValue(raw: String, kind: MetricKind): String {
@@ -159,27 +190,22 @@ object QuotaTextParser {
         if (singleLine.isEmpty()) return "--"
         val token = extractMetricToken(singleLine, kind)
         if (token != null) return token
-        return if (singleLine.length > 15) singleLine.take(14) + "…" else singleLine
+        return if (singleLine.length > 14) singleLine.take(13) + "…" else singleLine
     }
 
     /**
      * Parses UI text from Compose layouts, TextViews, Accessibility descriptions,
-     * or `https://gemini.google.com/usage` innerText.
+     * or `https://gemini.google.com/usage` innerText, extracting separate 5h & Weekly resets.
      */
     fun parseUiBlock(
         block: String,
-        prev: QuotaHudLayout.Snapshot,
+        prev: QuotaHudView.Snapshot,
         source: String
-    ): QuotaHudLayout.Snapshot? {
-        if (block.contains("5h ") && (block.contains("· 周 ") || block.contains("· Wk "))) {
-            return null
-        }
-
+    ): QuotaHudView.Snapshot? {
         var fiveHour = prev.fiveHourQuota
+        var fiveReset = prev.fiveHourReset
         var weekly = prev.weeklyLimit
-        var primaryReset = prev.resetTimer
-        var weeklyResetCandidate: String? = null
-        var capturedPrimaryResetInPass = false
+        var weekReset = prev.weeklyReset
         var hit = false
 
         var section = SectionContext.NONE
@@ -198,21 +224,21 @@ object QuotaTextParser {
                 }
                 val bannerReset = extractMetricToken(line, MetricKind.RESET)
                 if (bannerReset != null) {
-                    primaryReset = bannerReset
-                    capturedPrimaryResetInPass = true
+                    fiveReset = bannerReset
                     hit = true
                 }
             }
 
-            // Pair standalone values ("18%", "0% used", "32/50") with recent Compose label node
+            // Pair standalone values ("15%", "29%", "32/50") with recent Compose label node
             val activeSlot = pendingSlot
             if (activeSlot != null && (now - pendingSlotTimestampMs) <= 700L) {
                 if (activeSlot == MetricKind.RESET) {
                     val resetToken = extractMetricToken(line, MetricKind.RESET)
                     if (resetToken != null) {
-                        if (section != SectionContext.WEEKLY || !capturedPrimaryResetInPass) {
-                            primaryReset = resetToken
-                            if (section != SectionContext.WEEKLY) capturedPrimaryResetInPass = true
+                        if (section == SectionContext.WEEKLY) {
+                            weekReset = resetToken
+                        } else {
+                            fiveReset = resetToken
                         }
                         hit = true
                         pendingSlot = null
@@ -249,7 +275,7 @@ object QuotaTextParser {
                 }
                 val inlineReset = if (resetLabelRegex.matches(line)) extractMetricToken(line, MetricKind.RESET) else null
                 if (inlineReset != null) {
-                    weeklyResetCandidate = inlineReset
+                    weekReset = inlineReset
                     hit = true
                 }
                 continue
@@ -269,8 +295,7 @@ object QuotaTextParser {
                 }
                 val inlineReset = if (resetLabelRegex.matches(line)) extractMetricToken(line, MetricKind.RESET) else null
                 if (inlineReset != null) {
-                    primaryReset = inlineReset
-                    capturedPrimaryResetInPass = true
+                    fiveReset = inlineReset
                     hit = true
                 }
                 continue
@@ -300,10 +325,9 @@ object QuotaTextParser {
                     val inlineReset = extractMetricToken(line, MetricKind.RESET)
                     if (inlineReset != null) {
                         if (section == SectionContext.WEEKLY) {
-                            weeklyResetCandidate = inlineReset
+                            weekReset = inlineReset
                         } else {
-                            primaryReset = inlineReset
-                            capturedPrimaryResetInPass = true
+                            fiveReset = inlineReset
                         }
                         hit = true
                     }
@@ -315,10 +339,9 @@ object QuotaTextParser {
                 val token = extractMetricToken(line, MetricKind.RESET)
                 if (token != null) {
                     if (section == SectionContext.WEEKLY) {
-                        weeklyResetCandidate = token
+                        weekReset = token
                     } else {
-                        primaryReset = token
-                        capturedPrimaryResetInPass = true
+                        fiveReset = token
                     }
                     hit = true
                     pendingSlot = null
@@ -329,22 +352,28 @@ object QuotaTextParser {
             }
         }
 
-        if (!capturedPrimaryResetInPass && primaryReset == "--" && weeklyResetCandidate != null) {
-            primaryReset = weeklyResetCandidate
-        }
-
         if (!hit) return null
-        if (fiveHour == prev.fiveHourQuota && weekly == prev.weeklyLimit && primaryReset == prev.resetTimer) {
+        if (fiveHour == prev.fiveHourQuota &&
+            fiveReset == prev.fiveHourReset &&
+            weekly == prev.weeklyLimit &&
+            weekReset == prev.weeklyReset
+        ) {
             return null
         }
-        return QuotaHudLayout.Snapshot(fiveHour, weekly, primaryReset, source)
+        return QuotaHudView.Snapshot(
+            fiveHourQuota = fiveHour,
+            fiveHourReset = fiveReset,
+            weeklyLimit = weekly,
+            weeklyReset = weekReset,
+            source = source
+        )
     }
 
     fun inspectJsonObject(
         json: JSONObject,
-        prev: QuotaHudLayout.Snapshot,
+        prev: QuotaHudView.Snapshot,
         source: String
-    ): QuotaHudLayout.Snapshot? {
+    ): QuotaHudView.Snapshot? {
         val extracted = mutableMapOf<String, String>()
         collectFromJson(json, extracted, 0)
         if (extracted.isEmpty()) return null
@@ -353,9 +382,9 @@ object QuotaTextParser {
 
     fun inspectJsonArray(
         arr: JSONArray,
-        prev: QuotaHudLayout.Snapshot,
+        prev: QuotaHudView.Snapshot,
         source: String
-    ): QuotaHudLayout.Snapshot? {
+    ): QuotaHudView.Snapshot? {
         val extracted = mutableMapOf<String, String>()
         collectFromJson(arr, extracted, 0)
         if (extracted.isEmpty()) return null
@@ -364,9 +393,9 @@ object QuotaTextParser {
 
     fun parseRawPayload(
         payload: String,
-        prev: QuotaHudLayout.Snapshot,
+        prev: QuotaHudView.Snapshot,
         source: String
-    ): QuotaHudLayout.Snapshot? {
+    ): QuotaHudView.Snapshot? {
         val cleaned = payload
             .removePrefix(")]}'\n")
             .removePrefix(")]}'")
@@ -465,12 +494,13 @@ object QuotaTextParser {
 
     private fun mergeExtractedFields(
         fields: Map<String, String>,
-        prev: QuotaHudLayout.Snapshot,
+        prev: QuotaHudView.Snapshot,
         source: String
-    ): QuotaHudLayout.Snapshot? {
+    ): QuotaHudView.Snapshot? {
         var fiveHour = prev.fiveHourQuota
+        var fiveReset = prev.fiveHourReset
         var weekly = prev.weeklyLimit
-        var reset = prev.resetTimer
+        var weekReset = prev.weeklyReset
 
         var remainingVal: String? = null
         var totalLimitVal: String? = null
@@ -481,12 +511,14 @@ object QuotaTextParser {
                     remainingVal = v
                 k == "limit" || k == "quota_limit" || k == "max_quota" ->
                     totalLimitVal = v
+                (k.contains("week") || k.contains("cap")) && (k.contains("reset") || k.contains("expire") || k.contains("refresh")) ->
+                    weekReset = normalizeValue(v, MetricKind.RESET)
+                k.contains("reset") || k.contains("expire") || k.contains("refresh") ->
+                    fiveReset = normalizeValue(v, MetricKind.RESET)
                 k.contains("5h") || k.contains("five") || k.contains("window") || k.contains("session") || k.contains("quota") ->
                     fiveHour = normalizeValue(v, MetricKind.FIVE_HOUR)
                 k.contains("week") || k.contains("cap") ->
                     weekly = normalizeValue(v, MetricKind.WEEKLY)
-                k.contains("reset") || k.contains("expire") || k.contains("refresh") ->
-                    reset = normalizeValue(v, MetricKind.RESET)
             }
         }
 
@@ -498,9 +530,19 @@ object QuotaTextParser {
             weekly = normalizeValue(totalLimitVal, MetricKind.WEEKLY)
         }
 
-        if (fiveHour == prev.fiveHourQuota && weekly == prev.weeklyLimit && reset == prev.resetTimer) {
+        if (fiveHour == prev.fiveHourQuota &&
+            fiveReset == prev.fiveHourReset &&
+            weekly == prev.weeklyLimit &&
+            weekReset == prev.weeklyReset
+        ) {
             return null
         }
-        return QuotaHudLayout.Snapshot(fiveHour, weekly, reset, source)
+        return QuotaHudView.Snapshot(
+            fiveHourQuota = fiveHour,
+            fiveHourReset = fiveReset,
+            weeklyLimit = weekly,
+            weeklyReset = weekReset,
+            source = source
+        )
     }
 }

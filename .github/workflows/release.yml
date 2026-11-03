@@ -44,7 +44,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.8.${{ github.run_number }}
-          name: Gemini-Eye v1.8.${{ github.run_number }}
-          body: "**v1.8 True Dual-API Hook (LibXposed API 102 + Legacy Xposed 82) & Live Usage Sync**: Added `META-INF/xposed/{module.prop,java_init.list,scope.list}` + `ModernQuotaModule` (`io.github.libxposed.api.XposedModule`) alongside `assets/xposed_init` (`QuotaHookEntry`) so both Vector / Modern LSPosed API 102 and Legacy LSPosed hook reliably; refactored `QuotaTextParser` to parse `gemini.google.com/usage` percentage meters (`% used` / `已使用 %`); added built-in `gemini.google.com/usage` WebView live sync + cross-app broadcast + optional `SYSTEM_ALERT_WINDOW` floating capsule fallback for Magisk DenyList/Shamiko setups."
+          tag_name: v1.9.${{ github.run_number }}
+          name: Gemini-Eye v1.9.${{ github.run_number }}
+          body: "**v1.9 Single-Line Capsule HUD (`QuotaHudView`), Dual Themes (`MIUIX` vs `MD3`), Bilingual i18n & Single-HUD Exclusion**: Refactored HUD to exact horizontal single-row capsule (`5h` + mini progress bar + `% (reset)` | `每周`/`Weekly` + mini progress bar + `% (reset)` | Refresh & External Link action buttons); added dynamic ZH/EN i18n toggle and MIUIX frosted glass vs Material You MD3 dynamic coloring; enforced automatic Single-HUD Exclusion when `ModernQuotaModule` (API 102) binds to Gemini; unified real-time `SharedPreferences` quota sync across HUD and Settings."
           files: Gemini-Eye.apk

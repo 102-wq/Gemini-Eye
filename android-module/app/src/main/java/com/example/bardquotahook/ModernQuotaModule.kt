@@ -1,5 +1,6 @@
 package com.example.bardquotahook
 
+import android.content.SharedPreferences
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.ExceptionMode
@@ -11,8 +12,14 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import java.lang.reflect.Executable
 
 /**
- * Modern LibXposed API 101/102 Entry Point (Vector & Modern LSPosed).
- * Registered via `src/main/resources/META-INF/xposed/java_init.list`.
+ * Modern LibXposed API 102 Entry Point (Vector & Modern LSPosed).
+ * Registered via `src/main/resources/META-INF/xposed/java_init.list` + `module.prop`.
+ *
+ * When bound to Gemini (`com.google.android.apps.bard` or `com.google.android.googlequicksearchbox`):
+ * 1. Signals `isModernApi102 = true` to `QuotaCoreEngine` -> broadcasts `ACTION_HOOK_HEARTBEAT`
+ *    so `OverlayHudController` automatically disables App System Overlay (Single-HUD Exclusion).
+ * 2. Bridges LibXposed remote `SharedPreferences` (when supported) + cross-process sync so
+ *    both the single in-app `QuotaHudView` capsule and Settings app share identical real-time data.
  */
 class ModernQuotaModule : XposedModule() {
 
@@ -59,13 +66,26 @@ class ModernQuotaModule : XposedModule() {
                     get() = try {
                         "${moduleRef.frameworkName}-API-${moduleRef.apiVersion}"
                     } catch (_: Throwable) {
-                        "LibXposed-102"
+                        "LibXposed-API-102"
                     }
+
+                override val isModernApi102: Boolean = true
 
                 override fun log(msg: String) {
                     try {
                         moduleRef.log(Log.INFO, "BardQuota", msg)
                     } catch (_: Throwable) {
+                    }
+                }
+
+                override fun openRemotePreferences(group: String): SharedPreferences? {
+                    return try {
+                        val method = moduleRef.javaClass.methods.firstOrNull {
+                            it.name == "getRemotePreferences" && it.parameterTypes.size == 1
+                        }
+                        method?.invoke(moduleRef, group) as? SharedPreferences
+                    } catch (_: Throwable) {
+                        null
                     }
                 }
 
@@ -78,7 +98,11 @@ class ModernQuotaModule : XposedModule() {
                         val handle = moduleRef.hook(executable)
                             .setExceptionMode(ExceptionMode.PROTECTIVE)
                             .intercept(XposedInterface.Hooker { chain ->
-                                val thisObj = chain.thisObject
+                                val thisObj = try {
+                                    chain.thisObject
+                                } catch (_: Throwable) {
+                                    null
+                                }
                                 val rawArgs = chain.args
                                 val argsArr = Array<Any?>(rawArgs.size) { i -> rawArgs[i] }
                                 if (before != null) {
@@ -119,7 +143,7 @@ class ModernQuotaModule : XposedModule() {
 
             QuotaCoreEngine.install(
                 packageName = pkg,
-                processName = currentProcessName,
+                processName = currentProcessName.ifEmpty { pkg },
                 classLoader = param.classLoader,
                 bridge = bridge
             )

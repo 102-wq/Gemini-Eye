@@ -3,6 +3,7 @@ package com.example.bardquotahook
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.PixelFormat
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -11,22 +12,27 @@ import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.LinearLayout
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Optional System-Wide Floating Capsule Fallback (`TYPE_APPLICATION_OVERLAY`).
- * Works even when Magisk DenyList / Shamiko blocks Xposed injection into Google App,
- * and silently refreshes `https://gemini.google.com/usage` in the background while active.
+ * System-Wide Floating Capsule Controller & Headless Background API Sync Engine.
+ *
+ * Enforces **Single HUD Exclusion**:
+ * - Whenever `ModernQuotaModule` (Xposed API 102) or `QuotaHookEntry` binds to Gemini,
+ *   `enforceSingleHudExclusivity(context)` automatically closes and disables the System Overlay
+ *   so ONLY the single in-app `QuotaHudView` capsule is rendered.
+ * - Even while the System Overlay is hidden, `triggerHeadlessSync(context)` services the in-app
+ *   HUD's Refresh icon button by scraping `https://gemini.google.com/usage` in the background
+ *   and pushing fresh real-time values into `SharedPreferences` and Gemini's HUD.
  */
 object OverlayHudController {
 
     private const val USAGE_URL = "https://gemini.google.com/usage"
 
-    private val containerRef = AtomicReference<WeakReference<LinearLayout>>(WeakReference(null))
+    private val hudRef = AtomicReference<WeakReference<QuotaHudView>>(WeakReference(null))
     private val bgWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
-    private val latestSnapshot = AtomicReference(QuotaHudLayout.Snapshot())
+    private val latestSnapshot = AtomicReference(QuotaHudView.Snapshot())
 
     @Volatile private var wmParams: WindowManager.LayoutParams? = null
     @Volatile private var mainHandler: Handler? = null
@@ -48,51 +54,98 @@ object OverlayHudController {
         }
     }
 
+    /**
+     * Automatically disables and removes the System Overlay as soon as Xposed binds to Gemini.
+     */
+    fun enforceSingleHudExclusivity(context: Context) {
+        val appCtx = context.applicationContext ?: context
+        try {
+            appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("overlay_enabled", false)
+                .apply()
+        } catch (_: Throwable) {
+        }
+        if (isShowing || hudRef.get().get() != null) {
+            hideWindowOnly(appCtx)
+        }
+    }
+
     fun show(context: Context): Boolean {
-        val appCtx = context.applicationContext
+        val appCtx = context.applicationContext ?: context
+        // Single-HUD Exclusion: Do not open System Overlay if Xposed is bound to Gemini
+        if (HookTelemetryReceiver.isXposedActivelyBound(appCtx)) {
+            enforceSingleHudExclusivity(appCtx)
+            return false
+        }
         if (!Settings.canDrawOverlays(appCtx)) return false
-        if (isShowing && containerRef.get().get() != null) {
-            refreshNow(appCtx)
+        if (isShowing && hudRef.get().get() != null) {
+            applySavedPreferences(appCtx)
+            triggerHeadlessSync(appCtx)
             return true
         }
 
-        val saved = HookTelemetryReceiver.loadSnapshot(appCtx)
-        latestSnapshot.set(saved)
+        val savedSnap = HookTelemetryReceiver.loadSnapshot(appCtx)
+        val savedUi = HookTelemetryReceiver.loadUiPrefs(appCtx)
+        latestSnapshot.set(savedSnap)
+
+        try {
+            appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("overlay_enabled", true)
+                .apply()
+        } catch (_: Throwable) {
+        }
 
         runOnUi {
+            if (HookTelemetryReceiver.isXposedActivelyBound(appCtx)) return@runOnUi
             val wm = appCtx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return@runOnUi
+
+            var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            if (savedUi.theme == QuotaHudView.ThemeMode.MIUIX && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                flags = flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+            }
+
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                flags,
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.END
-                x = QuotaHudLayout.dp(appCtx, 12f)
-                y = QuotaHudLayout.dp(appCtx, 56f)
-            }
-            wmParams = params
-
-            val pill = QuotaHudLayout.createContainer(
-                context = appCtx,
-                snapshotProvider = { latestSnapshot.get() },
-                onTapRefresh = { refreshNow(appCtx) },
-                onWindowDrag = { dx, dy ->
-                    // Gravity.END inverts horizontal X offset direction
-                    params.x = maxOf(0, params.x - dx)
-                    params.y = maxOf(0, params.y + dy)
+                x = QuotaHudView.dp(appCtx, 10f)
+                y = QuotaHudView.dp(appCtx, 54f)
+                if (savedUi.theme == QuotaHudView.ThemeMode.MIUIX && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     try {
-                        wm.updateViewLayout(containerRef.get().get(), params)
+                        blurBehindRadius = QuotaHudView.dp(appCtx, 22f)
                     } catch (_: Throwable) {
                     }
                 }
+            }
+            wmParams = params
+
+            val pill = QuotaHudView(
+                context = appCtx,
+                onRefreshClick = { triggerHeadlessSync(appCtx) },
+                onOpenUsageClick = { QuotaHudView.openUsageWebpage(appCtx) },
+                onWindowDrag = { dx, dy ->
+                    params.x = maxOf(0, params.x - dx)
+                    params.y = maxOf(0, params.y + dy)
+                    try {
+                        wm.updateViewLayout(hudRef.get().get(), params)
+                    } catch (_: Throwable) {
+                    }
+                },
+                draggableInFrame = false
             )
-            QuotaHudLayout.bind(appCtx, pill, latestSnapshot.get())
+            pill.applyPreferences(savedUi.lang, savedUi.theme)
+            pill.updateSnapshot(latestSnapshot.get())
+
             try {
                 wm.addView(pill, params)
-                containerRef.set(WeakReference(pill))
+                hudRef.set(WeakReference(pill))
                 isShowing = true
                 ensureBackgroundPoller(appCtx)
             } catch (_: Throwable) {
@@ -103,19 +156,36 @@ object OverlayHudController {
     }
 
     fun hide(context: Context) {
-        val appCtx = context.applicationContext
+        val appCtx = context.applicationContext ?: context
+        try {
+            appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("overlay_enabled", false)
+                .apply()
+        } catch (_: Throwable) {
+        }
+        hideWindowOnly(appCtx)
+        destroyBackgroundWebView()
+    }
+
+    private fun hideWindowOnly(appCtx: Context) {
         runOnUi {
             val wm = appCtx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-            val pill = containerRef.get().get()
+            val pill = hudRef.get().get()
             if (wm != null && pill != null) {
                 try {
                     wm.removeView(pill)
                 } catch (_: Throwable) {
                 }
             }
-            containerRef.set(WeakReference(null))
+            hudRef.set(WeakReference(null))
             isShowing = false
+            HookTelemetryReceiver.notifyUiListeners()
+        }
+    }
 
+    private fun destroyBackgroundWebView() {
+        runOnUi {
             val wv = bgWebViewRef.get().get()
             if (wv != null) {
                 try {
@@ -128,18 +198,48 @@ object OverlayHudController {
         }
     }
 
-    fun updateSnapshot(context: Context, snapshot: QuotaHudLayout.Snapshot) {
-        latestSnapshot.set(snapshot)
-        val appCtx = context.applicationContext
+    fun applySavedPreferences(context: Context) {
+        val appCtx = context.applicationContext ?: context
+        val ui = HookTelemetryReceiver.loadUiPrefs(appCtx)
         runOnUi {
-            val pill = containerRef.get().get() ?: return@runOnUi
-            QuotaHudLayout.bind(appCtx, pill, snapshot)
+            val pill = hudRef.get().get() ?: return@runOnUi
+            pill.applyPreferences(ui.lang, ui.theme)
+
+            val params = wmParams
+            val wm = appCtx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            if (params != null && wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    if (ui.theme == QuotaHudView.ThemeMode.MIUIX) {
+                        params.flags = params.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                        params.blurBehindRadius = QuotaHudView.dp(appCtx, 22f)
+                    } else {
+                        params.flags = params.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+                        params.blurBehindRadius = 0
+                    }
+                    wm.updateViewLayout(pill, params)
+                } catch (_: Throwable) {
+                }
+            }
         }
     }
 
+    fun updateSnapshot(context: Context, snapshot: QuotaHudView.Snapshot) {
+        latestSnapshot.set(snapshot)
+        runOnUi {
+            val pill = hudRef.get().get() ?: return@runOnUi
+            pill.updateSnapshot(snapshot)
+        }
+    }
+
+    /**
+     * Headless background API/WebView sync of `https://gemini.google.com/usage`.
+     * Invoked when clicking the Refresh icon button on `QuotaHudView` (either in-app Xposed HUD
+     * or fallback System Overlay).
+     */
     @SuppressLint("SetJavaScriptEnabled")
-    fun refreshNow(context: Context) {
-        val appCtx = context.applicationContext
+    fun triggerHeadlessSync(context: Context) {
+        val appCtx = context.applicationContext ?: context
+        latestSnapshot.set(HookTelemetryReceiver.loadSnapshot(appCtx))
         runOnUi {
             var wv = bgWebViewRef.get().get()
             if (wv == null) {
@@ -151,8 +251,8 @@ object OverlayHudController {
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {
-                                scrapeWebView(appCtx, view, 1200L)
-                                scrapeWebView(appCtx, view, 3200L)
+                                scrapeWebView(appCtx, view, 1100L)
+                                scrapeWebView(appCtx, view, 3000L)
                             }
                         }
                     }
@@ -169,14 +269,14 @@ object OverlayHudController {
     }
 
     private fun ensureBackgroundPoller(appCtx: Context) {
-        refreshNow(appCtx)
+        triggerHeadlessSync(appCtx)
         schedulePeriodicLoop(appCtx)
     }
 
     private fun schedulePeriodicLoop(appCtx: Context) {
         runOnUi(delayMs = 90_000L) {
             if (!isShowing) return@runOnUi
-            refreshNow(appCtx)
+            triggerHeadlessSync(appCtx)
             schedulePeriodicLoop(appCtx)
         }
     }
@@ -193,7 +293,8 @@ object OverlayHudController {
                             val text = raw.trim('"')
                                 .replace("\\n", "\n")
                                 .replace("\\\"", "\"")
-                            val snap = QuotaTextParser.parseUiBlock(text, latestSnapshot.get(), "UsageWeb")
+                            val baseSnap = HookTelemetryReceiver.loadSnapshot(appCtx)
+                            val snap = QuotaTextParser.parseUiBlock(text, baseSnap, "UsageWeb")
                             if (snap != null) {
                                 HookTelemetryReceiver.pushExternalQuotaToHostApps(appCtx, snap)
                             }

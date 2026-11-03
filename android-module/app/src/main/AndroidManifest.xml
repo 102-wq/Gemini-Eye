@@ -38,6 +38,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.example.bardquotahook.ACTION_HOOK_HEARTBEAT" />
+                <action android:name="com.example.bardquotahook.ACTION_REQUEST_QUOTA_REFRESH" />
             </intent-filter>
         </receiver>
 
