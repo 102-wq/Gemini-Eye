@@ -2,10 +2,17 @@ package com.example.bardquotahook
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AndroidAppHelper
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.text.BoringLayout
 import android.text.TextPaint
 import android.util.Log
 import android.util.TypedValue
@@ -14,10 +21,10 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.TextView
-import android.widget.Toast
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
@@ -26,10 +33,10 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.Reader
 import java.lang.ref.WeakReference
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 
@@ -38,6 +45,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
     companion object {
         private const val TAG = "BardQuota"
         private const val OVERLAY_TAG = "bard_quota_overlay_view"
+        private const val ACTION_QUOTA_SYNC = "com.example.bardquotahook.ACTION_QUOTA_SYNC"
 
         @Volatile private var mainHandler: Handler? = null
 
@@ -50,8 +58,8 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         private val activeActivityRef = AtomicReference<WeakReference<Activity>>(WeakReference(null))
         private val overlayViewRef = AtomicReference<WeakReference<TextView>>(WeakReference(null))
         private val activeWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
+        private val receiverRef = AtomicReference<WeakReference<BroadcastReceiver>>(WeakReference(null))
         private val unhookRefs = CopyOnWriteArrayList<WeakReference<XC_MethodHook.Unhook>>()
-        private val shownToastInProc = AtomicBoolean(false)
 
         @Volatile private var currentLang: Lang = Lang.ZH
         @Volatile private var isCollapsed: Boolean = false
@@ -62,21 +70,30 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
         private val keyRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
             Regex(
-                """["']?([a-zA-Z0-9_]*(?:quota|limit|reset|remaining)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']?([^"',}\]\n]+)["']?""",
+                """["']?([a-zA-Z0-9_]*(?:quota|limit|reset|remaining|cap|usage)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']?([^"',}\]\n]{1,48})["']?""",
                 RegexOption.IGNORE_CASE
             )
         }
 
         private val fiveHourRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(""".*(5\s*(-|\s)?(hour|hr|h|小时)|5h).*""", RegexOption.IGNORE_CASE)
+            Regex(
+                """.*(5\s*(-|\s)?(hour|hr|h|小时)|5h|(\d+\s*/\s*\d+)|remaining|剩余\s*\d+|已用\s*\d+).*""",
+                RegexOption.IGNORE_CASE
+            )
         }
 
         private val weeklyRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(""".*(weekly|week|每周|周限额|7\s*(-|\s)?(day|天)).*""", RegexOption.IGNORE_CASE)
+            Regex(
+                """.*(weekly|week|每周|周限额|daily|每日|7\s*(-|\s)?(day|天)).*""",
+                RegexOption.IGNORE_CASE
+            )
         }
 
         private val resetRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
-            Regex(""".*(resets?\b|重置|恢复|available\s+(in|at)|后重置).*""", RegexOption.IGNORE_CASE)
+            Regex(
+                """.*(resets?\b|重置|恢复|available\s+(in|at)|try\s+again\s+(in|after|at)|until\s+\d|后重置|\d+\s*(h|hr|小时)\s*\d*\s*(m|min|分钟)?).*""",
+                RegexOption.IGNORE_CASE
+            )
         }
 
         private fun logInfo(msg: String) {
@@ -95,32 +112,32 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
     )
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        logInfo("initZygote -> modulePath=${startupParam.modulePath}")
+        logInfo("initZygote -> ${startupParam.modulePath}")
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        logInfo("handleLoadPackage -> pkg=${lpparam.packageName} proc=${lpparam.processName}")
-        if (lpparam.packageName == "android") return
+        // Match ALL processes (:search, :interactor, main UI, remote background services)
+        if (lpparam.packageName == "android" || lpparam.packageName == "com.example.bardquotahook") return
+        logInfo("Loaded pkg=${lpparam.packageName} proc=${lpparam.processName}")
 
-        runCatching { hookActivityLifecycle(lpparam.packageName) }
-            .onFailure { logInfo("hookActivityLifecycle err: ${it.message}") }
-        runCatching { hookFrameworkStaticLayout() }
-            .onFailure { logInfo("hookStaticLayout err: ${it.message}") }
-        runCatching { hookWebViewDomSniffer() }
-            .onFailure { logInfo("hookWebView err: ${it.message}") }
+        // 1. Network / Data-flow hooks (active in BOTH background service processes & UI process)
         runCatching { hookOrgJson() }
-            .onFailure { logInfo("hookOrgJson err: ${it.message}") }
+        runCatching { hookAndroidStringFactory() } // ART redirects new String(byte[]) here!
+        runCatching { hookCronetByteBuffers(lpparam.classLoader) }
         runCatching { hookGsonIfPresent(lpparam.classLoader) }
-            .onFailure { logInfo("hookGson err: ${it.message}") }
-        runCatching { hookRawJsonStrings() }
-            .onFailure { logInfo("hookRawStrings err: ${it.message}") }
+
+        // 2. Obfuscation-proof Framework UI / Compose / Accessibility / WebView hooks
+        runCatching { hookActivityLifecycle() }
+        runCatching { hookComposeBoringAndStaticLayout() }
+        runCatching { hookAccessibilitySemantics() }
+        runCatching { hookWebViewDomSniffer() }
     }
 
     private fun trackUnhook(unhook: XC_MethodHook.Unhook?) {
         if (unhook != null) unhookRefs.add(WeakReference(unhook))
     }
 
-    private fun hookActivityLifecycle(pkg: String) {
+    private fun hookActivityLifecycle() {
         trackUnhook(
             XposedHelpers.findAndHookMethod(
                 Activity::class.java,
@@ -129,21 +146,8 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val activity = param.thisObject as? Activity ?: return
                         if (activity.isFinishing) return
-                        logInfo("onResume -> ${activity.javaClass.name} in $pkg")
-
-                        // Attach unconditionally: inside googlequicksearchbox, R8 obfuscates Gemini's Activity names!
                         activeActivityRef.set(WeakReference(activity))
-                        if (shownToastInProc.compareAndSet(false, true)) {
-                            postToMain {
-                                runCatching {
-                                    Toast.makeText(
-                                        activity.applicationContext,
-                                        "Gemini-Eye 已挂载 ($pkg)",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                }
-                            }
-                        }
+                        registerCrossProcessReceiver(activity)
                         attachOrUpdateOverlay()
                         scheduleWebViewPoll()
                     }
@@ -159,6 +163,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val destroyed = param.thisObject as? Activity ?: return
                         if (activeActivityRef.get().get() === destroyed) {
+                            unregisterCrossProcessReceiver(destroyed)
                             activeActivityRef.set(WeakReference(null))
                             overlayViewRef.set(WeakReference(null))
                         }
@@ -169,12 +174,58 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         )
     }
 
-    private fun hookFrameworkStaticLayout() {
-        val builderClass = XposedHelpers.findClassIfExists(
-            "android.text.StaticLayout\$Builder",
-            null
-        ) ?: return
+    /**
+     * Bridges multi-process data: background network processes (:interactor / :search)
+     * broadcast extracted quota fields to the foreground UI Activity process.
+     */
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private fun registerCrossProcessReceiver(activity: Activity) {
+        if (receiverRef.get().get() != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != ACTION_QUOTA_SYNC) return
+                val prev = latestSnapshot.get()
+                val five = intent.getStringExtra("five") ?: prev.fiveHourQuota
+                val week = intent.getStringExtra("week") ?: prev.weeklyLimit
+                val reset = intent.getStringExtra("reset") ?: prev.resetTimer
+                val src = intent.getStringExtra("src") ?: "IPC"
+                applyLocalSnapshot(five, week, reset, src)
+            }
+        }
+        runCatching {
+            val filter = IntentFilter(ACTION_QUOTA_SYNC)
+            if (Build.VERSION.SDK_INT >= 33) {
+                activity.applicationContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                activity.applicationContext.registerReceiver(receiver, filter)
+            }
+            receiverRef.set(WeakReference(receiver))
+        }
+    }
 
+    private fun unregisterCrossProcessReceiver(activity: Activity) {
+        val receiver = receiverRef.get().get() ?: return
+        runCatching { activity.applicationContext.unregisterReceiver(receiver) }
+        receiverRef.set(WeakReference(null))
+    }
+
+    /**
+     * Jetpack Compose measures single-line Text via BoringLayout.isBoring() and multi-line Text
+     * via StaticLayout$Builder.obtain(). Both live in Android framework (immune to R8 obfuscation).
+     */
+    private fun hookComposeBoringAndStaticLayout() {
+        XposedBridge.hookAllMethods(
+            BoringLayout::class.java,
+            "isBoring",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val cs = param.args.firstOrNull() as? CharSequence ?: return
+                    if (cs.length in 3..240) inspectUiText(cs.toString(), "Compose1L")
+                }
+            }
+        ).forEach { trackUnhook(it) }
+
+        val builderClass = XposedHelpers.findClassIfExists("android.text.StaticLayout\$Builder", null) ?: return
         trackUnhook(
             XposedHelpers.findAndHookMethod(
                 builderClass,
@@ -187,10 +238,76 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val cs = param.args[0] as? CharSequence ?: return
-                        if (cs.length !in 3..300) return
-                        val text = cs.toString()
-                        if (text.startsWith("用量监控") || text.startsWith("Usage Limits") || text.startsWith("👁")) return
-                        scanRenderedLines(text, "Compose")
+                        if (cs.length in 3..300) inspectUiText(cs.toString(), "ComposeML")
+                    }
+                }
+            )
+        )
+    }
+
+    /**
+     * Catches Compose Semantics & native Accessibility text / contentDescriptions.
+     */
+    private fun hookAccessibilitySemantics() {
+        val hook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val cs = param.args.firstOrNull() as? CharSequence ?: return
+                if (cs.length in 3..240) inspectUiText(cs.toString(), "Semantics")
+            }
+        }
+        XposedBridge.hookAllMethods(AccessibilityNodeInfo::class.java, "setText", hook)
+            .forEach { trackUnhook(it) }
+        XposedBridge.hookAllMethods(AccessibilityNodeInfo::class.java, "setContentDescription", hook)
+            .forEach { trackUnhook(it) }
+    }
+
+    /**
+     * On Android ART, `new String(byte[], ...)` compiles to `java.lang.StringFactory.newStringFromBytes`.
+     * Hooking StringFactory intercepts Protobuf-Lite UTF-8 strings, batchexecute JSON, and gRPC payloads!
+     */
+    private fun hookAndroidStringFactory() {
+        val factoryClass = XposedHelpers.findClassIfExists("java.lang.StringFactory", null) ?: return
+        XposedBridge.hookAllMethods(
+            factoryClass,
+            "newStringFromBytes",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val str = param.result as? String ?: return
+                    if (str.length in 6..262_144 && containsTargetKeyword(str)) {
+                        parseRawPayload(str, "ARTBytes")
+                    }
+                }
+            }
+        ).forEach { trackUnhook(it) }
+    }
+
+    /**
+     * Intercepts Cronet native network read ByteBuffers across background network processes.
+     */
+    private fun hookCronetByteBuffers(classLoader: ClassLoader) {
+        val callbackCls = XposedHelpers.findClassIfExists("org.chromium.net.UrlRequest\$Callback", classLoader)
+        if (callbackCls != null) {
+            logInfo("Found Cronet UrlRequest.Callback in $classLoader")
+        }
+        // Hook ByteBuffer.flip() used right after Cronet fills response buffers
+        trackUnhook(
+            XposedHelpers.findAndHookMethod(
+                ByteBuffer::class.java,
+                "flip",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val buf = param.thisObject as? ByteBuffer ?: return
+                        val rem = buf.remaining()
+                        if (rem !in 24..131_072) return
+                        runCatching {
+                            val dup = buf.duplicate()
+                            val bytes = ByteArray(rem)
+                            dup.get(bytes)
+                            val text = String(bytes, StandardCharsets.UTF_8)
+                            if (containsTargetKeyword(text)) {
+                                parseRawPayload(text, "CronetBuf")
+                            }
+                        }
                     }
                 }
             )
@@ -214,7 +331,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     private fun scheduleWebViewPoll() {
-        postToMain(delayMs = 1200L) {
+        postToMain(delayMs = 1000L) {
             val wv = activeWebViewRef.get().get() ?: return@postToMain
             if (!wv.isShown) return@postToMain
             runCatching {
@@ -223,14 +340,15 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 ) { rawJsString ->
                     if (!rawJsString.isNullOrBlank() && rawJsString != "null") {
                         val unescaped = rawJsString.trim('"').replace("\\n", "\n")
-                        scanRenderedLines(unescaped, "WebView")
+                        inspectUiText(unescaped, "WebView")
                     }
                 }
             }
         }
     }
 
-    private fun scanRenderedLines(block: String, source: String) {
+    private fun inspectUiText(block: String, source: String) {
+        if (block.startsWith("用量监控") || block.startsWith("Usage Limits") || block.startsWith("👁")) return
         val prev = latestSnapshot.get()
         var fiveHour = prev.fiveHourQuota
         var weekly = prev.weeklyLimit
@@ -254,7 +372,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             }
         }
 
-        if (hit) updateSnapshot(fiveHour, weekly, reset, source)
+        if (hit) publishSnapshotAcrossProcesses(fiveHour, weekly, reset, source)
     }
 
     private fun hookOrgJson() {
@@ -278,38 +396,20 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         val gsonClass = XposedHelpers.findClassIfExists("com.google.gson.Gson", classLoader) ?: return
         XposedBridge.hookAllMethods(gsonClass, "fromJson", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                when (val input = param.args.firstOrNull()) {
-                    is String -> if (containsTargetKeyword(input)) parseRawPayload(input, "Gson")
-                    is Reader -> Unit
-                }
+                val input = param.args.firstOrNull() as? String ?: return
+                if (containsTargetKeyword(input)) parseRawPayload(input, "Gson")
             }
         }).forEach { trackUnhook(it) }
-    }
-
-    private fun hookRawJsonStrings() {
-        trackUnhook(
-            XposedHelpers.findAndHookConstructor(
-                String::class.java,
-                ByteArray::class.java,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                java.nio.charset.Charset::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val str = param.thisObject as? String ?: return
-                        if (str.length in 16..262_144 && containsTargetKeyword(str)) {
-                            parseRawPayload(str, "UTF8")
-                        }
-                    }
-                }
-            )
-        )
     }
 
     private fun containsTargetKeyword(text: String): Boolean {
         return text.contains("quota", ignoreCase = true) ||
             text.contains("limit", ignoreCase = true) ||
-            text.contains("reset", ignoreCase = true)
+            text.contains("reset", ignoreCase = true) ||
+            text.contains("remaining", ignoreCase = true) ||
+            text.contains("小时") ||
+            text.contains("限额") ||
+            text.contains("重置")
     }
 
     private fun inspectJsonObject(json: JSONObject, source: String) {
@@ -354,6 +454,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             extracted[match.groupValues[1].lowercase()] = match.groupValues[2]
         }
         if (extracted.isNotEmpty()) mergeExtractedFields(extracted, source)
+        inspectUiText(cleaned, source)
     }
 
     private fun mergeExtractedFields(fields: Map<String, String>, source: String) {
@@ -364,20 +465,39 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
         for ((k, v) in fields) {
             when {
-                k.contains("5h") || k.contains("window") || k.contains("quota") -> fiveHour = v
-                k.contains("week") || k.contains("limit") -> weekly = v
+                k.contains("5h") || k.contains("window") || k.contains("quota") || k.contains("remaining") -> fiveHour = v
+                k.contains("week") || k.contains("limit") || k.contains("cap") -> weekly = v
                 k.contains("reset") || k.contains("expire") -> reset = v
             }
         }
-        updateSnapshot(fiveHour, weekly, reset, source)
+        publishSnapshotAcrossProcesses(fiveHour, weekly, reset, source)
     }
 
-    private fun updateSnapshot(fiveHour: String, weekly: String, reset: String, source: String) {
+    private fun publishSnapshotAcrossProcesses(fiveHour: String, weekly: String, reset: String, source: String) {
+        val changed = applyLocalSnapshot(fiveHour, weekly, reset, source)
+        if (!changed) return
+
+        // Broadcast to UI process in case this hook fired inside :interactor or :search process
+        runCatching {
+            val appCtx = AndroidAppHelper.currentApplication() ?: activeActivityRef.get().get()?.applicationContext
+            appCtx?.sendBroadcast(
+                Intent(ACTION_QUOTA_SYNC).apply {
+                    putExtra("five", fiveHour)
+                    putExtra("week", weekly)
+                    putExtra("reset", reset)
+                    putExtra("src", source)
+                }
+            )
+        }
+    }
+
+    private fun applyLocalSnapshot(fiveHour: String, weekly: String, reset: String, source: String): Boolean {
         val prev = latestSnapshot.get()
-        if (prev.fiveHourQuota == fiveHour && prev.weeklyLimit == weekly && prev.resetTimer == reset) return
+        if (prev.fiveHourQuota == fiveHour && prev.weeklyLimit == weekly && prev.resetTimer == reset) return false
         logInfo("[$source] 5h=$fiveHour | week=$weekly | reset=$reset")
         latestSnapshot.set(QuotaSnapshot(fiveHour, weekly, reset, source))
         attachOrUpdateOverlay()
+        return true
     }
 
     @SuppressLint("ClickableViewAccessibility")
