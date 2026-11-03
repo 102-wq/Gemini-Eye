@@ -88,7 +88,21 @@ export function buildZipBlob(entries: ZipEntryInput[]): Blob {
   ev.setUint32(16, offset, true);
   ev.setUint16(20, 0, true);
 
-  return new Blob([...localChunks, ...centralChunks, eocd], {
+  const totalSize = offset + centralSize + eocd.length;
+  const archiveBuffer = new ArrayBuffer(totalSize);
+  const archiveBytes = new Uint8Array(archiveBuffer);
+  let cursor = 0;
+  for (const chunk of localChunks) {
+    archiveBytes.set(chunk, cursor);
+    cursor += chunk.length;
+  }
+  for (const chunk of centralChunks) {
+    archiveBytes.set(chunk, cursor);
+    cursor += chunk.length;
+  }
+  archiveBytes.set(eocd, cursor);
+
+  return new Blob([archiveBuffer], {
     type: 'application/zip',
   });
 }

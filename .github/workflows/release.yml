@@ -44,7 +44,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.4.${{ github.run_number }}
-          name: Gemini-Eye v1.4.${{ github.run_number }}
-          body: "**IMPORTANT (First-time upgrade to v1.4)**: Uninstall any older Gemini-Eye APK once before installing (v1.4+ now uses a fixed signing key for all future updates). After installing, open **Gemini-Eye**, enable both **Gemini** and **Google** (unhide System apps in LSPosed), and Force Stop **Google**."
+          tag_name: v1.5.${{ github.run_number }}
+          name: Gemini-Eye v1.5.${{ github.run_number }}
+          body: "**v1.5 Multi-Process & Android 11+ Visibility Update**: Fixed Android 11+ `<queries>` package visibility false-positive in HUD launcher, added cross-process `BroadcastReceiver` IPC for `:interactor`/`:search` background processes, and added R8-immune ART `StringFactory` + Compose `BoringLayout` + Cronet `ByteBuffer` quota extractors."
           files: Gemini-Eye.apk
