@@ -280,7 +280,7 @@ object QuotaHudLayout {
 
         val metricsText = TextView(activity).apply {
             tag = TAG_METRICS
-            setSingleLine(true)
+            isSingleLine = true
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             includeFontPadding = false
@@ -299,7 +299,7 @@ object QuotaHudLayout {
 
         val langBadge = TextView(activity).apply {
             tag = TAG_LANG
-            setSingleLine(true)
+            isSingleLine = true
             maxLines = 1
             includeFontPadding = false
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
@@ -614,7 +614,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         }
     }
 
-    private enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }
+    enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
         safeTry("initZygote") {
@@ -648,7 +648,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     private fun findClassSafe(name: String, cl: ClassLoader? = null): Class<*>? {
         return try {
-            XposedHelpers.findClass(name, cl)
+            XposedHelpers.findClassIfExists(name, cl)
         } catch (_: Throwable) {
             null
         }
@@ -793,7 +793,8 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val cb = param.result as? CharBuffer ?: return
-                    if (cb.length !in 6..262_144) return
+                    val rem = cb.remaining()
+                    if (rem !in 6..262_144) return
                     val str = cb.toString()
                     if (!fastHasQuotaKeyword(str)) return
                     withReentrancyGuard {
@@ -1278,12 +1279,12 @@ jobs:
         run: yes | "\$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Setup Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.9'
 
       - name: Build Signed Single-DEX Release APK
-        run: gradle assembleRelease --no-daemon
+        run: gradle assembleRelease --no-daemon --stacktrace
 
       - name: Upload Compiled APK
         uses: actions/upload-artifact@v4

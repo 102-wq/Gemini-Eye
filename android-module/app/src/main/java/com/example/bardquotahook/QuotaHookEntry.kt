@@ -150,7 +150,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
         }
     }
 
-    private enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }
+    enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
         safeTry("initZygote") {
@@ -190,7 +190,7 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     private fun findClassSafe(name: String, cl: ClassLoader? = null): Class<*>? {
         return try {
-            XposedHelpers.findClass(name, cl)
+            XposedHelpers.findClassIfExists(name, cl)
         } catch (_: Throwable) {
             null
         }
@@ -353,7 +353,8 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val cb = param.result as? CharBuffer ?: return
-                    if (cb.length !in 6..262_144) return
+                    val rem = cb.remaining()
+                    if (rem !in 6..262_144) return
                     val str = cb.toString()
                     if (!fastHasQuotaKeyword(str)) return
                     withReentrancyGuard {

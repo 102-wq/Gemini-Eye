@@ -135,7 +135,7 @@ object QuotaHudLayout {
 
         val metricsText = TextView(activity).apply {
             tag = TAG_METRICS
-            setSingleLine(true)
+            isSingleLine = true
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             includeFontPadding = false
@@ -154,7 +154,7 @@ object QuotaHudLayout {
 
         val langBadge = TextView(activity).apply {
             tag = TAG_LANG
-            setSingleLine(true)
+            isSingleLine = true
             maxLines = 1
             includeFontPadding = false
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
