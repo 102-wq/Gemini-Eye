@@ -38,10 +38,10 @@ const SAMPLE_PAYLOADS: Array<{
 }> = [
   {
     id: 'reference-spec',
-    labelZh: '基准胶囊规范示例 · 15% (1h52m) / 29% (23h52m)',
-    labelEn: 'Reference Capsule Spec · 15% (1h52m) / 29% (23h52m)',
-    source: 'UsageWeb',
-    raw: 'Usage limits\n5-hour window\n15% used · Resets in 1 hr 52 min\nWeekly limit\n29% used · Resets in 23 hr 52 min',
+    labelZh: 'Cronet ProtoBuf 二进制流 · 15% (1h52m) / 29% (23h52m)',
+    labelEn: 'Cronet ProtoBuf Stream · 15% (1h52m) / 29% (23h52m)',
+    source: 'Cronet-PB',
+    raw: 'gRPC Frame [0x00, 0x00000028] -> Window1{used=15, limit=100, ts=+6720s} | Window2{used=29, limit=100, ts=+85920s}',
     parsed: {
       fiveHourPct: 15,
       fiveHourQuota: '15%',
@@ -49,15 +49,15 @@ const SAMPLE_PAYLOADS: Array<{
       weeklyPct: 29,
       weeklyLimit: '29%',
       weeklyReset: '23h52m',
-      source: 'UsageWeb',
+      source: 'Cronet-PB',
     },
   },
   {
-    id: 'compose-cn',
-    labelZh: '中文用量页嗅探 · 42% (3h18m) / 64% (4d12h)',
-    labelEn: 'CN Usage Sniff · 42% (3h18m) / 64% (4d12h)',
-    source: 'Compose',
-    raw: '用量与限额\n当前 5 小时窗口\n已使用 42%\n3 小时 18 分钟后重置\n每周限额\n已使用 64%\n4 天 12 小时后重置',
+    id: 'grpc-stream',
+    labelZh: 'gRPC ClientInterceptor 帧解析 · 42% (3h18m) / 64% (4d12h)',
+    labelEn: 'gRPC ClientInterceptor Frame · 42% (3h18m) / 64% (4d12h)',
+    source: 'gRPC-PB',
+    raw: 'io.grpc.ClientCall$Listener.onMessage -> ProtoBuf{f5h=0.42, ts=+11880s, fWk=0.64, ts=+388800s}',
     parsed: {
       fiveHourPct: 42,
       fiveHourQuota: '42%',
@@ -65,15 +65,15 @@ const SAMPLE_PAYLOADS: Array<{
       weeklyPct: 64,
       weeklyLimit: '64%',
       weeklyReset: '4d12h',
-      source: 'Compose',
+      source: 'gRPC-PB',
     },
   },
   {
-    id: 'high-load',
-    labelZh: '高负载预警阈值测试 · 84% (28m) / 92% (11h05m)',
-    labelEn: 'High-Usage Threshold · 84% (28m) / 92% (11h05m)',
-    source: 'SharedPrefs',
-    raw: '{"five_hour_quota":"84%","five_reset":"28m","weekly_limit":"92%","weekly_reset":"11h05m"}',
+    id: 'stateflow-vm',
+    labelZh: 'ViewModel / StateFlow 内存态捕获 · 84% (28m) / 92% (11h05m)',
+    labelEn: 'ViewModel / StateFlow Memory · 84% (28m) / 92% (11h05m)',
+    source: 'StateFlow',
+    raw: 'StateFlowImpl.setValue -> QuotaState(fiveHour=84%, reset=28m, weekly=92%, reset=11h05m)',
     parsed: {
       fiveHourPct: 84,
       fiveHourQuota: '84%',
@@ -81,7 +81,7 @@ const SAMPLE_PAYLOADS: Array<{
       weeklyPct: 92,
       weeklyLimit: '92%',
       weeklyReset: '11h05m',
-      source: 'SharedPrefs',
+      source: 'StateFlow',
     },
   },
 ];
@@ -92,7 +92,7 @@ export default function App() {
   const [hudTheme, setHudTheme] = useState<HudTheme>('MIUIX');
   const [activeView, setActiveView] = useState<ActiveView>('simulator');
   const [selectedPath, setSelectedPath] = useState<string>(
-    'app/src/main/java/com/example/bardquotahook/QuotaHudView.kt'
+    'app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt'
   );
   const [fileQuery, setFileQuery] = useState('');
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
@@ -169,7 +169,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'Gemini-Eye-v1.9.1-Android-Project.zip';
+    link.download = 'Gemini-Eye-v2.0.0-Android-Project.zip';
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -190,8 +190,8 @@ export default function App() {
     setIsRefreshingHud(true);
     setLastSyncNote(
       isZh
-        ? '已调用 QuotaSyncProvider.requestBackgroundRefresh -> 后台同步 gemini.google.com/usage 并通过 ContentObserver 实时推送到所有 HUD'
-        : 'Invoked QuotaSyncProvider.requestBackgroundRefresh -> synced gemini.google.com/usage and notified all HUD observers'
+        ? '已触发进程内重扫：扫描 com.google.android.apps.bard 内存中的 ViewModel / StateFlow / LiveData / Repository 与最近一次 Cronet/gRPC ProtoBuf 快照（零网页轮询）'
+        : 'Triggered strictly in-app scan: inspected live ViewModel / StateFlow / LiveData / Repository holders & latest Cronet/gRPC ProtoBuf frame inside com.google.android.apps.bard (zero web polling)'
     );
     setTimeout(() => {
       setIsRefreshingHud(false);
@@ -297,9 +297,9 @@ export default function App() {
             Gemini-Eye
           </div>
           <div className="mt-1 text-xs text-slate-500">
-            <span>QuotaHudView · API 102 + 82</span>
+            <span>In-App gRPC/Cronet · API 102 + 82</span>
             <span aria-hidden="true"> · </span>
-            <span>v1.9.1</span>
+            <span>v2.0.0</span>
           </div>
         </div>
 
@@ -347,7 +347,7 @@ export default function App() {
           >
             <FolderGit2 className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? 'v1.9.1 统一数据源与修复说明' : 'v1.9.1 Unified Sync & Fixes'}
+              {isZh ? 'v2.0.0 纯进程内拦截架构说明' : 'v2.0.0 Pure In-App Hook Spec'}
             </span>
           </button>
         </nav>
@@ -398,8 +398,8 @@ export default function App() {
                 : activeView === 'files'
                 ? currentFile.path
                 : isZh
-                ? 'v1.9.1 统一数据源与资源本地化规范'
-                : 'v1.9.1 Unified Sync & Localization Spec'}
+                ? 'v2.0.0 纯进程内 Cronet/gRPC 与 ViewModel 架构'
+                : 'v2.0.0 Pure In-App Cronet/gRPC & ViewModel Spec'}
             </span>
           </div>
 
@@ -412,11 +412,11 @@ export default function App() {
             <span>
               {zipDownloaded
                 ? isZh
-                  ? '已导出 v1.9.1 工程 .zip'
-                  : 'v1.9.1 .zip Downloaded'
+                  ? '已导出 v2.0.0 工程 .zip'
+                  : 'v2.0.0 .zip Downloaded'
                 : isZh
-                ? '导出 v1.9.1 Android 工程 (.zip)'
-                : 'Export v1.9.1 Project (.zip)'}
+                ? '导出 v2.0.0 Android 工程 (.zip)'
+                : 'Export v2.0.0 Project (.zip)'}
             </span>
           </button>
         </header>
@@ -424,17 +424,6 @@ export default function App() {
         {/* Workspace Toolbar */}
         <div className="px-6 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaHudView.kt');
-                setActiveView('files');
-              }}
-              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
-            >
-              QuotaHudView.kt
-            </button>
-            <span aria-hidden="true">·</span>
             <button
               type="button"
               onClick={() => {
@@ -449,23 +438,45 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaSyncProvider.kt');
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaHookEntry.kt');
                 setActiveView('files');
               }}
               className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
             >
-              QuotaSyncProvider.kt
+              QuotaHookEntry.kt
             </button>
             <span aria-hidden="true">·</span>
             <button
               type="button"
               onClick={() => {
-                setSelectedPath('app/src/main/res/values/strings.xml');
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaCoreEngine.kt');
                 setActiveView('files');
               }}
               className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
             >
-              strings.xml
+              QuotaCoreEngine.kt
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaTextParser.kt');
+                setActiveView('files');
+              }}
+              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
+            >
+              QuotaTextParser.kt
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaHudView.kt');
+                setActiveView('files');
+              }}
+              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
+            >
+              QuotaHudView.kt
             </button>
           </div>
 
@@ -799,7 +810,7 @@ export default function App() {
                       >
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-mono font-semibold text-blue-500">
-                            https://gemini.google.com/usage
+                            com.example.bardquotahook.MainActivity
                           </span>
                           <button
                             type="button"
@@ -811,11 +822,11 @@ export default function App() {
                         </div>
                         <div className="text-xs space-y-1">
                           <div>
-                            5-hour quota: <strong>{activeSample.parsed.fiveHourQuota}</strong> (resets in{' '}
+                            5h ({activeSample.source}): <strong>{activeSample.parsed.fiveHourQuota}</strong> (
                             {activeSample.parsed.fiveHourReset})
                           </div>
                           <div>
-                            Weekly quota: <strong>{activeSample.parsed.weeklyLimit}</strong> (resets in{' '}
+                            Weekly ({activeSample.source}): <strong>{activeSample.parsed.weeklyLimit}</strong> (
                             {activeSample.parsed.weeklyReset})
                           </div>
                         </div>
@@ -986,13 +997,13 @@ export default function App() {
               <div>
                 <h1 className="text-2xl font-bold tracking-tight text-slate-900">
                   {isZh
-                    ? 'v1.9.1 单一统一数据源与本地化字符串修复说明'
-                    : 'v1.9.1 Unified Data Source & Localized String Resources'}
+                    ? 'v2.0.0 纯进程内 Cronet/gRPC 二进制流与 ViewModel 内存拦截说明'
+                    : 'v2.0.0 Purely In-App Cronet/gRPC ProtoBuf & ViewModel Interception'}
                 </h1>
                 <p className="mt-1.5 text-sm text-slate-600 max-w-3xl leading-relaxed">
                   {isZh
-                    ? '通过导出型 QuotaSyncProvider + forceQueryable 解决 Android 11–15 跨进程可见性与广播冻结导致的额度不同步问题，并引入严格数值清洗与 Android 标准中英字符串资源。'
-                    : 'Resolves cross-process quota sync via an exported QuotaSyncProvider with forceQueryable package visibility, strict metric sanitization, and localized values/strings.xml + values-zh/strings.xml.'}
+                    ? '彻底移除所有外部网页回退与 HTTP 轮询（同时移除 AndroidManifest 的 INTERNET 权限），100% 严格在 com.google.android.apps.bard 进程内提取实时用量数据。'
+                    : 'Completely eliminates web fallbacks, HTTP polling, and the AndroidManifest INTERNET permission—extracting quota strictly inside the com.google.android.apps.bard process.'}
                 </p>
               </div>
 
@@ -1000,39 +1011,39 @@ export default function App() {
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '01. 单一权威跨进程数据源 (QuotaSyncProvider.kt + forceQueryable)'
-                      : '01. Single Authoritative Cross-Process Store (QuotaSyncProvider.kt)'}
+                      ? '01. Native Cronet & gRPC 字节流拦截与 ProtoBuf 二进制线格式扫描'
+                      : '01. Native Cronet & gRPC Interception + Binary ProtoBuf Wire Scanner'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? 'Android 11+ 默认限制宿主反向查询模块包名，导致 Gemini 内发出的广播被系统静默拦截，且各自私有 SharedPreferences 处于隔离沙盒。v1.9.1 在 AndroidManifest.xml 开启 android:forceQueryable="true" 并注册 QuotaSyncProvider，使 Gemini 应用内 HUD、设置页实时预览与后台同步引擎读写同一个权威数据源，并通过 ContentObserver 毫秒级实时推送变更。'
-                      : 'Android 11+ asymmetric package visibility previously blocked broadcasts from Gemini to the module. Adding android:forceQueryable="true" and QuotaSyncProvider unifies all HUD views onto one authoritative store with live ContentObserver notifications.'}
+                      ? '钩挂 org.chromium.net.UrlRequest / BidirectionalStream 回调（使用 ByteBuffer.duplicate() 非破坏性切片）以及 io.grpc.ClientInterceptor / Channel / ClientCall.Listener，自动解包 gRPC 5 字节帧头与 GZIP 压缩载荷，递归解析 ProtoBuf Wire Tag 中的 google.protobuf.Timestamp 重置时间戳与百分比/配额数值对。'
+                      : 'Hooks org.chromium.net.UrlRequest / BidirectionalStream callbacks (non-destructively via ByteBuffer.duplicate()) and io.grpc.ClientInterceptor / Channel / ClientCall.Listener, unwrapping 5-byte gRPC frames and scanning ProtoBuf wire tags for 5h/Weekly reset epochs and usage ratios.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '02. 严格额度白名单清洗与防对话文本污染 (QuotaTextParser.kt)'
-                      : '02. Strict Quota Sanitizer & Zero Chat Text Contamination (QuotaTextParser.kt)'}
+                      ? '02. ViewModel / StateFlow / LiveData / Repository 内存钩子（全 Throwable 安全防护）'
+                      : '02. ViewModel / StateFlow / LiveData / Repository Hooks (100% Throwable-Safe)'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '彻底移除 QuotaCoreEngine 对聊天正文布局的宽泛抓取与 normalizeValue 原文截断回退逻辑；新增 sanitizeQuotaMetric 与 sanitizeResetToken 严格白名单校验（仅允许合法百分比、比例及重置倒计时），并在读取旧缓存时自动清除任何历史残留的配置描述文本。'
-                      : 'Removed broad chat-text layout scraping and raw string truncation fallbacks; added strict whitelist validators (sanitizeQuotaMetric & sanitizeResetToken) and automatic cache sanitization so chat or config text can never appear in HUD TextViews.'}
+                      ? '追踪 androidx.lifecycle.ViewModel 实例、StateFlowImpl.setValue/updateState 与 LiveData 变更，结合 O(1) 类型判定缓存与 DEX / Hilt 单例对象图遍历（同时动态发现隔离 Chimera ClassLoader 中的 Cronet/gRPC 实例）；全部反射查找均包裹在 try-catch (Throwable) 中以抵御 R8 混淆变更。'
+                      : 'Hooks ViewModel constructors, StateFlowImpl, and LiveData updates alongside a background DEX & DI singleton scanner; every reflection lookup is wrapped in try-catch (Throwable) to stay crash-proof across R8-obfuscated Gemini builds.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '03. 标准 Android 本地化双语资源 (res/values & res/values-zh)'
-                      : '03. Proper Localized String Resources (values/strings.xml & values-zh/strings.xml)'}
+                      ? '03. 单行胶囊 HUD 视觉规范与 ModernQuotaModule (API 102) 自动互斥'
+                      : '03. Single-Line Pill HUD Spec & ModernQuotaModule (API 102) Overlay Suppression'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '新增完整的英文默认资源 res/values/strings.xml 与简体中文资源 res/values-zh/strings.xml，通过 createConfigurationContext 动态切换 Locale，规范渲染 "5h" / "每周" (CN) 与 "5h" / "Weekly" (EN) 及设置界面文案。'
-                      : 'Added complete English (res/values/strings.xml) and Chinese (res/values-zh/strings.xml) string resources resolved via Configuration locale contexts for clean EN/CN toggling.'}
+                      ? '完整保留单行胶囊布局（5h 百分比+倒计时 | 每周/Weekly 百分比+倒计时 | 应用内重扫与设置按钮）、MIUIX 毛玻璃与 MD3 动态取色双主题切换，并在 ModernQuotaModule (API 102) 绑定成功时立即自动抑制 App 系统悬浮窗。'
+                      : 'Preserves the exact single-line capsule HUD (5h % + reset | Weekly % + reset, MIUIX / MD3 theme toggle, EN / CN i18n) and automatically suppresses the App System Overlay as soon as ModernQuotaModule (API 102) binds.'}
                   </p>
                 </div>
               </div>

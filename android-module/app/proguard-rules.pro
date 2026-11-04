@@ -1,6 +1,10 @@
 -dontwarn de.robv.android.xposed.**
 -dontwarn io.github.libxposed.**
 -dontwarn io.github.libxposed.annotation.**
+-dontwarn org.chromium.net.**
+-dontwarn io.grpc.**
+-dontwarn kotlinx.coroutines.**
+-dontwarn androidx.lifecycle.**
 -adaptresourcefilecontents META-INF/xposed/java_init.list
 
 -keep,allowoptimization public class com.example.bardquotahook.ModernQuotaModule {

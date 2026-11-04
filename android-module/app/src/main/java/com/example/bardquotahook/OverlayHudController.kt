@@ -1,6 +1,5 @@
 package com.example.bardquotahook
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.database.ContentObserver
 import android.graphics.PixelFormat
@@ -10,27 +9,20 @@ import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * System-Wide Floating Capsule Controller & Headless Background API Sync Engine.
+ * Passive Fallback System Overlay Controller (`OverlayHudController`).
  *
- * Connected directly to `QuotaSyncProvider` (single unified data source):
- * - Enforces **Single HUD Exclusion**: automatically closes the fallback System Overlay whenever
- *   Xposed (`ModernQuotaModule` API 102 or `QuotaHookEntry` API 82) binds to Gemini.
- * - Services background `https://gemini.google.com/usage` sync requests from ANY HUD view and
- *   publishes sanitized values into `QuotaSyncProvider`.
+ * Strictly zero external HTTP polling or web fallback:
+ * - Enforces **Single-HUD Exclusion**: automatically suppresses and removes the App System Overlay
+ *   as soon as `ModernQuotaModule` (API 102) or `QuotaHookEntry` (API 82) binds to Gemini.
+ * - Displays values solely from `QuotaSyncProvider` and dispatches in-process memory scan pings.
  */
 object OverlayHudController {
 
-    private const val USAGE_URL = "https://gemini.google.com/usage"
-
     private val hudRef = AtomicReference<WeakReference<QuotaHudView>>(WeakReference(null))
-    private val bgWebViewRef = AtomicReference<WeakReference<WebView>>(WeakReference(null))
     private val latestSnapshot = AtomicReference(QuotaHudView.Snapshot())
 
     @Volatile private var wmParams: WindowManager.LayoutParams? = null
@@ -55,7 +47,7 @@ object OverlayHudController {
     }
 
     /**
-     * Automatically disables and removes the System Overlay as soon as Xposed binds to Gemini.
+     * Automatically suppresses and removes the App System Overlay whenever Xposed binds to Gemini.
      */
     fun enforceSingleHudExclusivity(context: Context) {
         val appCtx = context.applicationContext ?: context
@@ -114,7 +106,7 @@ object OverlayHudController {
         if (!Settings.canDrawOverlays(appCtx)) return false
         if (isShowing && hudRef.get().get() != null) {
             updateFromUnifiedState(appCtx, state)
-            triggerHeadlessSync(appCtx)
+            QuotaSyncProvider.requestInProcessRefresh(appCtx, appCtx.packageName)
             return true
         }
 
@@ -153,8 +145,12 @@ object OverlayHudController {
 
             val pill = QuotaHudView(
                 context = appCtx,
-                onRefreshClick = { triggerHeadlessSync(appCtx) },
-                onOpenUsageClick = { QuotaHudView.openUsageWebpage(appCtx) },
+                onRefreshClick = {
+                    QuotaSyncProvider.requestInProcessRefresh(appCtx, appCtx.packageName)
+                },
+                onOpenUsageClick = {
+                    QuotaHudView.openModuleSettings(appCtx)
+                },
                 onWindowDrag = { dx, dy ->
                     params.x = maxOf(0, params.x - dx)
                     params.y = maxOf(0, params.y + dy)
@@ -178,7 +174,7 @@ object OverlayHudController {
                         updateFromUnifiedState(appCtx, s)
                     }
                 }
-                ensureBackgroundPoller(appCtx)
+                QuotaSyncProvider.requestInProcessRefresh(appCtx, appCtx.packageName)
             } catch (_: Throwable) {
                 isShowing = false
             }
@@ -190,7 +186,6 @@ object OverlayHudController {
         val appCtx = context.applicationContext ?: context
         QuotaSyncProvider.updatePreferences(appCtx, overlayEnabled = false)
         hideWindowOnly(appCtx)
-        destroyBackgroundWebView()
     }
 
     private fun hideWindowOnly(appCtx: Context) {
@@ -208,121 +203,6 @@ object OverlayHudController {
             hudRef.set(WeakReference(null))
             isShowing = false
             HookTelemetryReceiver.notifyUiListeners()
-        }
-    }
-
-    private fun destroyBackgroundWebView() {
-        runOnUi {
-            val wv = bgWebViewRef.get().get()
-            if (wv != null) {
-                try {
-                    wv.stopLoading()
-                    wv.destroy()
-                } catch (_: Throwable) {
-                }
-            }
-            bgWebViewRef.set(WeakReference(null))
-        }
-    }
-
-    fun applySavedPreferences(context: Context) {
-        val appCtx = context.applicationContext ?: context
-        val st = QuotaSyncProvider.ensureLoaded(appCtx)
-        updateFromUnifiedState(appCtx, st)
-    }
-
-    fun updateSnapshot(context: Context, snapshot: QuotaHudView.Snapshot) {
-        val appCtx = context.applicationContext ?: context
-        val clean = snapshot.sanitized()
-        latestSnapshot.set(clean)
-        runOnUi {
-            val pill = hudRef.get().get() ?: return@runOnUi
-            pill.updateSnapshot(clean)
-        }
-    }
-
-    /**
-     * Headless background API/WebView sync of `https://gemini.google.com/usage`.
-     * Writes fresh quota into `QuotaSyncProvider` so all HUDs update identically.
-     */
-    @SuppressLint("SetJavaScriptEnabled")
-    fun triggerHeadlessSync(context: Context) {
-        val appCtx = context.applicationContext ?: context
-        latestSnapshot.set(QuotaSyncProvider.ensureLoaded(appCtx).snapshot.sanitized())
-        runOnUi {
-            var wv = bgWebViewRef.get().get()
-            if (wv == null) {
-                try {
-                    wv = WebView(appCtx).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        CookieManager.getInstance().setAcceptCookie(true)
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                        webViewClient = object : WebViewClient() {
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                val currentUrl = url.orEmpty().lowercase()
-                                if (currentUrl.contains("gemini.google.com/usage")) {
-                                    scrapeWebView(appCtx, view, 1100L)
-                                    scrapeWebView(appCtx, view, 3000L)
-                                }
-                            }
-                        }
-                    }
-                    bgWebViewRef.set(WeakReference(wv))
-                } catch (_: Throwable) {
-                    return@runOnUi
-                }
-            }
-            try {
-                wv.loadUrl(USAGE_URL)
-            } catch (_: Throwable) {
-            }
-        }
-    }
-
-    private fun ensureBackgroundPoller(appCtx: Context) {
-        triggerHeadlessSync(appCtx)
-        schedulePeriodicLoop(appCtx)
-    }
-
-    private fun schedulePeriodicLoop(appCtx: Context) {
-        runOnUi(delayMs = 90_000L) {
-            if (!isShowing) return@runOnUi
-            triggerHeadlessSync(appCtx)
-            schedulePeriodicLoop(appCtx)
-        }
-    }
-
-    private fun scrapeWebView(appCtx: Context, webView: WebView?, delayMs: Long) {
-        if (webView == null) return
-        runOnUi(delayMs = delayMs) {
-            try {
-                val activeUrl = webView.url.orEmpty().lowercase()
-                if (!activeUrl.contains("gemini.google.com/usage")) return@runOnUi
-                webView.evaluateJavascript(
-                    "(function(){return document.body ? document.body.innerText : '';})()"
-                ) { raw ->
-                    try {
-                        if (!raw.isNullOrBlank() && raw != "null") {
-                            val text = raw.trim('"')
-                                .replace("\\n", "\n")
-                                .replace("\\\"", "\"")
-                            val baseSnap = QuotaSyncProvider.ensureLoaded(appCtx).snapshot.sanitized()
-                            val snap = QuotaTextParser.parseUiBlock(
-                                block = text,
-                                prev = baseSnap,
-                                source = "UsageWeb",
-                                requireUsageStructure = true
-                            )
-                            if (snap != null) {
-                                QuotaSyncProvider.publishQuota(appCtx, snap)
-                            }
-                        }
-                    } catch (_: Throwable) {
-                    }
-                }
-            } catch (_: Throwable) {
-            }
         }
     }
 }

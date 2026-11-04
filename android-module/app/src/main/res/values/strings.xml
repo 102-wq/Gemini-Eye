@@ -1,33 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Gemini-Eye Quota HUD</string>
-    <string name="module_description">Single-line capsule quota HUD for Gemini (5h &amp; Weekly bars, reset timers, MIUIX/MD3, EN/CN)</string>
+    <string name="module_description">Purely in-app Cronet/gRPC ProtoBuf &amp; ViewModel quota HUD for Gemini (5h &amp; Weekly bars, MIUIX/MD3, EN/CN)</string>
 
     <!-- Floating Capsule HUD Localized Labels -->
     <string name="hud_label_5h">5h</string>
     <string name="hud_label_weekly">Weekly</string>
-    <string name="hud_action_refresh">Refresh quota</string>
-    <string name="hud_action_open_usage">Open usage page</string>
+    <string name="hud_action_refresh">Rescan in-app quota</string>
+    <string name="hud_action_open_usage">Open HUD settings</string>
 
     <!-- Module Settings & Preview Localized Strings -->
-    <string name="settings_title">Gemini-Eye Quota HUD (v1.9.1)</string>
+    <string name="settings_title">Gemini-Eye Quota HUD (v2.0.0)</string>
     <string name="settings_targets_fmt">Targets · Gemini: %1$s | Google: %2$s | API 102 + 82</string>
     <string name="settings_status_installed">Installed</string>
     <string name="settings_status_missing">Missing</string>
-    <string name="settings_preview_caption">Live Capsule Preview (Unified real-time quota store)</string>
+    <string name="settings_preview_caption">Live Capsule Preview (Pure In-App gRPC/Cronet + ViewModel Store)</string>
     <string name="settings_appearance_title">Language &amp; Theme</string>
     <string name="settings_lang_zh">中文</string>
     <string name="settings_lang_en">English</string>
     <string name="settings_theme_miuix">MIUIX Frosted</string>
     <string name="settings_theme_md3">MD3 Dynamic</string>
-    <string name="settings_hook_bound_fmt">Single-HUD Bound · Engine: %1$s\nHost: %2$s (%3$ds ago) · System Overlay Auto-Disabled</string>
-    <string name="settings_hook_waiting">Waiting for Gemini Xposed heartbeat:\n• Enable Gemini-Eye in LSPosed / Vector for Gemini &amp; Google, then force-stop Gemini.\n• Fallback System Overlay is available below when unhooked.</string>
-    <string name="settings_sync_now">Refresh &amp; Sync Quota Now</string>
-    <string name="settings_sync_desc">Sign in once below so tapping Refresh (↻) on the HUD silently fetches live 5h %, Weekly %, and reset timers in the background.</string>
-    <string name="settings_open_web_sync">Sign In &amp; Sync Usage (gemini.google.com/usage)</string>
-    <string name="settings_reload_web_sync">Reload Usage Page &amp; Extract Quota</string>
-    <string name="settings_overlay_exclusive">Single-HUD Exclusive Active (Managed by In-App Xposed HUD)</string>
+    <string name="settings_hook_bound_fmt">Single-HUD Bound · Engine: %1$s\nHost: %2$s (%3$ds ago) · System Overlay Auto-Suppressed</string>
+    <string name="settings_hook_waiting">Waiting for Gemini Xposed heartbeat:\n• Enable Gemini-Eye in LSPosed / Vector for Gemini, then force-stop &amp; reopen Gemini.\n• Quota is extracted strictly from in-app gRPC/Cronet streams &amp; ViewModel memory (zero web polling).</string>
+    <string name="settings_sync_now">Rescan In-App Memory &amp; Sync Now</string>
+    <string name="settings_sync_desc">Purely in-process extraction: intercepts Cronet UrlRequest / gRPC ProtoBuf byte streams and scans live ViewModel / StateFlow / LiveData / Repository state inside com.google.android.apps.bard without web fallback.</string>
+    <string name="settings_overlay_exclusive">Single-HUD Exclusive Active (System Overlay Auto-Suppressed)</string>
     <string name="settings_overlay_disable">Disable Fallback System Overlay (Running)</string>
-    <string name="settings_overlay_enable">Enable Fallback System Overlay (When Unhooked)</string>
+    <string name="settings_overlay_enable">Enable Passive System Overlay (When Unhooked)</string>
     <string name="settings_launch_gemini">Launch Gemini App</string>
 </resources>

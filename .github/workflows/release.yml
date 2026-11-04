@@ -44,7 +44,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.9.${{ github.run_number }}
-          name: Gemini-Eye v1.9.${{ github.run_number }}
-          body: "**v1.9.1 Unified `QuotaSyncProvider` Cross-Process Sync, Strict Quota Sanitizer & Localized `R.string` i18n**: Replaced disconnected per-app `SharedPreferences` and blocked Android 11+ broadcasts with a single authoritative exported `QuotaSyncProvider` (`android:forceQueryable=\"true\"` + `ContentObserver` + `ContentResolver.call`) so the in-app Gemini HUD and module HUD always display identical real-time values; hardened `QuotaTextParser` & `QuotaHudView.Snapshot` with strict metric/countdown validation to prevent chat or config text contamination; replaced raw UI strings with localized `values/strings.xml` (EN) and `values-zh/strings.xml` (CN)."
+          tag_name: v2.0.${{ github.run_number }}
+          name: Gemini-Eye v2.0.${{ github.run_number }}
+          body: "**v2.0.0 Purely In-App Cronet/gRPC ProtoBuf & ViewModel Interception (Zero Web Fallback)**: Removed all WebView / `gemini.google.com/usage` HTTP polling and `INTERNET` permission; implemented non-destructive Cronet (`org.chromium.net.UrlRequest` / `BidirectionalStream`) & gRPC (`io.grpc.ClientInterceptor` / `Channel` / `ClientCall.Listener`) raw `ByteArray`/`ByteBuffer` stream interception with a binary ProtoBuf wire-format scanner (`5h` & `Weekly` reset epochs + percentage/usage fields); added `Throwable`-guarded `ViewModel` / `StateFlow` / `LiveData` / `Repository` memory hooks; preserved single-line capsule HUD (`MIUIX` / `MD3`, `EN` / `CN`) and `ModernQuotaModule` (API 102) Single-HUD Exclusion."
           files: Gemini-Eye.apk

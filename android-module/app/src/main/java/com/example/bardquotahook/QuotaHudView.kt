@@ -11,7 +11,6 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.net.Uri
 import android.os.Build
 import android.text.TextUtils
 import android.util.TypedValue
@@ -263,7 +262,7 @@ class QuotaHudView(
                 if (custom != null) {
                     custom.invoke()
                 } else {
-                    openUsageWebpage(context)
+                    openModuleSettings(context)
                 }
             }
         }
@@ -646,7 +645,6 @@ class QuotaHudView(
     companion object {
         const val HUD_VIEW_TAG = "bard_quota_hud_capsule_v19"
         const val MODULE_PACKAGE = "com.example.bardquotahook"
-        const val USAGE_WEBPAGE_URL = "https://gemini.google.com/usage"
 
         private fun resolveLocalizedHudLabels(context: Context, lang: Lang): LocalizedHudLabels {
             val fallback5h = "5h"
@@ -705,10 +703,11 @@ class QuotaHudView(
             }
         }
 
-        fun openUsageWebpage(context: Context) {
+        fun openModuleSettings(context: Context) {
             try {
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(USAGE_WEBPAGE_URL)).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val intent = Intent().apply {
+                    setClassName(MODULE_PACKAGE, "$MODULE_PACKAGE.MainActivity")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 }
                 context.startActivity(intent)
             } catch (_: Throwable) {

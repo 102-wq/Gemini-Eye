@@ -7,8 +7,8 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Broadcast bridge that delegates all state reads and writes to the single authoritative
- * `QuotaSyncProvider` store so every HUD view and Settings screen stays 100% identical.
+ * Broadcast bridge that coordinates cross-process heartbeats and in-process memory scan triggers
+ * against the authoritative `QuotaSyncProvider` store (zero web/HTTP fallback).
  */
 class HookTelemetryReceiver : BroadcastReceiver() {
 
@@ -74,14 +74,11 @@ class HookTelemetryReceiver : BroadcastReceiver() {
             }
         }
 
-        fun pushExternalQuotaToHostApps(context: Context, snapshot: QuotaHudView.Snapshot) {
-            QuotaSyncProvider.publishQuota(context, snapshot.sanitized())
-        }
-
         fun syncStateToHostApps(
             context: Context,
             state: QuotaSyncProvider.UnifiedState? = null,
-            includePing: Boolean = false
+            includePing: Boolean = false,
+            triggerInAppScan: Boolean = false
         ) {
             val st = state ?: QuotaSyncProvider.ensureLoaded(context)
             val snap = st.snapshot.sanitized()
@@ -101,6 +98,7 @@ class HookTelemetryReceiver : BroadcastReceiver() {
                         putExtra("ui_lang", st.lang.code)
                         putExtra("ui_theme", st.theme.code)
                         if (includePing) putExtra("ping", true)
+                        if (triggerInAppScan) putExtra("rescan_memory", true)
                     }
                     context.sendBroadcast(intent)
                 } catch (_: Throwable) {
@@ -128,7 +126,7 @@ class HookTelemetryReceiver : BroadcastReceiver() {
                             ?: "--",
                         weeklyLimit = intent.getStringExtra("week") ?: "--",
                         weeklyReset = intent.getStringExtra("week_reset") ?: "--",
-                        source = intent.getStringExtra("src") ?: "Hook"
+                        source = intent.getStringExtra("src") ?: "InAppHook"
                     ).sanitized()
 
                     val updated = QuotaSyncProvider.mutateLocalStore(
@@ -147,7 +145,11 @@ class HookTelemetryReceiver : BroadcastReceiver() {
                 }
 
                 QuotaTextParser.ACTION_REQUEST_QUOTA_REFRESH -> {
-                    OverlayHudController.triggerHeadlessSync(appCtx)
+                    syncStateToHostApps(
+                        context = appCtx,
+                        includePing = true,
+                        triggerInAppScan = true
+                    )
                 }
             }
         } catch (_: Throwable) {

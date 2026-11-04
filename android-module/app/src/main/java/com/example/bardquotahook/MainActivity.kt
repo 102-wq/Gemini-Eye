@@ -1,6 +1,5 @@
 package com.example.bardquotahook
 
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
@@ -19,22 +18,13 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.View
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.Button
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.util.Locale
 
 class MainActivity : Activity() {
-
-    companion object {
-        private const val USAGE_URL = "https://gemini.google.com/usage"
-    }
 
     private var titleView: TextView? = null
     private var pkgView: TextView? = null
@@ -50,18 +40,13 @@ class MainActivity : Activity() {
     private var hookStatusView: TextView? = null
     private var quotaPreviewView: TextView? = null
     private var pingBtn: Button? = null
-
-    private var syncDescView: TextView? = null
-    private var syncWebBtn: Button? = null
-    private var webContainer: FrameLayout? = null
-    private var embeddedWebView: WebView? = null
+    private var engineDescView: TextView? = null
 
     private var overlayToggleBtn: Button? = null
     private var launchGeminiBtn: Button? = null
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var stateObserver: ContentObserver? = null
-    private var webExpanded = false
     private var bardInstalled = false
     private var gsaInstalled = false
 
@@ -93,12 +78,17 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun pingHookedProcesses() {
+    private fun triggerInProcessScanAndPing() {
         val st = QuotaSyncProvider.ensureLoaded(this)
-        HookTelemetryReceiver.syncStateToHostApps(this, st, includePing = true)
+        HookTelemetryReceiver.syncStateToHostApps(
+            context = this,
+            state = st,
+            includePing = true,
+            triggerInAppScan = true
+        )
     }
 
-    private fun launchGeminiWithFallback() {
+    private fun launchGeminiNativeApp() {
         val candidates = listOf(
             packageManager.getLaunchIntentForPackage("com.google.android.apps.bard"),
             Intent(Intent.ACTION_MAIN).apply {
@@ -107,8 +97,7 @@ class MainActivity : Activity() {
                     "com.google.android.apps.bard.shellapp.BardEntryPointActivity"
                 )
             },
-            packageManager.getLaunchIntentForPackage("com.google.android.googlequicksearchbox"),
-            Intent(Intent.ACTION_VIEW, Uri.parse("https://gemini.google.com/app"))
+            packageManager.getLaunchIntentForPackage("com.google.android.googlequicksearchbox")
         )
 
         for (intent in candidates) {
@@ -208,12 +197,7 @@ class MainActivity : Activity() {
             "$label5h: ${snap.formatFiveHourDisplay()}   |   $labelWk: ${snap.formatWeeklyDisplay()}   [${snap.source}]"
 
         pingBtn?.text = loc.getString(R.string.settings_sync_now)
-        syncDescView?.text = loc.getString(R.string.settings_sync_desc)
-        syncWebBtn?.text = if (webExpanded) {
-            loc.getString(R.string.settings_reload_web_sync)
-        } else {
-            loc.getString(R.string.settings_open_web_sync)
-        }
+        engineDescView?.text = loc.getString(R.string.settings_sync_desc)
 
         val overlayOn = OverlayHudController.isShowing
         overlayToggleBtn?.apply {
@@ -235,85 +219,6 @@ class MainActivity : Activity() {
         }
 
         launchGeminiBtn?.text = loc.getString(R.string.settings_launch_gemini)
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun toggleOrReloadUsageWebView() {
-        val frame = webContainer ?: return
-        if (!webExpanded) {
-            webExpanded = true
-            frame.visibility = View.VISIBLE
-
-            if (embeddedWebView == null) {
-                try {
-                    val wv = WebView(this).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        CookieManager.getInstance().setAcceptCookie(true)
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                        webViewClient = object : WebViewClient() {
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                val currentUrl = url.orEmpty().lowercase()
-                                if (currentUrl.contains("gemini.google.com/usage")) {
-                                    extractFromEmbeddedWebView(900L)
-                                    extractFromEmbeddedWebView(2600L)
-                                }
-                            }
-                        }
-                    }
-                    embeddedWebView = wv
-                    frame.addView(
-                        wv,
-                        FrameLayout.LayoutParams(
-                            FrameLayout.LayoutParams.MATCH_PARENT,
-                            dp(340f)
-                        )
-                    )
-                } catch (_: Throwable) {
-                    return
-                }
-            }
-            embeddedWebView?.loadUrl(USAGE_URL)
-        } else {
-            embeddedWebView?.reload()
-            extractFromEmbeddedWebView(1200L)
-        }
-        refreshAllUi()
-    }
-
-    private fun extractFromEmbeddedWebView(delayMs: Long) {
-        uiHandler.postDelayed(r@{
-            val wv = embeddedWebView ?: return@r
-            if (isFinishing || isDestroyed) return@r
-            try {
-                val activeUrl = wv.url.orEmpty().lowercase()
-                if (!activeUrl.contains("gemini.google.com/usage")) return@r
-                wv.evaluateJavascript(
-                    "(function(){return document.body ? document.body.innerText : '';})()"
-                ) { raw ->
-                    try {
-                        if (!raw.isNullOrBlank() && raw != "null") {
-                            val text = raw.trim('"')
-                                .replace("\\n", "\n")
-                                .replace("\\\"", "\"")
-                            val prev = QuotaSyncProvider.ensureLoaded(this@MainActivity).snapshot.sanitized()
-                            val snap = QuotaTextParser.parseUiBlock(
-                                block = text,
-                                prev = prev,
-                                source = "UsageWeb",
-                                requireUsageStructure = true
-                            )
-                            if (snap != null) {
-                                QuotaSyncProvider.publishQuota(this@MainActivity, snap)
-                                refreshAllUi()
-                            }
-                        }
-                    } catch (_: Throwable) {
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-        }, delayMs)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -367,11 +272,10 @@ class MainActivity : Activity() {
         val hudPreview = QuotaHudView(
             context = this,
             onRefreshClick = {
-                OverlayHudController.triggerHeadlessSync(this@MainActivity)
-                pingHookedProcesses()
+                triggerInProcessScanAndPing()
             },
             onOpenUsageClick = {
-                QuotaHudView.openUsageWebpage(this@MainActivity)
+                launchGeminiNativeApp()
             },
             draggableInFrame = false
         ).apply {
@@ -485,7 +389,7 @@ class MainActivity : Activity() {
         prefCard.addView(langRow)
         prefCard.addView(themeRow)
 
-        // 2. Live Hook & Unified Quota Store Telemetry Card
+        // 2. Live In-App Interception & Unified Quota Store Telemetry Card
         val diagCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeCardDrawable("#1E293B", "#334155")
@@ -521,69 +425,26 @@ class MainActivity : Activity() {
             background = makeBtnDrawable("#0284C7")
             setOnClickListener {
                 liveCapsulePreview?.triggerRefreshSpin()
-                OverlayHudController.triggerHeadlessSync(this@MainActivity)
-                pingHookedProcesses()
+                triggerInProcessScanAndPing()
                 uiHandler.postDelayed({ refreshAllUi() }, 500L)
             }
         }
         pingBtn = btnPing
 
+        val descTv = TextView(this).apply {
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setLineSpacing(dp(3f).toFloat(), 1.1f)
+            setPadding(0, dp(10f), 0, 0)
+        }
+        engineDescView = descTv
+
         diagCard.addView(statusTv)
         diagCard.addView(quotaTv)
         diagCard.addView(btnPing)
+        diagCard.addView(descTv)
 
-        // 3. Direct gemini.google.com/usage Live Login & Sync Card
-        val syncCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = makeCardDrawable("#1E293B", "#334155")
-            val p = dp(14f)
-            setPadding(p, p, p, p)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(12f)
-            }
-        }
-
-        val syncDesc = TextView(this).apply {
-            setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setLineSpacing(dp(3f).toFloat(), 1.1f)
-        }
-        syncDescView = syncDesc
-
-        val webBtn = Button(this).apply {
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            background = makeBtnDrawable("#2563EB")
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(10f)
-            }
-            setOnClickListener { toggleOrReloadUsageWebView() }
-        }
-        syncWebBtn = webBtn
-
-        val webHolder = FrameLayout(this).apply {
-            visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(10f)
-            }
-        }
-        webContainer = webHolder
-
-        syncCard.addView(syncDesc)
-        syncCard.addView(webBtn)
-        syncCard.addView(webHolder)
-
-        // 4. Single-HUD Exclusive System Overlay Button
+        // 3. Single-HUD Exclusive System Overlay Button
         val overlayBtn = Button(this).apply {
             isAllCaps = false
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
@@ -617,7 +478,7 @@ class MainActivity : Activity() {
         }
         overlayToggleBtn = overlayBtn
 
-        // 5. Launch Gemini Button
+        // 4. Launch Gemini App Button
         val launchBtn = Button(this).apply {
             isAllCaps = false
             setTextColor(Color.WHITE)
@@ -631,7 +492,7 @@ class MainActivity : Activity() {
                 topMargin = dp(10f)
             }
             setPadding(dp(12f), dp(13f), dp(12f), dp(13f))
-            setOnClickListener { launchGeminiWithFallback() }
+            setOnClickListener { launchGeminiNativeApp() }
         }
         launchGeminiBtn = launchBtn
 
@@ -640,7 +501,6 @@ class MainActivity : Activity() {
         container.addView(previewCard)
         container.addView(prefCard)
         container.addView(diagCard)
-        container.addView(syncCard)
         container.addView(overlayBtn)
         container.addView(launchBtn)
         scroll.addView(container)
@@ -652,13 +512,13 @@ class MainActivity : Activity() {
         stateObserver = QuotaSyncProvider.registerStateObserver(this) {
             runOnUiThread { refreshAllUi() }
         }
-        pingHookedProcesses()
+        triggerInProcessScanAndPing()
         refreshAllUi()
     }
 
     override fun onResume() {
         super.onResume()
-        pingHookedProcesses()
+        triggerInProcessScanAndPing()
         refreshAllUi()
     }
 
@@ -666,13 +526,6 @@ class MainActivity : Activity() {
         HookTelemetryReceiver.setUiListener(null)
         QuotaSyncProvider.unregisterStateObserver(this, stateObserver)
         stateObserver = null
-        embeddedWebView?.let { wv ->
-            runCatching {
-                wv.stopLoading()
-                wv.destroy()
-            }
-        }
-        embeddedWebView = null
         super.onDestroy()
     }
 }

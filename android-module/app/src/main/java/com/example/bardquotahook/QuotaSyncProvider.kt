@@ -10,17 +10,17 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Single Authoritative Cross-Process Data Source (`content://com.example.bardquotahook.provider`).
  *
- * Unifies quota values (`5h`, `5h reset`, `Weekly`, `Weekly reset`), i18n language (`ZH` / `EN`),
- * theme mode (`MIUIX` / `MD3`), and Xposed Single-HUD Exclusion state across:
- * 1. Gemini's in-app Xposed `QuotaHudView` (`com.google.android.apps.bard` / Google app)
+ * Unifies strictly in-app captured quota values (`5h`, `5h reset`, `Weekly`, `Weekly reset`),
+ * i18n language (`ZH` / `EN`), theme mode (`MIUIX` / `MD3`), and `ModernQuotaModule` (API 102)
+ * Single-HUD Exclusion state across:
+ * 1. Gemini's in-app Xposed `QuotaHudView` (`com.google.android.apps.bard` UI & service processes)
  * 2. Module Settings live preview `QuotaHudView` (`MainActivity`)
- * 3. Fallback `OverlayHudController` & headless `gemini.google.com/usage` sync engine
+ * 3. Passive `OverlayHudController` (auto-suppressed whenever Xposed binds)
  */
 class QuotaSyncProvider : ContentProvider() {
 
@@ -108,7 +108,7 @@ class QuotaSyncProvider : ContentProvider() {
                         fiveHourReset = extras?.getString(KEY_FIVE_RESET, "--") ?: "--",
                         weeklyLimit = extras?.getString(KEY_WEEK, "--") ?: "--",
                         weeklyReset = extras?.getString(KEY_WEEK_RESET, "--") ?: "--",
-                        source = extras?.getString(KEY_SRC, "Hook") ?: "Hook"
+                        source = extras?.getString(KEY_SRC, "InAppHook") ?: "InAppHook"
                     ).sanitized()
                     val updated = mutateLocalStore(appCtx, incomingSnapshot = incoming)
                     dispatchLocalSideEffects(appCtx, updated)
@@ -143,7 +143,7 @@ class QuotaSyncProvider : ContentProvider() {
                         fiveHourReset = extras?.getString(KEY_FIVE_RESET, "--") ?: "--",
                         weeklyLimit = extras?.getString(KEY_WEEK, "--") ?: "--",
                         weeklyReset = extras?.getString(KEY_WEEK_RESET, "--") ?: "--",
-                        source = extras?.getString(KEY_SRC, "Hook") ?: "Hook"
+                        source = extras?.getString(KEY_SRC, "InAppHook") ?: "InAppHook"
                     ).sanitized()
 
                     val updated = mutateLocalStore(
@@ -156,23 +156,21 @@ class QuotaSyncProvider : ContentProvider() {
                         markXposedBound = true
                     )
 
-                    // Single-HUD Exclusion: auto-close system overlay when Gemini Xposed HUD binds
+                    // Single-HUD Exclusion: immediately suppress App System Overlay when Xposed binds
                     OverlayHudController.enforceSingleHudExclusivity(appCtx)
                     dispatchLocalSideEffects(appCtx, updated)
-
-                    // Auto-trigger headless sync if unified store has no quota data yet
-                    if (!updated.snapshot.hasLiveData) {
-                        triggerAutoRefreshIfIdle(appCtx)
-                    }
-
                     updated.toBundle()
                 }
 
                 METHOD_REQUEST_REFRESH -> {
-                    mainHandler.post {
-                        OverlayHudController.triggerHeadlessSync(appCtx)
-                    }
-                    ensureLoaded(appCtx).toBundle()
+                    val current = ensureLoaded(appCtx)
+                    HookTelemetryReceiver.syncStateToHostApps(
+                        context = appCtx,
+                        state = current,
+                        includePing = true,
+                        triggerInAppScan = true
+                    )
+                    current.toBundle()
                 }
 
                 else -> ensureLoaded(appCtx).toBundle()
@@ -269,12 +267,9 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_OVERLAY_ENABLED = "overlay_enabled"
 
         private const val ACTIVE_HOOK_WINDOW_MS = 12 * 60 * 60 * 1000L
-        private const val AUTO_REFRESH_COOLDOWN_MS = 45_000L
 
         private val stateLock = Any()
         private val cachedState = AtomicReference<UnifiedState?>(null)
-        private val lastAutoRefreshMs = AtomicLong(0L)
-        private val mainHandler = Handler(Looper.getMainLooper())
 
         private fun isInModuleProcess(context: Context): Boolean {
             return context.packageName == MODULE_PACKAGE
@@ -307,7 +302,6 @@ class QuotaSyncProvider : ContentProvider() {
                     source = rawSrc
                 ).sanitized()
 
-                // Purge any legacy corrupted text from SharedPreferences immediately on load
                 if (cleanSnap.fiveHourQuota != rawFive ||
                     cleanSnap.fiveHourReset != rawFiveReset ||
                     cleanSnap.weeklyLimit != rawWeek ||
@@ -437,16 +431,6 @@ class QuotaSyncProvider : ContentProvider() {
             HookTelemetryReceiver.notifyUiListeners()
         }
 
-        private fun triggerAutoRefreshIfIdle(appCtx: Context) {
-            val now = System.currentTimeMillis()
-            val prev = lastAutoRefreshMs.get()
-            if (now - prev >= AUTO_REFRESH_COOLDOWN_MS && lastAutoRefreshMs.compareAndSet(prev, now)) {
-                mainHandler.post {
-                    OverlayHudController.triggerHeadlessSync(appCtx)
-                }
-            }
-        }
-
         // =====================================================================
         // Cross-Process Client API (Callable from BOTH Module & Hooked Gemini)
         // =====================================================================
@@ -550,13 +534,17 @@ class QuotaSyncProvider : ContentProvider() {
             }
         }
 
-        fun requestBackgroundRefresh(context: Context, requesterPkg: String) {
+        fun requestInProcessRefresh(context: Context, requesterPkg: String) {
             try {
                 if (isInModuleProcess(context)) {
                     val appCtx = context.applicationContext ?: context
-                    mainHandler.post {
-                        OverlayHudController.triggerHeadlessSync(appCtx)
-                    }
+                    val st = ensureLoaded(appCtx)
+                    HookTelemetryReceiver.syncStateToHostApps(
+                        context = appCtx,
+                        state = st,
+                        includePing = true,
+                        triggerInAppScan = true
+                    )
                 } else {
                     val extras = Bundle().apply {
                         putString("requester_pkg", requesterPkg)
