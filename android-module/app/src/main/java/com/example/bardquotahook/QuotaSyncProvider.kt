@@ -13,19 +13,20 @@ import android.os.Looper
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Single Authoritative Cross-Process Data Source (`content://com.example.bardquotahook.provider`).
+ * Passive, Zero-Background Cross-Process Preference & Session-Scoped Quota Store
+ * (`content://com.example.bardquotahook.provider`).
  *
- * Unifies strictly in-app captured quota values (`5h`, `5h reset`, `Weekly`, `Weekly reset`),
- * i18n language (`ZH` / `EN`), theme mode (`MIUIX` / `MD3`), and `ModernQuotaModule` (API 102)
- * Single-HUD Exclusion state across:
- * 1. Gemini's in-app Xposed `QuotaHudView` (`com.google.android.apps.bard` UI & service processes)
- * 2. Module Settings live preview `QuotaHudView` (`MainActivity`)
- * 3. Passive `OverlayHudController` (auto-suppressed whenever Xposed binds)
+ * - Zero background services, zero timers, and zero wake-up broadcasts.
+ * - Tracks `sessionId` (`sess_<12hex>`) alongside `Snapshot` so switching Google accounts inside
+ *   Gemini cleanly replaces stale previous-account values (`replaceSession = true`) instead of
+ *   bleeding or merging quotas across accounts.
+ * - Notifies only currently foregrounded `ContentObserver`s (`MainActivity` or foreground Gemini).
  */
 class QuotaSyncProvider : ContentProvider() {
 
     data class UnifiedState(
         val snapshot: QuotaHudView.Snapshot = QuotaHudView.Snapshot(),
+        val sessionId: String = "",
         val lang: QuotaHudView.Lang = QuotaHudView.Lang.ZH,
         val theme: QuotaHudView.ThemeMode = QuotaHudView.ThemeMode.MIUIX,
         val xposedBound: Boolean = false,
@@ -50,6 +51,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putString(KEY_WEEK, clean.weeklyLimit)
                 putString(KEY_WEEK_RESET, clean.weeklyReset)
                 putString(KEY_SRC, clean.source)
+                putString(KEY_SESSION_ID, sessionId)
                 putString(KEY_LANG, lang.code)
                 putString(KEY_THEME, theme.code)
                 putBoolean(KEY_XPOSED_BOUND, isActivelyBound)
@@ -59,7 +61,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putString(KEY_LAST_PKG, lastPkg)
                 putString(KEY_LAST_PROC, lastProc)
                 putString(KEY_LAST_BRIDGE, lastBridge)
-                putBoolean(KEY_OVERLAY_ENABLED, overlayEnabled && !isActivelyBound)
+                putBoolean(KEY_OVERLAY_ENABLED, false)
             }
         }
 
@@ -75,6 +77,7 @@ class QuotaSyncProvider : ContentProvider() {
                 ).sanitized()
                 return UnifiedState(
                     snapshot = snap,
+                    sessionId = bundle.getString(KEY_SESSION_ID, "") ?: "",
                     lang = QuotaHudView.Lang.fromCode(bundle.getString(KEY_LANG, "ZH")),
                     theme = QuotaHudView.ThemeMode.fromCode(bundle.getString(KEY_THEME, "MIUIX")),
                     xposedBound = bundle.getBoolean(KEY_XPOSED_BOUND, false),
@@ -84,7 +87,7 @@ class QuotaSyncProvider : ContentProvider() {
                     lastPkg = bundle.getString(KEY_LAST_PKG, "") ?: "",
                     lastProc = bundle.getString(KEY_LAST_PROC, "") ?: "",
                     lastBridge = bundle.getString(KEY_LAST_BRIDGE, "") ?: "",
-                    overlayEnabled = bundle.getBoolean(KEY_OVERLAY_ENABLED, false)
+                    overlayEnabled = false
                 )
             }
         }
@@ -110,26 +113,28 @@ class QuotaSyncProvider : ContentProvider() {
                         weeklyReset = extras?.getString(KEY_WEEK_RESET, "--") ?: "--",
                         source = extras?.getString(KEY_SRC, "InAppHook") ?: "InAppHook"
                     ).sanitized()
-                    val updated = mutateLocalStore(appCtx, incomingSnapshot = incoming)
-                    dispatchLocalSideEffects(appCtx, updated)
+                    val incomingSession = extras?.getString(KEY_SESSION_ID)
+                    val replaceSession = extras?.getBoolean(KEY_REPLACE_SESSION, false) ?: false
+
+                    val updated = mutateLocalStore(
+                        appCtx = appCtx,
+                        incomingSnapshot = incoming,
+                        sessionId = incomingSession,
+                        replaceSession = replaceSession
+                    )
+                    dispatchForegroundNotifications(appCtx, updated)
                     updated.toBundle()
                 }
 
                 METHOD_PUT_PREFS -> {
                     val lang = extras?.getString(KEY_LANG)?.let { QuotaHudView.Lang.fromCode(it) }
                     val theme = extras?.getString(KEY_THEME)?.let { QuotaHudView.ThemeMode.fromCode(it) }
-                    val overlayFlag = if (extras?.containsKey(KEY_OVERLAY_ENABLED) == true) {
-                        extras.getBoolean(KEY_OVERLAY_ENABLED)
-                    } else {
-                        null
-                    }
                     val updated = mutateLocalStore(
                         appCtx = appCtx,
                         lang = lang,
-                        theme = theme,
-                        overlayEnabled = overlayFlag
+                        theme = theme
                     )
-                    dispatchLocalSideEffects(appCtx, updated)
+                    dispatchForegroundNotifications(appCtx, updated)
                     updated.toBundle()
                 }
 
@@ -138,6 +143,7 @@ class QuotaSyncProvider : ContentProvider() {
                     val proc = extras?.getString(KEY_LAST_PROC) ?: ""
                     val bridge = extras?.getString(KEY_LAST_BRIDGE) ?: "Xposed"
                     val api102 = extras?.getBoolean(KEY_API_102, false) ?: false
+                    val incomingSession = extras?.getString(KEY_SESSION_ID)
                     val candidate = QuotaHudView.Snapshot(
                         fiveHourQuota = extras?.getString(KEY_FIVE, "--") ?: "--",
                         fiveHourReset = extras?.getString(KEY_FIVE_RESET, "--") ?: "--",
@@ -149,6 +155,7 @@ class QuotaSyncProvider : ContentProvider() {
                     val updated = mutateLocalStore(
                         appCtx = appCtx,
                         incomingSnapshot = if (candidate.hasLiveData) candidate else null,
+                        sessionId = incomingSession,
                         pkg = pkg,
                         proc = proc,
                         bridge = bridge,
@@ -156,21 +163,9 @@ class QuotaSyncProvider : ContentProvider() {
                         markXposedBound = true
                     )
 
-                    // Single-HUD Exclusion: immediately suppress App System Overlay when Xposed binds
                     OverlayHudController.enforceSingleHudExclusivity(appCtx)
-                    dispatchLocalSideEffects(appCtx, updated)
+                    dispatchForegroundNotifications(appCtx, updated)
                     updated.toBundle()
-                }
-
-                METHOD_REQUEST_REFRESH -> {
-                    val current = ensureLoaded(appCtx)
-                    HookTelemetryReceiver.syncStateToHostApps(
-                        context = appCtx,
-                        state = current,
-                        includePing = true,
-                        triggerInAppScan = true
-                    )
-                    current.toBundle()
                 }
 
                 else -> ensureLoaded(appCtx).toBundle()
@@ -193,6 +188,7 @@ class QuotaSyncProvider : ContentProvider() {
             KEY_WEEK,
             KEY_WEEK_RESET,
             KEY_SRC,
+            KEY_SESSION_ID,
             KEY_LANG,
             KEY_THEME,
             KEY_XPOSED_BOUND,
@@ -212,6 +208,7 @@ class QuotaSyncProvider : ContentProvider() {
                     snap.weeklyLimit,
                     snap.weeklyReset,
                     snap.source,
+                    st.sessionId,
                     st.lang.code,
                     st.theme.code,
                     if (st.isActivelyBound) 1 else 0,
@@ -248,13 +245,14 @@ class QuotaSyncProvider : ContentProvider() {
         const val METHOD_PUT_QUOTA = "put_quota"
         const val METHOD_PUT_PREFS = "put_prefs"
         const val METHOD_HEARTBEAT = "heartbeat"
-        const val METHOD_REQUEST_REFRESH = "request_refresh"
 
         const val KEY_FIVE = "five"
         const val KEY_FIVE_RESET = "five_reset"
         const val KEY_WEEK = "week"
         const val KEY_WEEK_RESET = "week_reset"
         const val KEY_SRC = "src"
+        const val KEY_SESSION_ID = "session_id"
+        const val KEY_REPLACE_SESSION = "replace_session"
         const val KEY_LANG = "ui_lang"
         const val KEY_THEME = "ui_theme"
         const val KEY_XPOSED_BOUND = "xposed_bound"
@@ -286,41 +284,17 @@ class QuotaSyncProvider : ContentProvider() {
                 val appCtx = context.applicationContext ?: context
                 val prefs = appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
 
-                val rawFive = prefs.getString(KEY_FIVE, "--") ?: "--"
-                val rawFiveReset = prefs.getString(KEY_FIVE_RESET, null)
-                    ?: prefs.getString("reset", "--")
-                    ?: "--"
-                val rawWeek = prefs.getString(KEY_WEEK, "--") ?: "--"
-                val rawWeekReset = prefs.getString(KEY_WEEK_RESET, "--") ?: "--"
-                val rawSrc = prefs.getString(KEY_SRC, "UnifiedStore") ?: "UnifiedStore"
-
                 val cleanSnap = QuotaHudView.Snapshot(
-                    fiveHourQuota = rawFive,
-                    fiveHourReset = rawFiveReset,
-                    weeklyLimit = rawWeek,
-                    weeklyReset = rawWeekReset,
-                    source = rawSrc
+                    fiveHourQuota = prefs.getString(KEY_FIVE, "--") ?: "--",
+                    fiveHourReset = prefs.getString(KEY_FIVE_RESET, "--") ?: "--",
+                    weeklyLimit = prefs.getString(KEY_WEEK, "--") ?: "--",
+                    weeklyReset = prefs.getString(KEY_WEEK_RESET, "--") ?: "--",
+                    source = prefs.getString(KEY_SRC, "UnifiedStore") ?: "UnifiedStore"
                 ).sanitized()
-
-                if (cleanSnap.fiveHourQuota != rawFive ||
-                    cleanSnap.fiveHourReset != rawFiveReset ||
-                    cleanSnap.weeklyLimit != rawWeek ||
-                    cleanSnap.weeklyReset != rawWeekReset
-                ) {
-                    try {
-                        prefs.edit()
-                            .putString(KEY_FIVE, cleanSnap.fiveHourQuota)
-                            .putString(KEY_FIVE_RESET, cleanSnap.fiveHourReset)
-                            .putString(KEY_WEEK, cleanSnap.weeklyLimit)
-                            .putString(KEY_WEEK_RESET, cleanSnap.weeklyReset)
-                            .remove("reset")
-                            .apply()
-                    } catch (_: Throwable) {
-                    }
-                }
 
                 val loaded = UnifiedState(
                     snapshot = cleanSnap,
+                    sessionId = prefs.getString(KEY_SESSION_ID, "") ?: "",
                     lang = QuotaHudView.Lang.fromCode(prefs.getString(KEY_LANG, "ZH")),
                     theme = QuotaHudView.ThemeMode.fromCode(prefs.getString(KEY_THEME, "MIUIX")),
                     xposedBound = prefs.getBoolean(KEY_XPOSED_BOUND, false),
@@ -330,7 +304,7 @@ class QuotaSyncProvider : ContentProvider() {
                     lastPkg = prefs.getString(KEY_LAST_PKG, "") ?: "",
                     lastProc = prefs.getString(KEY_LAST_PROC, "") ?: "",
                     lastBridge = prefs.getString(KEY_LAST_BRIDGE, "") ?: "",
-                    overlayEnabled = prefs.getBoolean(KEY_OVERLAY_ENABLED, false)
+                    overlayEnabled = false
                 )
                 cachedState.set(loaded)
                 return loaded
@@ -341,46 +315,56 @@ class QuotaSyncProvider : ContentProvider() {
         internal fun mutateLocalStore(
             appCtx: Context,
             incomingSnapshot: QuotaHudView.Snapshot? = null,
+            sessionId: String? = null,
+            replaceSession: Boolean = false,
             lang: QuotaHudView.Lang? = null,
             theme: QuotaHudView.ThemeMode? = null,
             pkg: String? = null,
             proc: String? = null,
             bridge: String? = null,
             isApi102: Boolean? = null,
-            markXposedBound: Boolean = false,
-            overlayEnabled: Boolean? = null
+            markXposedBound: Boolean = false
         ): UnifiedState {
             val prev = ensureLoaded(appCtx)
             val now = System.currentTimeMillis()
 
-            val cleanIncoming = incomingSnapshot?.sanitized()
-            val mergedSnap = if (cleanIncoming != null && cleanIncoming.hasLiveData) {
-                QuotaHudView.Snapshot(
-                    fiveHourQuota = if (cleanIncoming.fiveHourQuota != "--") cleanIncoming.fiveHourQuota else prev.snapshot.fiveHourQuota,
-                    fiveHourReset = if (cleanIncoming.fiveHourReset != "--") cleanIncoming.fiveHourReset else prev.snapshot.fiveHourReset,
-                    weeklyLimit = if (cleanIncoming.weeklyLimit != "--") cleanIncoming.weeklyLimit else prev.snapshot.weeklyLimit,
-                    weeklyReset = if (cleanIncoming.weeklyReset != "--") cleanIncoming.weeklyReset else prev.snapshot.weeklyReset,
-                    source = cleanIncoming.source
-                ).sanitized()
+            val nextSessionId = if (!sessionId.isNullOrBlank() && sessionId != "sess_default") {
+                sessionId
             } else {
-                prev.snapshot
+                prev.sessionId
+            }
+
+            // Detect Google account switch: never merge old account quota into newly switched account!
+            val sessionSwitched = replaceSession ||
+                (!sessionId.isNullOrBlank() &&
+                    sessionId != "sess_default" &&
+                    prev.sessionId.isNotBlank() &&
+                    sessionId != prev.sessionId)
+
+            val cleanIncoming = incomingSnapshot?.sanitized()
+            val mergedSnap = when {
+                sessionSwitched -> {
+                    cleanIncoming ?: QuotaHudView.Snapshot(source = "AccountSwitch")
+                }
+                cleanIncoming != null && cleanIncoming.hasLiveData -> {
+                    QuotaHudView.Snapshot(
+                        fiveHourQuota = if (cleanIncoming.fiveHourQuota != "--") cleanIncoming.fiveHourQuota else prev.snapshot.fiveHourQuota,
+                        fiveHourReset = if (cleanIncoming.fiveHourReset != "--") cleanIncoming.fiveHourReset else prev.snapshot.fiveHourReset,
+                        weeklyLimit = if (cleanIncoming.weeklyLimit != "--") cleanIncoming.weeklyLimit else prev.snapshot.weeklyLimit,
+                        weeklyReset = if (cleanIncoming.weeklyReset != "--") cleanIncoming.weeklyReset else prev.snapshot.weeklyReset,
+                        source = cleanIncoming.source
+                    ).sanitized()
+                }
+                else -> prev.snapshot
             }
 
             val nextBound = if (markXposedBound) true else prev.xposedBound
             val nextHbMs = if (markXposedBound) now else prev.lastHeartbeatMs
-            val nextQuotaMs = if (cleanIncoming != null && cleanIncoming.hasLiveData && mergedSnap != prev.snapshot) {
-                now
-            } else {
-                prev.lastQuotaMs
-            }
-            val nextOverlay = when {
-                markXposedBound -> false
-                overlayEnabled != null -> overlayEnabled
-                else -> prev.overlayEnabled
-            }
+            val nextQuotaMs = if (mergedSnap != prev.snapshot) now else prev.lastQuotaMs
 
             val next = prev.copy(
                 snapshot = mergedSnap,
+                sessionId = nextSessionId,
                 lang = lang ?: prev.lang,
                 theme = theme ?: prev.theme,
                 xposedBound = nextBound,
@@ -390,7 +374,7 @@ class QuotaSyncProvider : ContentProvider() {
                 lastPkg = if (!pkg.isNullOrBlank()) pkg else prev.lastPkg,
                 lastProc = if (!proc.isNullOrBlank()) proc else prev.lastProc,
                 lastBridge = if (!bridge.isNullOrBlank()) bridge else prev.lastBridge,
-                overlayEnabled = nextOverlay
+                overlayEnabled = false
             )
 
             cachedState.set(next)
@@ -403,6 +387,7 @@ class QuotaSyncProvider : ContentProvider() {
                     .putString(KEY_WEEK, next.snapshot.weeklyLimit)
                     .putString(KEY_WEEK_RESET, next.snapshot.weeklyReset)
                     .putString(KEY_SRC, next.snapshot.source)
+                    .putString(KEY_SESSION_ID, next.sessionId)
                     .putString(KEY_LANG, next.lang.code)
                     .putString(KEY_THEME, next.theme.code)
                     .putBoolean(KEY_XPOSED_BOUND, next.xposedBound)
@@ -412,7 +397,7 @@ class QuotaSyncProvider : ContentProvider() {
                     .putString(KEY_LAST_PKG, next.lastPkg)
                     .putString(KEY_LAST_PROC, next.lastProc)
                     .putString(KEY_LAST_BRIDGE, next.lastBridge)
-                    .putBoolean(KEY_OVERLAY_ENABLED, next.overlayEnabled)
+                    .putBoolean(KEY_OVERLAY_ENABLED, false)
                     .apply()
             } catch (_: Throwable) {
             }
@@ -425,14 +410,13 @@ class QuotaSyncProvider : ContentProvider() {
             return next
         }
 
-        private fun dispatchLocalSideEffects(appCtx: Context, state: UnifiedState) {
+        private fun dispatchForegroundNotifications(appCtx: Context, state: UnifiedState) {
             OverlayHudController.updateFromUnifiedState(appCtx, state)
-            HookTelemetryReceiver.syncStateToHostApps(appCtx, state, includePing = false)
             HookTelemetryReceiver.notifyUiListeners()
         }
 
         // =====================================================================
-        // Cross-Process Client API (Callable from BOTH Module & Hooked Gemini)
+        // Cross-Process Client API (Demand-Driven, Zero Background Broadcasts)
         // =====================================================================
 
         fun readUnifiedState(context: Context): UnifiedState? {
@@ -454,7 +438,8 @@ class QuotaSyncProvider : ContentProvider() {
             proc: String,
             bridge: String,
             isApi102: Boolean,
-            localSnapshot: QuotaHudView.Snapshot
+            localSnapshot: QuotaHudView.Snapshot,
+            sessionId: String = ""
         ): UnifiedState? {
             return try {
                 val clean = localSnapshot.sanitized()
@@ -463,6 +448,9 @@ class QuotaSyncProvider : ContentProvider() {
                     putString(KEY_LAST_PROC, proc)
                     putString(KEY_LAST_BRIDGE, bridge)
                     putBoolean(KEY_API_102, isApi102)
+                    if (sessionId.isNotBlank()) {
+                        putString(KEY_SESSION_ID, sessionId)
+                    }
                     if (clean.hasLiveData) {
                         putString(KEY_FIVE, clean.fiveHourQuota)
                         putString(KEY_FIVE_RESET, clean.fiveHourReset)
@@ -478,14 +466,24 @@ class QuotaSyncProvider : ContentProvider() {
             }
         }
 
-        fun publishQuota(context: Context, snapshot: QuotaHudView.Snapshot): UnifiedState? {
+        fun publishSessionQuota(
+            context: Context,
+            snapshot: QuotaHudView.Snapshot,
+            sessionId: String,
+            replaceSession: Boolean
+        ): UnifiedState? {
             val clean = snapshot.sanitized()
-            if (!clean.hasLiveData) return readUnifiedState(context)
+            if (!replaceSession && !clean.hasLiveData) return readUnifiedState(context)
             return try {
                 if (isInModuleProcess(context)) {
                     val appCtx = context.applicationContext ?: context
-                    val updated = mutateLocalStore(appCtx, incomingSnapshot = clean)
-                    dispatchLocalSideEffects(appCtx, updated)
+                    val updated = mutateLocalStore(
+                        appCtx = appCtx,
+                        incomingSnapshot = clean,
+                        sessionId = sessionId,
+                        replaceSession = replaceSession
+                    )
+                    dispatchForegroundNotifications(appCtx, updated)
                     updated
                 } else {
                     val extras = Bundle().apply {
@@ -494,6 +492,8 @@ class QuotaSyncProvider : ContentProvider() {
                         putString(KEY_WEEK, clean.weeklyLimit)
                         putString(KEY_WEEK_RESET, clean.weeklyReset)
                         putString(KEY_SRC, clean.source)
+                        putString(KEY_SESSION_ID, sessionId)
+                        putBoolean(KEY_REPLACE_SESSION, replaceSession)
                     }
                     val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_PUT_QUOTA, null, extras)
                     UnifiedState.fromBundle(reply)
@@ -501,6 +501,15 @@ class QuotaSyncProvider : ContentProvider() {
             } catch (_: Throwable) {
                 null
             }
+        }
+
+        fun publishQuota(context: Context, snapshot: QuotaHudView.Snapshot): UnifiedState? {
+            return publishSessionQuota(
+                context = context,
+                snapshot = snapshot,
+                sessionId = "",
+                replaceSession = false
+            )
         }
 
         fun updatePreferences(
@@ -515,43 +524,20 @@ class QuotaSyncProvider : ContentProvider() {
                     val updated = mutateLocalStore(
                         appCtx = appCtx,
                         lang = lang,
-                        theme = theme,
-                        overlayEnabled = overlayEnabled
+                        theme = theme
                     )
-                    dispatchLocalSideEffects(appCtx, updated)
+                    dispatchForegroundNotifications(appCtx, updated)
                     updated
                 } else {
                     val extras = Bundle().apply {
                         if (lang != null) putString(KEY_LANG, lang.code)
                         if (theme != null) putString(KEY_THEME, theme.code)
-                        if (overlayEnabled != null) putBoolean(KEY_OVERLAY_ENABLED, overlayEnabled)
                     }
                     val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_PUT_PREFS, null, extras)
                     UnifiedState.fromBundle(reply)
                 }
             } catch (_: Throwable) {
                 null
-            }
-        }
-
-        fun requestInProcessRefresh(context: Context, requesterPkg: String) {
-            try {
-                if (isInModuleProcess(context)) {
-                    val appCtx = context.applicationContext ?: context
-                    val st = ensureLoaded(appCtx)
-                    HookTelemetryReceiver.syncStateToHostApps(
-                        context = appCtx,
-                        state = st,
-                        includePing = true,
-                        triggerInAppScan = true
-                    )
-                } else {
-                    val extras = Bundle().apply {
-                        putString("requester_pkg", requesterPkg)
-                    }
-                    context.contentResolver.call(AUTHORITY_URI, METHOD_REQUEST_REFRESH, requesterPkg, extras)
-                }
-            } catch (_: Throwable) {
             }
         }
 

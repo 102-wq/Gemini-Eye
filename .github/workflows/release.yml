@@ -44,7 +44,7 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.${{ github.run_number }}
-          name: Gemini-Eye v2.0.${{ github.run_number }}
-          body: "**v2.0.0 Purely In-App Cronet/gRPC ProtoBuf & ViewModel Interception (Zero Web Fallback)**: Removed all WebView / `gemini.google.com/usage` HTTP polling and `INTERNET` permission; implemented non-destructive Cronet (`org.chromium.net.UrlRequest` / `BidirectionalStream`) & gRPC (`io.grpc.ClientInterceptor` / `Channel` / `ClientCall.Listener`) raw `ByteArray`/`ByteBuffer` stream interception with a binary ProtoBuf wire-format scanner (`5h` & `Weekly` reset epochs + percentage/usage fields); added `Throwable`-guarded `ViewModel` / `StateFlow` / `LiveData` / `Repository` memory hooks; preserved single-line capsule HUD (`MIUIX` / `MD3`, `EN` / `CN`) and `ModernQuotaModule` (API 102) Single-HUD Exclusion."
+          tag_name: v2.1.${{ github.run_number }}
+          name: Gemini-Eye v2.1.${{ github.run_number }}
+          body: "**v2.1.0 Zero-Background Lifecycle & Dynamic Session/Cookie Interception**: Dynamically intercepts active `Authorization`, `Cookie`, and `X-Goog-AuthUser` headers on outgoing Cronet, gRPC `Metadata`, and OkHttp requests for seamless Google account switching (zero static/hardcoded tokens); eliminated all background services, manifest wake-up receivers, and persistent system overlays (`0` permissions requested); `QuotaHudView` attaches strictly when Gemini is in the foreground, sleeps completely (`0` threads) when backgrounded, and triggers lightweight quota refreshes only on app open or user query dispatch."
           files: Gemini-Eye.apk

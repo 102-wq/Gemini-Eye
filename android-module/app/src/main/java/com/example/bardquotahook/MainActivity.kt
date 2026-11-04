@@ -10,12 +10,8 @@ import android.database.ContentObserver
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
 import android.widget.Button
@@ -39,13 +35,9 @@ class MainActivity : Activity() {
 
     private var hookStatusView: TextView? = null
     private var quotaPreviewView: TextView? = null
-    private var pingBtn: Button? = null
     private var engineDescView: TextView? = null
-
-    private var overlayToggleBtn: Button? = null
     private var launchGeminiBtn: Button? = null
 
-    private val uiHandler = Handler(Looper.getMainLooper())
     private var stateObserver: ContentObserver? = null
     private var bardInstalled = false
     private var gsaInstalled = false
@@ -76,16 +68,6 @@ class MainActivity : Activity() {
         } catch (_: Throwable) {
             packageManager.getLaunchIntentForPackage(pkg) != null
         }
-    }
-
-    private fun triggerInProcessScanAndPing() {
-        val st = QuotaSyncProvider.ensureLoaded(this)
-        HookTelemetryReceiver.syncStateToHostApps(
-            context = this,
-            state = st,
-            includePing = true,
-            triggerInAppScan = true
-        )
     }
 
     private fun launchGeminiNativeApp() {
@@ -135,10 +117,6 @@ class MainActivity : Activity() {
         val zh = state.lang == QuotaHudView.Lang.ZH
         val loc = localizedContext(state.lang)
 
-        if (state.isActivelyBound && OverlayHudController.isShowing) {
-            OverlayHudController.enforceSingleHudExclusivity(this)
-        }
-
         titleView?.text = loc.getString(R.string.settings_title)
 
         val installedLabel = loc.getString(R.string.settings_status_installed)
@@ -179,6 +157,7 @@ class MainActivity : Activity() {
             setTextColor(if (!isMiuix) Color.WHITE else Color.parseColor("#94A3B8"))
         }
 
+        val sessionLabel = state.sessionId.ifBlank { "sess_awaiting" }
         hookStatusView?.text = if (state.isActivelyBound) {
             val secAgo = maxOf(0L, (System.currentTimeMillis() - state.lastHeartbeatMs) / 1000L)
             loc.getString(
@@ -186,7 +165,7 @@ class MainActivity : Activity() {
                 state.lastBridge.ifBlank { "Xposed" },
                 state.lastPkg.ifBlank { "com.google.android.apps.bard" },
                 secAgo
-            )
+            ) + "\nSession: $sessionLabel"
         } else {
             loc.getString(R.string.settings_hook_waiting)
         }
@@ -196,28 +175,7 @@ class MainActivity : Activity() {
         quotaPreviewView?.text =
             "$label5h: ${snap.formatFiveHourDisplay()}   |   $labelWk: ${snap.formatWeeklyDisplay()}   [${snap.source}]"
 
-        pingBtn?.text = loc.getString(R.string.settings_sync_now)
         engineDescView?.text = loc.getString(R.string.settings_sync_desc)
-
-        val overlayOn = OverlayHudController.isShowing
-        overlayToggleBtn?.apply {
-            if (state.isActivelyBound) {
-                isEnabled = false
-                text = loc.getString(R.string.settings_overlay_exclusive)
-                background = makeBtnDrawable("#1E293B", "#334155")
-                setTextColor(Color.parseColor("#94A3B8"))
-            } else {
-                isEnabled = true
-                setTextColor(Color.WHITE)
-                text = if (overlayOn) {
-                    loc.getString(R.string.settings_overlay_disable)
-                } else {
-                    loc.getString(R.string.settings_overlay_enable)
-                }
-                background = makeBtnDrawable(if (overlayOn) "#059669" else "#334155")
-            }
-        }
-
         launchGeminiBtn?.text = loc.getString(R.string.settings_launch_gemini)
     }
 
@@ -272,7 +230,7 @@ class MainActivity : Activity() {
         val hudPreview = QuotaHudView(
             context = this,
             onRefreshClick = {
-                triggerInProcessScanAndPing()
+                refreshAllUi()
             },
             onOpenUsageClick = {
                 launchGeminiNativeApp()
@@ -389,7 +347,7 @@ class MainActivity : Activity() {
         prefCard.addView(langRow)
         prefCard.addView(themeRow)
 
-        // 2. Live In-App Interception & Unified Quota Store Telemetry Card
+        // 2. Zero-Background Dynamic Session Telemetry Card
         val diagCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = makeCardDrawable("#1E293B", "#334155")
@@ -414,71 +372,23 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#34D399"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.MONOSPACE
-            setPadding(0, dp(10f), 0, dp(10f))
+            setPadding(0, dp(10f), 0, dp(6f))
         }
         quotaPreviewView = quotaTv
-
-        val btnPing = Button(this).apply {
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            background = makeBtnDrawable("#0284C7")
-            setOnClickListener {
-                liveCapsulePreview?.triggerRefreshSpin()
-                triggerInProcessScanAndPing()
-                uiHandler.postDelayed({ refreshAllUi() }, 500L)
-            }
-        }
-        pingBtn = btnPing
 
         val descTv = TextView(this).apply {
             setTextColor(Color.parseColor("#94A3B8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setLineSpacing(dp(3f).toFloat(), 1.1f)
-            setPadding(0, dp(10f), 0, 0)
+            setPadding(0, dp(6f), 0, 0)
         }
         engineDescView = descTv
 
         diagCard.addView(statusTv)
         diagCard.addView(quotaTv)
-        diagCard.addView(btnPing)
         diagCard.addView(descTv)
 
-        // 3. Single-HUD Exclusive System Overlay Button
-        val overlayBtn = Button(this).apply {
-            isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(12f)
-            }
-            setPadding(dp(12f), dp(12f), dp(12f), dp(12f))
-            setOnClickListener {
-                if (QuotaSyncProvider.ensureLoaded(this@MainActivity).isActivelyBound) {
-                    OverlayHudController.enforceSingleHudExclusivity(this@MainActivity)
-                    refreshAllUi()
-                    return@setOnClickListener
-                }
-                if (OverlayHudController.isShowing) {
-                    OverlayHudController.hide(this@MainActivity)
-                    uiHandler.postDelayed({ refreshAllUi() }, 200L)
-                } else if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    val permIntent = Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
-                    )
-                    runCatching { startActivity(permIntent) }
-                } else {
-                    OverlayHudController.show(this@MainActivity)
-                    uiHandler.postDelayed({ refreshAllUi() }, 250L)
-                }
-            }
-        }
-        overlayToggleBtn = overlayBtn
-
-        // 4. Launch Gemini App Button
+        // 3. Launch Gemini App Button
         val launchBtn = Button(this).apply {
             isAllCaps = false
             setTextColor(Color.WHITE)
@@ -489,7 +399,7 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dp(10f)
+                topMargin = dp(12f)
             }
             setPadding(dp(12f), dp(13f), dp(12f), dp(13f))
             setOnClickListener { launchGeminiNativeApp() }
@@ -501,7 +411,6 @@ class MainActivity : Activity() {
         container.addView(previewCard)
         container.addView(prefCard)
         container.addView(diagCard)
-        container.addView(overlayBtn)
         container.addView(launchBtn)
         scroll.addView(container)
         setContentView(scroll)
@@ -512,13 +421,11 @@ class MainActivity : Activity() {
         stateObserver = QuotaSyncProvider.registerStateObserver(this) {
             runOnUiThread { refreshAllUi() }
         }
-        triggerInProcessScanAndPing()
         refreshAllUi()
     }
 
     override fun onResume() {
         super.onResume()
-        triggerInProcessScanAndPing()
         refreshAllUi()
     }
 

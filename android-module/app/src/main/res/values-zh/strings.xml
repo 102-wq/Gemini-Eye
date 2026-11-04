@@ -1,31 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Gemini-Eye 用量胶囊</string>
-    <string name="module_description">纯应用内 Cronet/gRPC ProtoBuf 与 ViewModel 内存嗅探用量胶囊（5h / 每周进度条 · MIUIX/MD3 · 中英双语）</string>
+    <string name="module_description">零后台服务 · 动态会话拦截 · Gemini 纯前台用量胶囊（无感切号 · MIUIX/MD3 · 中英双语）</string>
 
     <!-- Floating Capsule HUD Localized Labels -->
     <string name="hud_label_5h">5h</string>
     <string name="hud_label_weekly">每周</string>
-    <string name="hud_action_refresh">重扫应用内内存额度</string>
+    <string name="hud_action_refresh">刷新当前前台额度</string>
     <string name="hud_action_open_usage">打开模块设置</string>
 
     <!-- Module Settings & Preview Localized Strings -->
-    <string name="settings_title">Gemini-Eye 用量胶囊 (v2.0.0)</string>
-    <string name="settings_targets_fmt">宿主检测 · Gemini: %1$s | Google: %2$s | API 102 + 82</string>
+    <string name="settings_title">Gemini-Eye 用量胶囊 (v2.1.0)</string>
+    <string name="settings_targets_fmt">宿主检测 · Gemini: %1$s | Google: %2$s | 零后台 API 102 + 82</string>
     <string name="settings_status_installed">已安装</string>
     <string name="settings_status_missing">未安装</string>
-    <string name="settings_preview_caption">实时单行胶囊预览（纯应用内 gRPC/Cronet + ViewModel 统一数据源）</string>
+    <string name="settings_preview_caption">实时单行胶囊预览（动态多账号会话隔离 · 纯前台生命周期）</string>
     <string name="settings_appearance_title">语言与主题样式</string>
     <string name="settings_lang_zh">中文</string>
     <string name="settings_lang_en">English</string>
     <string name="settings_theme_miuix">MIUIX 毛玻璃</string>
     <string name="settings_theme_md3">MD3 动态取色</string>
-    <string name="settings_hook_bound_fmt">单 HUD 独占已激活 · 引擎: %1$s\n宿主: %2$s (%3$ds 前同步) · 系统全局悬浮窗已自动抑制</string>
-    <string name="settings_hook_waiting">等待 Gemini 进程连接：\n• 请在 LSPosed / Vector 中启用本模块并勾选 Gemini，强行停止后重新打开。\n• 严格从 Gemini 进程内 gRPC/Cronet 二进制流与 ViewModel 状态中提取（零网页轮询）。</string>
-    <string name="settings_sync_now">立即扫描应用内状态并同步</string>
-    <string name="settings_sync_desc">纯进程内拦截架构：直接在 com.google.android.apps.bard 内部拦截 Cronet UrlRequest / gRPC ProtoBuf 字节流并扫描 ViewModel / StateFlow / LiveData / Repository 内存字段，绝不发起任何外部网页请求。</string>
-    <string name="settings_overlay_exclusive">单 HUD 独占模式生效中（系统悬浮窗已自动抑制）</string>
-    <string name="settings_overlay_disable">关闭被动系统悬浮胶囊（运行中）</string>
-    <string name="settings_overlay_enable">开启被动系统悬浮胶囊（仅未注入时可用）</string>
+    <string name="settings_hook_bound_fmt">纯前台引擎就绪 · 架构: %1$s\n宿主: %2$s (%3$ds 前前台唤醒) · 零后台常驻服务</string>
+    <string name="settings_hook_waiting">等待打开 Gemini 前台界面：\n• 请在 LSPosed / Vector 中启用本模块并勾选 Gemini，打开 Gemini 即可自动挂载。\n• 胶囊仅在 Gemini 前台挂载，退回后台即完全休眠（0 后台线程）。</string>
+    <string name="settings_sync_now">刷新预览状态</string>
+    <string name="settings_sync_desc">动态会话与零后台架构：在发出 Cronet / gRPC 请求时实时捕获动态 Authorization / Cookie / X-Goog-AuthUser 会话指纹，切换 Google 账号自动隔离并刷新额度；仅在打开 Gemini 或发送提问时轻量触发，后台完全休眠。</string>
     <string name="settings_launch_gemini">启动 Gemini 应用</string>
 </resources>

@@ -9,37 +9,30 @@ import java.lang.reflect.Executable
 import java.lang.reflect.Modifier
 
 /**
- * Legacy Xposed / LSPosed Bridge API 82-93 Entry Point (`QuotaHookEntry`).
+ * Legacy Xposed / LSPosed Bridge API 82-93 Entry Point (`QuotaHookEntry` — v2.1.0).
  * Registered via `src/main/assets/xposed_init`.
  *
- * Strictly In-App Quota Extraction (Zero Web Fallback / Zero HTTP Polling):
- * 1. Native Cronet & gRPC Stream Interception:
- *    Matches all processes (`lpparam.processName`) of `com.google.android.apps.bard` and hooks
- *    `org.chromium.net.UrlRequest` / `BidirectionalStream` and `io.grpc.Channel` / `ClientInterceptor` /
- *    `ClientCall.Listener` to scan raw ProtoBuf binary payloads for 5h & Weekly limits + reset epochs.
- * 2. Memory / ViewModel / StateFlow / LiveData / Repository Hook:
- *    Hooks `androidx.lifecycle.ViewModel`, `StateFlowImpl`, and `LiveData` and scans loaded DEX
- *    state holders with every reflection lookup wrapped in `try-catch (Throwable)`.
- * 3. Single-Line Capsule HUD & Unified Sync:
- *    Renders captured data onto the single-line `QuotaHudView` pill (MIUIX / MD3, ZH / EN) and
- *    suppresses duplicate overlays via `QuotaSyncProvider`.
+ * Uses the exact same Zero-Background In-App Lifecycle and Dynamic Session/Cookie Interception
+ * architecture as `ModernQuotaModule`:
+ * - Skips non-UI background daemon processes (`isEligibleUiProcess`).
+ * - Dynamically intercepts outgoing `Authorization` / `Cookie` / `X-Goog-AuthUser` headers on the fly
+ *   so switching Google accounts inside Gemini seamlessly switches quota state.
+ * - Attaches `QuotaHudView` strictly while Gemini is in the foreground and sleeps completely in background.
  */
 class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        try {
-            XposedBridge.log("[BardQuota] initZygote -> ${startupParam.modulePath}")
-        } catch (_: Throwable) {
-        }
+        // Zero background work at Zygote init
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         try {
             val pkg = lpparam.packageName ?: return
             if (pkg == "android" || pkg == "com.example.bardquotahook") return
-            if (!QuotaCoreEngine.isTargetHostPackage(pkg)) return
 
             val procName = lpparam.processName ?: pkg
+            if (!QuotaCoreEngine.isEligibleUiProcess(pkg, procName)) return
+
             val hostClassLoader = lpparam.classLoader
 
             val bridge = object : QuotaCoreEngine.HookBridge {
@@ -107,22 +100,22 @@ class QuotaHookEntry : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 }
             }
 
-            // 1. Bind In-App Single-Line Capsule HUD & Unified Exclusivity Heartbeat
-            QuotaCoreEngine.installInAppHudAndExclusivity(
+            // 1. Zero-Background Foreground HUD Lifecycle
+            QuotaCoreEngine.installForegroundHudLifecycle(
                 packageName = pkg,
                 processName = procName,
                 classLoader = hostClassLoader,
                 bridge = bridge
             )
 
-            // 2. Hook Native Cronet Engine & gRPC Interceptors for Raw ProtoBuf Stream Scanning
-            QuotaCoreEngine.installNativeGrpcAndCronetInterceptors(
+            // 2. Dynamic Outgoing Session/Cookie/Auth Interception + Query Event & ProtoBuf Stream Hooks
+            QuotaCoreEngine.installDynamicSessionAndNetworkHooks(
                 classLoader = hostClassLoader,
                 bridge = bridge
             )
 
-            // 3. Hook ViewModel / StateFlow / LiveData & Scan Loaded Repository State Holders
-            QuotaCoreEngine.installMemoryAndViewModelHooks(
+            // 3. Foreground-Only ViewModel / StateFlow / LiveData On-Demand Inspection
+            QuotaCoreEngine.installForegroundMemoryHooks(
                 classLoader = hostClassLoader,
                 bridge = bridge
             )

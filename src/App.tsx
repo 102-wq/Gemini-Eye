@@ -6,10 +6,13 @@ import {
   ExternalLink,
   FileCode,
   FolderGit2,
+  Moon,
   RefreshCw,
   Search,
+  Send,
   ShieldCheck,
   Smartphone,
+  UserCheck,
 } from 'lucide-react';
 import { PROJECT_FILES } from './moduleFiles';
 import { buildZipBlob } from './zipBuilder';
@@ -28,20 +31,22 @@ interface HudSnapshot {
   source: string;
 }
 
-const SAMPLE_PAYLOADS: Array<{
+interface SimulatedAccountSession {
   id: string;
-  labelZh: string;
-  labelEn: string;
-  source: string;
-  raw: string;
+  sessionTag: string;
+  accountLabelZh: string;
+  accountLabelEn: string;
+  headerSummary: string;
   parsed: HudSnapshot;
-}> = [
+}
+
+const ACCOUNT_SESSIONS: SimulatedAccountSession[] = [
   {
-    id: 'reference-spec',
-    labelZh: 'Cronet ProtoBuf 二进制流 · 15% (1h52m) / 29% (23h52m)',
-    labelEn: 'Cronet ProtoBuf Stream · 15% (1h52m) / 29% (23h52m)',
-    source: 'Cronet-PB',
-    raw: 'gRPC Frame [0x00, 0x00000028] -> Window1{used=15, limit=100, ts=+6720s} | Window2{used=29, limit=100, ts=+85920s}',
+    id: 'account-primary',
+    sessionTag: 'sess_8f3a91c04b12',
+    accountLabelZh: '主账号 · Google Pro (X-Goog-AuthUser: 0)',
+    accountLabelEn: 'Primary Account · Google Pro (X-Goog-AuthUser: 0)',
+    headerSummary: 'Cronet UrlRequest.Builder.addHeader("Cookie", "__Secure-1PSID=...") -> sess_8f3a91c04b12',
     parsed: {
       fiveHourPct: 15,
       fiveHourQuota: '15%',
@@ -53,11 +58,11 @@ const SAMPLE_PAYLOADS: Array<{
     },
   },
   {
-    id: 'grpc-stream',
-    labelZh: 'gRPC ClientInterceptor 帧解析 · 42% (3h18m) / 64% (4d12h)',
-    labelEn: 'gRPC ClientInterceptor Frame · 42% (3h18m) / 64% (4d12h)',
-    source: 'gRPC-PB',
-    raw: 'io.grpc.ClientCall$Listener.onMessage -> ProtoBuf{f5h=0.42, ts=+11880s, fWk=0.64, ts=+388800s}',
+    id: 'account-workspace',
+    sessionTag: 'sess_2d7e44b910ca',
+    accountLabelZh: '切换账号 · Workspace 账号 (X-Goog-AuthUser: 1)',
+    accountLabelEn: 'Switched Account · Workspace (X-Goog-AuthUser: 1)',
+    headerSummary: 'gRPC Metadata.put("authorization", "Bearer ya29...") -> sess_2d7e44b910ca',
     parsed: {
       fiveHourPct: 42,
       fiveHourQuota: '42%',
@@ -69,11 +74,11 @@ const SAMPLE_PAYLOADS: Array<{
     },
   },
   {
-    id: 'stateflow-vm',
-    labelZh: 'ViewModel / StateFlow 内存态捕获 · 84% (28m) / 92% (11h05m)',
-    labelEn: 'ViewModel / StateFlow Memory · 84% (28m) / 92% (11h05m)',
-    source: 'StateFlow',
-    raw: 'StateFlowImpl.setValue -> QuotaState(fiveHour=84%, reset=28m, weekly=92%, reset=11h05m)',
+    id: 'account-heavy',
+    sessionTag: 'sess_c91b05e781f4',
+    accountLabelZh: '备用账号 · 高负载会话 (X-Goog-AuthUser: 2)',
+    accountLabelEn: 'Secondary Account · High Usage (X-Goog-AuthUser: 2)',
+    headerSummary: 'OkHttp Request.Builder.header("Authorization", "Bearer ya29...") -> sess_c91b05e781f4',
     parsed: {
       fiveHourPct: 84,
       fiveHourQuota: '84%',
@@ -92,16 +97,15 @@ export default function App() {
   const [hudTheme, setHudTheme] = useState<HudTheme>('MIUIX');
   const [activeView, setActiveView] = useState<ActiveView>('simulator');
   const [selectedPath, setSelectedPath] = useState<string>(
-    'app/src/main/java/com/example/bardquotahook/ModernQuotaModule.kt'
+    'app/src/main/java/com/example/bardquotahook/QuotaCoreEngine.kt'
   );
   const [fileQuery, setFileQuery] = useState('');
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const [zipDownloaded, setZipDownloaded] = useState(false);
 
-  const [selectedSampleId, setSelectedSampleId] = useState<string>('reference-spec');
+  const [selectedAccountId, setSelectedAccountId] = useState<string>('account-primary');
   const [simDarkTheme, setSimDarkTheme] = useState<boolean>(false);
-  const [xposedBound, setXposedBound] = useState<boolean>(true);
-  const [systemOverlayEnabled, setSystemOverlayEnabled] = useState<boolean>(false);
+  const [isGeminiForeground, setIsGeminiForeground] = useState<boolean>(true);
   const [isRefreshingHud, setIsRefreshingHud] = useState<boolean>(false);
   const [usageSheetOpen, setUsageSheetOpen] = useState<boolean>(false);
   const [lastSyncNote, setLastSyncNote] = useState<string>('');
@@ -137,27 +141,20 @@ export default function App() {
     [selectedPath]
   );
 
-  const activeSample = useMemo(
-    () => SAMPLE_PAYLOADS.find((s) => s.id === selectedSampleId) ?? SAMPLE_PAYLOADS[0],
-    [selectedSampleId]
+  const activeSession = useMemo(
+    () => ACCOUNT_SESSIONS.find((s) => s.id === selectedAccountId) ?? ACCOUNT_SESSIONS[0],
+    [selectedAccountId]
   );
-
-  // Enforce Single-HUD Exclusion when ModernQuotaModule (API 102) binds to Gemini
-  useEffect(() => {
-    if (xposedBound && systemOverlayEnabled) {
-      setSystemOverlayEnabled(false);
-    }
-  }, [xposedBound, systemOverlayEnabled]);
 
   // Update mini progress bar fill widths via DOM refs (no inline style props)
   useEffect(() => {
-    const w5 = `${Math.max(8, Math.min(100, activeSample.parsed.fiveHourPct))}%`;
-    const wWk = `${Math.max(8, Math.min(100, activeSample.parsed.weeklyPct))}%`;
+    const w5 = `${Math.max(8, Math.min(100, activeSession.parsed.fiveHourPct))}%`;
+    const wWk = `${Math.max(8, Math.min(100, activeSession.parsed.weeklyPct))}%`;
     if (bar5hRef.current) bar5hRef.current.style.width = w5;
     if (barWeeklyRef.current) barWeeklyRef.current.style.width = wWk;
     if (settingsBar5hRef.current) settingsBar5hRef.current.style.width = w5;
     if (settingsBarWeeklyRef.current) settingsBarWeeklyRef.current.style.width = wWk;
-  }, [activeSample, activeView, xposedBound, systemOverlayEnabled]);
+  }, [activeSession, activeView, isGeminiForeground]);
 
   const handleDownloadZip = () => {
     const blob = buildZipBlob(
@@ -169,7 +166,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'Gemini-Eye-v2.0.0-Android-Project.zip';
+    link.download = 'Gemini-Eye-v2.1.0-Android-Project.zip';
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -184,14 +181,50 @@ export default function App() {
     setTimeout(() => setCopiedPath(null), 1800);
   };
 
-  const triggerSimulatedRefresh = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (isRefreshingHud) return;
+  const handleSwitchAccount = (acct: SimulatedAccountSession) => {
+    setSelectedAccountId(acct.id);
     setIsRefreshingHud(true);
     setLastSyncNote(
       isZh
-        ? '已触发进程内重扫：扫描 com.google.android.apps.bard 内存中的 ViewModel / StateFlow / LiveData / Repository 与最近一次 Cronet/gRPC ProtoBuf 快照（零网页轮询）'
-        : 'Triggered strictly in-app scan: inspected live ViewModel / StateFlow / LiveData / Repository holders & latest Cronet/gRPC ProtoBuf frame inside com.google.android.apps.bard (zero web polling)'
+        ? `检测到出站动态请求头变更 (${acct.sessionTag})：已自动隔离旧账号缓存并切换至当前 Google 账号额度`
+        : `Dynamic outgoing auth/cookie header changed (${acct.sessionTag}): isolated previous cache & switched to active Google account quota`
+    );
+    setTimeout(() => setIsRefreshingHud(false), 550);
+  };
+
+  const handleToggleForeground = (fg: boolean) => {
+    setIsGeminiForeground(fg);
+    setUsageSheetOpen(false);
+    setLastSyncNote(
+      fg
+        ? isZh
+          ? 'Gemini 进入前台 (APP_OPEN)：HUD 已挂载并触发一次轻量级前台额度刷新'
+          : 'Gemini entered foreground (APP_OPEN): HUD attached & triggered single lightweight refresh'
+        : isZh
+        ? 'Gemini 退至后台 (TRIM_MEMORY_UI_HIDDEN)：HUD 已卸载、注销监听、清空临时凭证缓冲，工作线程降至 0'
+        : 'Gemini moved to background: HUD detached, observers unregistered, buffers wiped, 0 active threads'
+    );
+  };
+
+  const handleSimulateQuerySend = () => {
+    if (!isGeminiForeground) return;
+    setIsRefreshingHud(true);
+    setLastSyncNote(
+      isZh
+        ? `发送提问事件 (QUERY_SENT · ${activeSession.sessionTag})：实时携带当前账号 Authorization/Cookie，流结束后触发单次轻量额度同步`
+        : `User query sent (QUERY_SENT · ${activeSession.sessionTag}): intercepted live Authorization/Cookie header & triggered lightweight post-query sync`
+    );
+    setTimeout(() => setIsRefreshingHud(false), 600);
+  };
+
+  const triggerSimulatedRefresh = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isRefreshingHud || !isGeminiForeground) return;
+    setIsRefreshingHud(true);
+    setLastSyncNote(
+      isZh
+        ? `手动前台刷新 (MANUAL_TAP · ${activeSession.sessionTag})：扫描当前前台 Activity ViewModel / StateFlow 状态（零网页轮询 / 零常驻服务）`
+        : `Manual foreground refresh (MANUAL_TAP · ${activeSession.sessionTag}): scanned foreground Activity ViewModel / StateFlow holders (zero web polling)`
     );
     setTimeout(() => {
       setIsRefreshingHud(false);
@@ -255,7 +288,6 @@ export default function App() {
         ? 'bg-zinc-900/80 backdrop-blur-xl border-white/20 text-slate-50 shadow-lg shadow-black/40'
         : 'bg-white/85 backdrop-blur-xl border-slate-900/12 text-slate-900 shadow-lg shadow-slate-900/12';
     }
-    // MD3 Material You Dynamic Tonal Surface
     return simDarkTheme
       ? 'bg-[#292533]/95 border-[#938F99]/40 text-[#E6E1E5] shadow-md shadow-black/40'
       : 'bg-[#F5EFFB]/95 border-[#CAC4D0]/70 text-[#1D1B20] shadow-md shadow-indigo-950/10';
@@ -286,8 +318,6 @@ export default function App() {
       : 'text-violet-700 hover:bg-violet-700/10 active:bg-violet-700/20';
   }, [hudTheme, simDarkTheme]);
 
-  const showAnyHudInSim = xposedBound || systemOverlayEnabled;
-
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col lg:flex-row">
       {/* Sidebar Navigation */}
@@ -297,9 +327,9 @@ export default function App() {
             Gemini-Eye
           </div>
           <div className="mt-1 text-xs text-slate-500">
-            <span>In-App gRPC/Cronet · API 102 + 82</span>
+            <span>Zero-Background · API 102 + 82</span>
             <span aria-hidden="true"> · </span>
-            <span>v2.0.0</span>
+            <span>v2.1.0</span>
           </div>
         </div>
 
@@ -315,7 +345,7 @@ export default function App() {
           >
             <Smartphone className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? '单行胶囊交互预览 (MIUIX/MD3)' : 'Capsule HUD Simulator'}
+              {isZh ? '动态切号与纯前台预览' : 'Session & Foreground Simulator'}
             </span>
           </button>
 
@@ -347,7 +377,7 @@ export default function App() {
           >
             <FolderGit2 className="w-4 h-4 shrink-0" />
             <span className="truncate">
-              {isZh ? 'v2.0.0 纯进程内拦截架构说明' : 'v2.0.0 Pure In-App Hook Spec'}
+              {isZh ? 'v2.1.0 零后台动态会话架构' : 'v2.1.0 Zero-Background Spec'}
             </span>
           </button>
         </nav>
@@ -387,19 +417,19 @@ export default function App() {
         <header className="flex items-center justify-between gap-6 px-6 py-3.5 bg-white border-b border-slate-200">
           <div className="flex items-center gap-2 text-sm text-slate-600 min-w-0">
             <span className="font-semibold text-slate-900 whitespace-nowrap">
-              {isZh ? 'Gemini 单行胶囊监控模块' : 'Gemini Capsule HUD Module'}
+              {isZh ? 'Gemini 零后台胶囊监控模块' : 'Gemini Zero-Background HUD'}
             </span>
             <span aria-hidden="true">/</span>
             <span className="truncate">
               {activeView === 'simulator'
                 ? isZh
-                  ? 'QuotaHudView 单行胶囊 · 双语 i18n · 单 HUD 互斥 · MIUIX vs MD3'
-                  : 'QuotaHudView Single-Row Pill · i18n · Single-HUD Exclusion · MIUIX vs MD3'
+                  ? '动态 Authorization/Cookie 切号隔离 · 前台挂载 / 后台完全休眠'
+                  : 'Dynamic Session Interception · Foreground-Only Lifecycle'
                 : activeView === 'files'
                 ? currentFile.path
                 : isZh
-                ? 'v2.0.0 纯进程内 Cronet/gRPC 与 ViewModel 架构'
-                : 'v2.0.0 Pure In-App Cronet/gRPC & ViewModel Spec'}
+                ? 'v2.1.0 零后台与动态多账号架构说明'
+                : 'v2.1.0 Zero-Background & Dynamic Session Spec'}
             </span>
           </div>
 
@@ -412,11 +442,11 @@ export default function App() {
             <span>
               {zipDownloaded
                 ? isZh
-                  ? '已导出 v2.0.0 工程 .zip'
-                  : 'v2.0.0 .zip Downloaded'
+                  ? '已导出 v2.1.0 工程 .zip'
+                  : 'v2.1.0 .zip Downloaded'
                 : isZh
-                ? '导出 v2.0.0 Android 工程 (.zip)'
-                : 'Export v2.0.0 Project (.zip)'}
+                ? '导出 v2.1.0 Android 工程 (.zip)'
+                : 'Export v2.1.0 Project (.zip)'}
             </span>
           </button>
         </header>
@@ -438,17 +468,6 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaHookEntry.kt');
-                setActiveView('files');
-              }}
-              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
-            >
-              QuotaHookEntry.kt
-            </button>
-            <span aria-hidden="true">·</span>
-            <button
-              type="button"
-              onClick={() => {
                 setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaCoreEngine.kt');
                 setActiveView('files');
               }}
@@ -460,23 +479,34 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaTextParser.kt');
+                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaHookEntry.kt');
                 setActiveView('files');
               }}
               className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
             >
-              QuotaTextParser.kt
+              QuotaHookEntry.kt
             </button>
             <span aria-hidden="true">·</span>
             <button
               type="button"
               onClick={() => {
-                setSelectedPath('app/src/main/java/com/example/bardquotahook/QuotaHudView.kt');
+                setSelectedPath('app/proguard-rules.pro');
                 setActiveView('files');
               }}
               className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
             >
-              QuotaHudView.kt
+              proguard-rules.pro
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath('app/src/main/AndroidManifest.xml');
+                setActiveView('files');
+              }}
+              className="font-mono text-slate-800 hover:text-blue-600 underline underline-offset-4 cursor-pointer"
+            >
+              AndroidManifest.xml
             </button>
           </div>
 
@@ -510,13 +540,115 @@ export default function App() {
         <main className="p-6 max-w-6xl w-full mx-auto flex-1">
           {activeView === 'simulator' && (
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-              {/* Left Column: Controls & SharedPreferences Sync State */}
+              {/* Left Column: Lifecycle, Account Session & Theme Controls */}
               <div className="lg:col-span-6 space-y-5">
+                {/* 1. Zero-Background Lifecycle Gate */}
+                <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-slate-900">
+                      {isZh
+                        ? '1. 零后台应用内生命周期 (Zero-Background Lifecycle)'
+                        : '1. Zero-Background In-App Lifecycle'}
+                    </div>
+                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                  </div>
+
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    {isZh
+                      ? '无任何常驻 Service 或轮询定时器。仅当 Gemini Activity 进入前台时挂载 HUD；切回桌面或锁屏时立即卸载 HUD、注销监听并将线程池缩减至 0 线程。'
+                      : 'Zero background or foreground services. HUD attaches strictly when Gemini enters foreground and detaches + spins down to 0 threads on background.'}
+                  </p>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleForeground(true)}
+                      className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors text-left cursor-pointer ${
+                        isGeminiForeground
+                          ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="font-semibold">
+                        {isZh ? 'Gemini 前台运行中 (Awake)' : 'Gemini Foreground (Awake)'}
+                      </div>
+                      <div className="text-[11px] opacity-80 mt-0.5">
+                        {isZh ? 'HUD 已挂载 · 按需事件触发' : 'HUD attached · Event-driven'}
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleToggleForeground(false)}
+                      className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors text-left cursor-pointer ${
+                        !isGeminiForeground
+                          ? 'bg-slate-900 border-slate-900 text-white'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="font-semibold flex items-center gap-1.5">
+                        <Moon className="w-3.5 h-3.5" />
+                        <span>
+                          {isZh ? '退至后台休眠 (Sleep)' : 'Background Sleep (0 Threads)'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] opacity-80 mt-0.5">
+                        {isZh ? 'HUD 已卸载 · 0 后台线程耗电' : 'HUD detached · 0 idle CPU/threads'}
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                {/* 2. Dynamic Session & Google Account Switcher */}
+                <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-slate-900">
+                      {isZh
+                        ? '2. 动态 Authorization / Cookie 切号拦截'
+                        : '2. Dynamic Session & Cookie Account Switching'}
+                    </div>
+                    <UserCheck className="w-4 h-4 text-blue-600 shrink-0" />
+                  </div>
+
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    {isZh
+                      ? '绝不硬编码静态 Cookie 或 Token。实时从 Cronet / gRPC Metadata / OkHttp 出站请求头提取稳定会话指纹，应用内切换 Google 账号时立即隔离旧缓存并无缝刷新：'
+                      : 'Never uses hardcoded cookies/tokens. Dynamically intercepts outgoing Cronet/gRPC headers to isolate per-account quota states on Google account switch:'}
+                  </p>
+
+                  <div className="space-y-2">
+                    {ACCOUNT_SESSIONS.map((acct) => {
+                      const selected = acct.id === activeSession.id;
+                      return (
+                        <button
+                          key={acct.id}
+                          type="button"
+                          onClick={() => handleSwitchAccount(acct)}
+                          className={`w-full text-left p-3 rounded-lg border transition-colors cursor-pointer ${
+                            selected
+                              ? 'bg-slate-900 text-white border-slate-900'
+                              : 'bg-slate-50 text-slate-800 border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2 text-xs font-medium">
+                            <span>{isZh ? acct.accountLabelZh : acct.accountLabelEn}</span>
+                            <span className="font-mono opacity-80">{acct.sessionTag}</span>
+                          </div>
+                          <div className="mt-1 text-[11px] font-mono opacity-75 truncate">
+                            {acct.headerSummary}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 3. Dual Language (i18n) & Theme Engine */}
                 <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '1. 双语标签 (i18n) 与双主题引擎 (MIUIX vs MD3)'
-                      : '1. Dual Language (i18n) & Theme Engine (MIUIX vs MD3)'}
+                      ? '3. 双语标签 (i18n) 与双主题引擎 (MIUIX vs MD3)'
+                      : '3. Dual Language (i18n) & Theme Engine (MIUIX vs MD3)'}
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -580,130 +712,13 @@ export default function App() {
                       </div>
                     </div>
                   </div>
-                </div>
-
-                {/* Single-HUD Exclusion Control */}
-                <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-semibold text-slate-900">
-                      {isZh
-                        ? '2. 单 HUD 互斥机制 (ModernQuotaModule API 102)'
-                        : '2. Single-HUD Exclusion (ModernQuotaModule API 102)'}
-                    </div>
-                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                  </div>
-
-                  <p className="text-xs text-slate-600 leading-relaxed">
-                    {isZh
-                      ? '当 ModernQuotaModule (Xposed API 102) 成功绑定 Gemini 并发送心跳时，自动关闭并锁定 App 系统全局悬浮窗，确保仅渲染唯一的 Gemini 应用内单行胶囊。'
-                      : 'When ModernQuotaModule (Xposed API 102) binds to Gemini, OverlayHudController automatically disables the App System Overlay so only one in-app HUD renders.'}
-                  </p>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setXposedBound((v) => !v)}
-                      className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors text-left cursor-pointer ${
-                        xposedBound
-                          ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
-                          : 'bg-slate-50 border-slate-200 text-slate-700'
-                      }`}
-                    >
-                      <div className="font-semibold">
-                        {xposedBound
-                          ? isZh
-                            ? 'ModernQuotaModule: 已绑定'
-                            : 'ModernQuotaModule: Bound'
-                          : isZh
-                          ? 'ModernQuotaModule: 未绑定'
-                          : 'ModernQuotaModule: Unbound'}
-                      </div>
-                      <div className="text-[11px] opacity-80 mt-0.5">
-                        {xposedBound
-                          ? isZh
-                            ? '应用内单胶囊已接管'
-                            : 'In-app single HUD active'
-                          : isZh
-                          ? '点击模拟 Xposed 注入绑定'
-                          : 'Click to simulate Xposed bind'}
-                      </div>
-                    </button>
-
-                    <button
-                      type="button"
-                      disabled={xposedBound}
-                      onClick={() => setSystemOverlayEnabled((v) => !v)}
-                      className={`px-3 py-2 text-xs font-medium rounded-lg border transition-colors text-left ${
-                        xposedBound
-                          ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
-                          : systemOverlayEnabled
-                          ? 'bg-blue-50 border-blue-300 text-blue-900 cursor-pointer'
-                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 cursor-pointer'
-                      }`}
-                    >
-                      <div className="font-semibold">
-                        {xposedBound
-                          ? isZh
-                            ? '系统悬浮窗：已自动互斥关闭'
-                            : 'System Overlay: Auto-Disabled'
-                          : systemOverlayEnabled
-                          ? isZh
-                            ? '系统悬浮窗：开启中'
-                            : 'System Overlay: Enabled'
-                          : isZh
-                          ? '系统悬浮窗：已关闭'
-                          : 'System Overlay: Off'}
-                      </div>
-                      <div className="text-[11px] opacity-80 mt-0.5">
-                        {xposedBound
-                          ? isZh
-                            ? '防止重影双胶囊'
-                            : 'Prevents duplicate HUDs'
-                          : isZh
-                          ? '仅在未 Hook 时允许开启'
-                          : 'Fallback when unhooked'}
-                      </div>
-                    </button>
-                  </div>
-                </div>
-
-                {/* SharedPreferences Sample Selector */}
-                <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
-                  <div className="text-sm font-semibold text-slate-900">
-                    {isZh
-                      ? '3. 单一权威跨进程数据源 (QuotaSyncProvider)'
-                      : '3. Single Unified Data Source (QuotaSyncProvider)'}
-                  </div>
-
-                  <div className="space-y-2">
-                    {SAMPLE_PAYLOADS.map((sample) => {
-                      const selected = sample.id === activeSample.id;
-                      return (
-                        <button
-                          key={sample.id}
-                          type="button"
-                          onClick={() => setSelectedSampleId(sample.id)}
-                          className={`w-full text-left p-3 rounded-lg border transition-colors cursor-pointer ${
-                            selected
-                              ? 'bg-slate-900 text-white border-slate-900'
-                              : 'bg-slate-50 text-slate-800 border-slate-200 hover:border-slate-300'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2 text-xs font-medium">
-                            <span>{isZh ? sample.labelZh : sample.labelEn}</span>
-                            <span className="font-mono opacity-75">{sample.source}</span>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
 
                   {/* Identical Settings App Mirror */}
                   <div className="pt-2 border-t border-slate-100">
                     <div className="text-[11px] text-slate-500 mb-2">
                       {isZh
-                        ? 'MainActivity 设置页共享数值镜像 (与 Gemini 内置 HUD 100% 实时一致)：'
-                        : 'MainActivity Settings Mirror (Identical SharedPreferences values):'}
+                        ? `MainActivity 同步镜像 (当前会话 ${activeSession.sessionTag})：`
+                        : `MainActivity Mirror (Session ${activeSession.sessionTag}):`}
                     </div>
                     <div className="px-3 py-2 rounded-lg bg-slate-900 text-slate-100 font-mono text-xs flex flex-wrap items-center justify-between gap-2">
                       <span className="inline-flex items-center gap-1.5">
@@ -712,7 +727,7 @@ export default function App() {
                           <span ref={settingsBar5hRef} className="block h-full rounded-full bg-sky-400" />
                         </span>
                         <span>
-                          {activeSample.parsed.fiveHourQuota} ({activeSample.parsed.fiveHourReset})
+                          {activeSession.parsed.fiveHourQuota} ({activeSession.parsed.fiveHourReset})
                         </span>
                       </span>
                       <span className="inline-flex items-center gap-1.5">
@@ -721,7 +736,7 @@ export default function App() {
                           <span ref={settingsBarWeeklyRef} className="block h-full rounded-full bg-sky-400" />
                         </span>
                         <span>
-                          {activeSample.parsed.weeklyLimit} ({activeSample.parsed.weeklyReset})
+                          {activeSession.parsed.weeklyLimit} ({activeSession.parsed.weeklyReset})
                         </span>
                       </span>
                     </div>
@@ -729,7 +744,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right Column: Simulated Gemini Host Screen with Exact Single-Line Capsule */}
+              {/* Right Column: Simulated Gemini Host Screen */}
               <div className="lg:col-span-6 flex flex-col items-center gap-3">
                 <div className="w-full max-w-md flex items-center justify-between px-1">
                   <span className="text-xs font-medium text-slate-600">
@@ -767,75 +782,135 @@ export default function App() {
                   >
                     <span>09:41</span>
                     <span>
-                      {xposedBound ? 'Gemini · In-App Xposed HUD' : 'Gemini · Unhooked'}
+                      {isGeminiForeground
+                        ? `Gemini · ${activeSession.sessionTag}`
+                        : isZh
+                        ? 'Android 桌面 · Gemini 已后台休眠'
+                        : 'Home · Gemini Sleeping (0 Threads)'}
                     </span>
                   </div>
 
                   {/* Simulated Gemini Body */}
-                  <div className="p-6 pt-16 space-y-4 flex-1">
-                    <div>
-                      <div className="text-base font-bold">
-                        {isZh ? '你好，有什么可以帮你？' : 'Hello, how can I help today?'}
-                      </div>
-                      <div
-                        className={`mt-1 text-xs ${
-                          simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
-                        }`}
-                      >
-                        {isZh
-                          ? '可按住上方单行胶囊任意拖拽，或点击胶囊右侧「↻ 刷新」与「↗ 用量网页」图标按钮。'
-                          : 'Drag the single-line capsule above, or click its right-side Refresh (↻) and External Link (↗) buttons.'}
-                      </div>
+                  <div className="p-6 pt-16 space-y-4 flex-1 flex flex-col justify-between">
+                    <div className="space-y-4">
+                      {isGeminiForeground ? (
+                        <div>
+                          <div className="text-base font-bold">
+                            {isZh ? '你好，有什么可以帮你？' : 'Hello, how can I help today?'}
+                          </div>
+                          <div
+                            className={`mt-1 text-xs ${
+                              simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
+                            }`}
+                          >
+                            {isZh
+                              ? '仅在打开 Gemini 或点击下方「发送提问」时触发轻量刷新；切换左侧 Google 账号将实时拦截新会话请求头。'
+                              : 'Lightweight quota refresh runs only on Gemini foreground open or query send below.'}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="py-12 text-center space-y-2">
+                          <Moon className="w-7 h-7 mx-auto opacity-50" />
+                          <div className="text-sm font-semibold">
+                            {isZh
+                              ? 'Gemini 已进入后台完全休眠态'
+                              : 'Gemini Process in Zero-Background Sleep'}
+                          </div>
+                          <div
+                            className={`text-xs max-w-xs mx-auto leading-relaxed ${
+                              simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
+                            }`}
+                          >
+                            {isZh
+                              ? 'QuotaHudView 已从窗口移除，ContentObserver 已注销，工作线程池已缩减至 0 线程。点击左侧「Gemini 前台运行中」重新唤醒。'
+                              : 'QuotaHudView detached, ContentObserver unregistered, and worker pool spun down to 0 threads.'}
+                          </div>
+                        </div>
+                      )}
+
+                      {lastSyncNote && (
+                        <div
+                          className={`p-3 rounded-xl border text-xs leading-relaxed ${
+                            simDarkTheme
+                              ? 'bg-emerald-950/50 border-emerald-800/60 text-emerald-200'
+                              : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                          }`}
+                        >
+                          {lastSyncNote}
+                        </div>
+                      )}
+
+                      {usageSheetOpen && isGeminiForeground && (
+                        <div
+                          className={`p-4 rounded-2xl border space-y-2.5 ${
+                            simDarkTheme
+                              ? 'bg-zinc-900 border-zinc-700 text-zinc-100'
+                              : 'bg-white border-slate-200 text-slate-900 shadow-xs'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-mono font-semibold text-blue-500">
+                              com.example.bardquotahook.MainActivity
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setUsageSheetOpen(false)}
+                              className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                            >
+                              {isZh ? '关闭' : 'Close'}
+                            </button>
+                          </div>
+                          <div className="text-xs space-y-1">
+                            <div className="font-mono text-[11px] opacity-75">
+                              Session: {activeSession.sessionTag}
+                            </div>
+                            <div>
+                              5h ({activeSession.parsed.source}):{' '}
+                              <strong>{activeSession.parsed.fiveHourQuota}</strong> (
+                              {activeSession.parsed.fiveHourReset})
+                            </div>
+                            <div>
+                              Weekly ({activeSession.parsed.source}):{' '}
+                              <strong>{activeSession.parsed.weeklyLimit}</strong> (
+                              {activeSession.parsed.weeklyReset})
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
-                    {lastSyncNote && (
+                    {/* Simulated Gemini Prompt Bar to trigger QUERY_SENT */}
+                    {isGeminiForeground && (
                       <div
-                        className={`p-3 rounded-xl border text-xs leading-relaxed ${
+                        className={`p-2 rounded-2xl border flex items-center justify-between gap-2 ${
                           simDarkTheme
-                            ? 'bg-emerald-950/50 border-emerald-800/60 text-emerald-200'
-                            : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                            ? 'bg-zinc-900 border-zinc-800'
+                            : 'bg-white border-slate-200 shadow-xs'
                         }`}
                       >
-                        {lastSyncNote}
-                      </div>
-                    )}
-
-                    {usageSheetOpen && (
-                      <div
-                        className={`p-4 rounded-2xl border space-y-2.5 ${
-                          simDarkTheme
-                            ? 'bg-zinc-900 border-zinc-700 text-zinc-100'
-                            : 'bg-white border-slate-200 text-slate-900 shadow-xs'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-mono font-semibold text-blue-500">
-                            com.example.bardquotahook.MainActivity
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => setUsageSheetOpen(false)}
-                            className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
-                          >
-                            {isZh ? '关闭' : 'Close'}
-                          </button>
-                        </div>
-                        <div className="text-xs space-y-1">
-                          <div>
-                            5h ({activeSample.source}): <strong>{activeSample.parsed.fiveHourQuota}</strong> (
-                            {activeSample.parsed.fiveHourReset})
-                          </div>
-                          <div>
-                            Weekly ({activeSample.source}): <strong>{activeSample.parsed.weeklyLimit}</strong> (
-                            {activeSample.parsed.weeklyReset})
-                          </div>
-                        </div>
+                        <span
+                          className={`px-2.5 text-xs truncate ${
+                            simDarkTheme ? 'text-zinc-400' : 'text-slate-500'
+                          }`}
+                        >
+                          {isZh
+                            ? '模拟发送一条 Gemini 提问以触发按需刷新...'
+                            : 'Simulate sending a Gemini query...'}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleSimulateQuerySend}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 transition-colors shrink-0 cursor-pointer"
+                        >
+                          <Send className="w-3.5 h-3.5" />
+                          <span>{isZh ? '发送提问' : 'Send Query'}</span>
+                        </button>
                       </div>
                     )}
                   </div>
 
-                  {/* EXACT SINGLE-LINE CAPSULE HUD (`QuotaHudView.kt` Spec) */}
-                  {showAnyHudInSim && (
+                  {/* EXACT SINGLE-LINE CAPSULE HUD (`QuotaHudView.kt` Spec — Foreground Only) */}
+                  {isGeminiForeground && (
                     <div
                       ref={hudCapsuleRef}
                       onPointerDown={onHudPointerDown}
@@ -843,7 +918,6 @@ export default function App() {
                       onPointerUp={onHudPointerUp}
                       className={`absolute top-12 right-2.5 max-w-[96%] inline-flex items-center px-2.5 py-1.5 rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none transition-colors ${capsuleContainerClass}`}
                     >
-                      {/* Left Section: 5h + Mini Progress Bar + "15% (1h52m)" */}
                       <span className={`font-semibold ${capsuleLabelClass}`}>5h</span>
                       <span
                         className={`w-6 h-[5px] mx-1.5 rounded-full overflow-hidden shrink-0 ${capsuleTrackClass}`}
@@ -851,22 +925,20 @@ export default function App() {
                         <span
                           ref={bar5hRef}
                           className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
-                            activeSample.parsed.fiveHourPct
+                            activeSession.parsed.fiveHourPct
                           )}`}
                         />
                       </span>
                       <span className="font-medium tabular-nums">
-                        {activeSample.parsed.fiveHourQuota} ({activeSample.parsed.fiveHourReset})
+                        {activeSession.parsed.fiveHourQuota} ({activeSession.parsed.fiveHourReset})
                       </span>
 
-                      {/* Subtle Divider 1 */}
                       <span
                         className={`w-px h-3 mx-2 shrink-0 ${
                           simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
                         }`}
                       />
 
-                      {/* Middle Section: "每周" / "Weekly" + Mini Progress Bar + "29% (23h52m)" */}
                       <span className={`font-semibold ${capsuleLabelClass}`}>
                         {hudLang === 'zh' ? '每周' : 'Weekly'}
                       </span>
@@ -876,27 +948,25 @@ export default function App() {
                         <span
                           ref={barWeeklyRef}
                           className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
-                            activeSample.parsed.weeklyPct
+                            activeSession.parsed.weeklyPct
                           )}`}
                         />
                       </span>
                       <span className="font-medium tabular-nums">
-                        {activeSample.parsed.weeklyLimit} ({activeSample.parsed.weeklyReset})
+                        {activeSession.parsed.weeklyLimit} ({activeSession.parsed.weeklyReset})
                       </span>
 
-                      {/* Subtle Divider 2 */}
                       <span
                         className={`w-px h-3 ml-2 mr-1 shrink-0 ${
                           simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
                         }`}
                       />
 
-                      {/* Right Section: Refresh Icon Button + External Link Icon Button */}
                       <button
                         type="button"
                         data-hud-action="true"
                         onClick={triggerSimulatedRefresh}
-                        title={isZh ? '触发后台 API 同步' : 'Trigger Background API Sync'}
+                        title={isZh ? '手动刷新当前前台额度' : 'Refresh foreground quota'}
                         className={`w-5 h-5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
                       >
                         <RefreshCw
@@ -908,7 +978,7 @@ export default function App() {
                         type="button"
                         data-hud-action="true"
                         onClick={triggerOpenUsageWebpage}
-                        title={isZh ? '打开用量网页' : 'Open Usage Webpage'}
+                        title={isZh ? '打开模块设置' : 'Open Module Settings'}
                         className={`w-5 h-5 ml-0.5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
                       >
                         <ExternalLink className="w-3 h-3" />
@@ -929,7 +999,7 @@ export default function App() {
                     type="text"
                     value={fileQuery}
                     onChange={(e) => setFileQuery(e.target.value)}
-                    placeholder={isZh ? '搜索 QuotaHudView / ModernQuotaModule...' : 'Filter files...'}
+                    placeholder={isZh ? '搜索 QuotaCoreEngine / ModernQuotaModule...' : 'Filter files...'}
                     className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-slate-400"
                   />
                 </div>
@@ -997,13 +1067,13 @@ export default function App() {
               <div>
                 <h1 className="text-2xl font-bold tracking-tight text-slate-900">
                   {isZh
-                    ? 'v2.0.0 纯进程内 Cronet/gRPC 二进制流与 ViewModel 内存拦截说明'
-                    : 'v2.0.0 Purely In-App Cronet/gRPC ProtoBuf & ViewModel Interception'}
+                    ? 'v2.1.0 零后台生命周期与动态 Authorization/Cookie 会话拦截架构'
+                    : 'v2.1.0 Zero-Background Lifecycle & Dynamic Session Interception'}
                 </h1>
                 <p className="mt-1.5 text-sm text-slate-600 max-w-3xl leading-relaxed">
                   {isZh
-                    ? '彻底移除所有外部网页回退与 HTTP 轮询（同时移除 AndroidManifest 的 INTERNET 权限），100% 严格在 com.google.android.apps.bard 进程内提取实时用量数据。'
-                    : 'Completely eliminates web fallbacks, HTTP polling, and the AndroidManifest INTERNET permission—extracting quota strictly inside the com.google.android.apps.bard process.'}
+                    ? '彻底移除所有常驻后台服务、全局系统悬浮窗、静态广播唤醒与硬编码凭证；APK 声明 0 权限、0 Service、0 Receiver，严格跟随 Gemini 前台生命周期按需运行。'
+                    : 'Eliminates all background services, persistent system overlays, manifest wake-up receivers, and static tokens—running with 0 permissions and sleeping completely when Gemini is backgrounded.'}
                 </p>
               </div>
 
@@ -1011,39 +1081,39 @@ export default function App() {
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '01. Native Cronet & gRPC 字节流拦截与 ProtoBuf 二进制线格式扫描'
-                      : '01. Native Cronet & gRPC Interception + Binary ProtoBuf Wire Scanner'}
+                      ? '01. 动态出站 Authorization / Cookie / X-Goog-AuthUser 实时拦截（无感切号）'
+                      : '01. Dynamic Outgoing Authorization & Cookie Interception (Account-Switch Safe)'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '钩挂 org.chromium.net.UrlRequest / BidirectionalStream 回调（使用 ByteBuffer.duplicate() 非破坏性切片）以及 io.grpc.ClientInterceptor / Channel / ClientCall.Listener，自动解包 gRPC 5 字节帧头与 GZIP 压缩载荷，递归解析 ProtoBuf Wire Tag 中的 google.protobuf.Timestamp 重置时间戳与百分比/配额数值对。'
-                      : 'Hooks org.chromium.net.UrlRequest / BidirectionalStream callbacks (non-destructively via ByteBuffer.duplicate()) and io.grpc.ClientInterceptor / Channel / ClientCall.Listener, unwrapping 5-byte gRPC frames and scanning ProtoBuf wire tags for 5h/Weekly reset epochs and usage ratios.'}
+                      ? '钩挂 Cronet UrlRequest.Builder.addHeader / BidirectionalStream.Builder.addHeader、gRPC io.grpc.Metadata.put / ClientCall.start 以及 OkHttp Request.Builder，实时提取稳定会话 Cookie（__Secure-1PSID / SAPISID / SID，过滤旋转的 __Secure-1PSIDTS）与 OAuth2 Bearer 指纹（sess_<12hex>）。用户在应用内切换 Google 账号时立即归档旧账号快照并切换至新账号独立槽位，彻底杜绝跨账号额度串号。'
+                      : 'Intercepts Cronet UrlRequest.Builder.addHeader, gRPC Metadata.put / ClientCall.start, and OkHttp Request.Builder on the fly to derive stable per-account SHA-256 session tags—automatically isolating and refreshing quota whenever the user switches Google accounts.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '02. ViewModel / StateFlow / LiveData / Repository 内存钩子（全 Throwable 安全防护）'
-                      : '02. ViewModel / StateFlow / LiveData / Repository Hooks (100% Throwable-Safe)'}
+                      ? '02. 零后台应用内生命周期（前台挂载 · 后台 0 线程完全休眠）'
+                      : '02. Zero-Background In-App Lifecycle (Awake on Foreground · 0 Threads on Sleep)'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '追踪 androidx.lifecycle.ViewModel 实例、StateFlowImpl.setValue/updateState 与 LiveData 变更，结合 O(1) 类型判定缓存与 DEX / Hilt 单例对象图遍历（同时动态发现隔离 Chimera ClassLoader 中的 Cronet/gRPC 实例）；全部反射查找均包裹在 try-catch (Throwable) 中以抵御 R8 混淆变更。'
-                      : 'Hooks ViewModel constructors, StateFlowImpl, and LiveData updates alongside a background DEX & DI singleton scanner; every reflection lookup is wrapped in try-catch (Throwable) to stay crash-proof across R8-obfuscated Gemini builds.'}
+                      ? 'ModernQuotaModule 入口直接过滤 :interactor、:crash_report、:background 等非 UI 守护进程；QuotaHudView 仅在 Gemini Activity 进入前台时初始化并挂载，当全部 Activity 停止 (startedActivityCount == 0) 或触发 TRIM_MEMORY_UI_HIDDEN 时立即卸载 HUD、注销 ContentObserver、清空内存凭证缓冲，并通过 allowCoreThreadTimeOut(true) 将工作线程彻底归零。'
+                      : 'ModernQuotaModule skips non-UI background daemons (:interactor, :background, etc.); QuotaHudView initializes strictly when a Gemini Activity enters foreground and detaches + unregisters observers + spins worker threads down to 0 via allowCoreThreadTimeOut(true) on background.'}
                   </p>
                 </div>
 
                 <div className="p-5">
                   <div className="text-sm font-semibold text-slate-900">
                     {isZh
-                      ? '03. 单行胶囊 HUD 视觉规范与 ModernQuotaModule (API 102) 自动互斥'
-                      : '03. Single-Line Pill HUD Spec & ModernQuotaModule (API 102) Overlay Suppression'}
+                      ? '03. 严格事件驱动轻量刷新（仅在打开 Gemini 或发送提问时触发）'
+                      : '03. Strictly Event-Driven Refresh (Only on App Open or Query Dispatch)'}
                   </div>
                   <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
                     {isZh
-                      ? '完整保留单行胶囊布局（5h 百分比+倒计时 | 每周/Weekly 百分比+倒计时 | 应用内重扫与设置按钮）、MIUIX 毛玻璃与 MD3 动态取色双主题切换，并在 ModernQuotaModule (API 102) 绑定成功时立即自动抑制 App 系统悬浮窗。'
-                      : 'Preserves the exact single-line capsule HUD (5h % + reset | Weekly % + reset, MIUIX / MD3 theme toggle, EN / CN i18n) and automatically suppresses the App System Overlay as soon as ModernQuotaModule (API 102) binds.'}
+                      ? '无任何定时轮询循环；仅在打开 Gemini (APP_OPEN)、出站提问发送 (Cronet UrlRequest.start / gRPC ClientCall.sendMessage -> QUERY_SENT)、账号切换 (ACCOUNT_SWITCH) 或手动点击胶囊刷新图标 (MANUAL_TAP) 时执行轻量级状态采集。'
+                      : 'Zero polling timers: lightweight quota refresh runs strictly on APP_OPEN, outgoing query dispatch (Cronet UrlRequest.start / gRPC ClientCall.sendMessage -> QUERY_SENT), ACCOUNT_SWITCH, or manual refresh tap.'}
                   </p>
                 </div>
               </div>

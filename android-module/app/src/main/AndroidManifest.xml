@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-    <!-- Android 11+ (API 30+) Package Visibility declarations (Zero INTERNET permission) -->
+    <!-- Zero Permissions, Zero Background Services, Zero Manifest Wake-Up Receivers -->
     <queries>
         <package android:name="com.google.android.apps.bard" />
         <package android:name="com.google.android.googlequicksearchbox" />
@@ -31,20 +29,11 @@
             </intent-filter>
         </activity>
 
-        <!-- Single Authoritative Cross-Process Unified Quota & Preference Store -->
+        <!-- Demand-Driven Cross-Process Preference & Session-Scoped Quota Store -->
         <provider
             android:name=".QuotaSyncProvider"
             android:authorities="com.example.bardquotahook.provider"
             android:exported="true" />
-
-        <receiver
-            android:name=".HookTelemetryReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.example.bardquotahook.ACTION_HOOK_HEARTBEAT" />
-                <action android:name="com.example.bardquotahook.ACTION_REQUEST_QUOTA_REFRESH" />
-            </intent-filter>
-        </receiver>
 
         <!-- Legacy Xposed / LSPosed Bridge Metadata -->
         <meta-data

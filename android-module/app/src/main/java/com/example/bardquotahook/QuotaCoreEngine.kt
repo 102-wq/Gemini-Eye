@@ -2,13 +2,11 @@ package com.example.bardquotahook
 
 import android.app.Activity
 import android.app.Application
-import android.content.BroadcastReceiver
+import android.content.ComponentCallbacks2
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.database.ContentObserver
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -29,32 +27,47 @@ import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.Enumeration
 import java.util.IdentityHashMap
+import java.util.LinkedHashMap
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 /**
- * Purely In-Process Gemini Quota Interception & Single-HUD Engine (`QuotaCoreEngine`).
+ * Clean, Dynamic, Zero-Background-Service Gemini Quota Engine (`QuotaCoreEngine` — v2.1.0).
  *
- * Strictly zero external web fallback and zero outbound HTTP polling.
- * Extracts quota exclusively from inside `com.google.android.apps.bard` (and Google host processes):
- * 1. Native Cronet (`org.chromium.net.UrlRequest` / `BidirectionalStream`) & gRPC (`io.grpc.Channel` /
- *    `ClientInterceptor` / `ClientCall.Listener`) raw `ByteArray` / `ByteBuffer` interception +
- *    ProtoBuf binary wire-format scanning (`QuotaTextParser.scanProtoBufBytes`).
- * 2. Memory / ViewModel / StateFlow / LiveData / Repository hooks & DEX state-holder class scanning
- *    with 100% `try-catch (Throwable)` reflection safety against R8 obfuscation.
- * 3. Single-Line Capsule HUD (`QuotaHudView`) with MIUIX / MD3 themes, EN / CN i18n, and automatic
- *    App System Overlay suppression when `ModernQuotaModule` (API 102) binds.
+ * Architectural Guarantees:
+ * 1. Dynamic Outgoing Session & Cookie/Auth Interception (Zero Hardcoded Tokens):
+ *    - Dynamically intercepts active `Authorization`, `Cookie`, and `X-Goog-AuthUser` headers
+ *      from Gemini's outgoing Cronet (`UrlRequest.Builder` / `BidirectionalStream.Builder`),
+ *      gRPC (`io.grpc.Metadata` / `ClientCall`), and OkHttp (`Request.Builder`) requests on the fly.
+ *    - Computes a stable per-account session fingerprint (`sess_<12hex>`) from stable session
+ *      cookies (`__Secure-1PSID`, `__Secure-3PSID`, `SAPISID`, `SID`), `X-Goog-AuthUser`, or
+ *      OAuth2 `Bearer` credentials—ignoring rotating timestamp cookies (`__Secure-1PSIDTS`) and
+ *      never logging or persisting raw credentials to disk.
+ *    - Seamlessly switches isolated per-account quota snapshots and clears stale values the
+ *      instant the user switches Google accounts inside Gemini.
+ *
+ * 2. Zero-Background In-App Lifecycle:
+ *    - Zero background services, zero foreground services, and zero periodic polling loops.
+ *    - `QuotaHudView` only initializes and attaches when a Gemini `Activity` enters the foreground
+ *      (`enterForeground`), and detaches + sleeps completely (`enterBackgroundSleep`) when Gemini
+ *      goes to the background (`startedActivityCount == 0` or `TRIM_MEMORY_UI_HIDDEN`).
+ *    - Uses a single on-demand `ThreadPoolExecutor` with `allowCoreThreadTimeOut(true)` (`5s` keep-alive)
+ *      so worker threads spin down to **0** whenever idle or backgrounded.
+ *    - Triggers lightweight quota refreshes strictly on `APP_OPEN`, `QUERY_SENT`, `ACCOUNT_SWITCH`,
+ *      or `MANUAL_TAP`.
  */
 object QuotaCoreEngine {
 
@@ -123,25 +136,94 @@ object QuotaCoreEngine {
         }
     }
 
+    enum class RefreshReason(val tag: String) {
+        APP_OPEN("app-open"),
+        QUERY_SENT("query-sent"),
+        ACCOUNT_SWITCH("account-switch"),
+        MANUAL_TAP("manual-tap")
+    }
+
     private const val LOG_TAG = "BardQuotaHook"
+    private const val DEFAULT_SESSION_TAG = "sess_default"
     private const val MAX_STREAM_ACCUM_BYTES = 65_536
     private const val MAX_CHUNK_COPY_BYTES = 32_768
+    private const val MAX_TRACKED_ACCOUNTS = 8
 
     val TARGET_PACKAGES = setOf(
         "com.google.android.apps.bard",
         "com.google.android.googlequicksearchbox"
     )
 
-    private val hudInstalledGuard = AtomicBoolean(false)
-    private val classLoaderWatcherInstalled = AtomicBoolean(false)
-    private val receiverRegistered = AtomicBoolean(false)
-    private val observerRegistered = AtomicBoolean(false)
-    private val lifecycleRegistered = AtomicBoolean(false)
-    private val dexScanCompleted = AtomicBoolean(false)
+    // Stable Google session cookie names (deliberately excludes rotating __Secure-1PSIDTS / _ga)
+    private val STABLE_COOKIE_KEYS = arrayOf(
+        "__Secure-1PSID",
+        "__Secure-3PSID",
+        "SAPISID",
+        "__Secure-3PAPISID",
+        "SID",
+        "LSID"
+    )
 
+    // Lifecycle & installation guards
+    private val lifecycleInstalledGuard = AtomicBoolean(false)
+    private val classLoaderWatcherInstalled = AtomicBoolean(false)
+    private val callbacksRegistered = AtomicBoolean(false)
+    private val observerRegistered = AtomicBoolean(false)
+    private val dexRepoScanCompleted = AtomicBoolean(false)
+
+    // Zero-Background Foreground Gate: false until a Gemini Activity enters foreground;
+    // immediately returns to false when all Gemini Activities stop or UI is hidden.
+    private val isForegroundActive = AtomicBoolean(false)
+    private val startedActivityCount = AtomicInteger(0)
+
+    // Dynamic Session & UI State
+    private val activeSessionTag = AtomicReference(DEFAULT_SESSION_TAG)
     private val latestSnapshot = AtomicReference(QuotaHudView.Snapshot())
     private val currentLang = AtomicReference(QuotaHudView.Lang.ZH)
     private val currentTheme = AtomicReference(QuotaHudView.ThemeMode.MIUIX)
+
+    // Bounded LRU map of per-account quota snapshots so switching Google accounts A <-> B is instant
+    private val sessionSnapshotsLock = Any()
+    private val perSessionSnapshots = object : LinkedHashMap<String, QuotaHudView.Snapshot>(MAX_TRACKED_ACCOUNTS, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, QuotaHudView.Snapshot>?): Boolean {
+            return size > MAX_TRACKED_ACCOUNTS
+        }
+    }
+
+    // Ephemeral foreground-only outgoing request session header contexts (cleared on background sleep)
+    private data class EphemeralSessionHeaders(
+        var url: String? = null,
+        var authorization: String? = null,
+        var cookie: String? = null,
+        var authUser: String? = null,
+        var pageId: String? = null
+    ) {
+        val hasCredentials: Boolean
+            get() = !authorization.isNullOrBlank() || !cookie.isNullOrBlank() || !authUser.isNullOrBlank()
+    }
+
+    private data class BoundRequestContext(
+        val urlOrMethod: String?,
+        val sessionTag: String,
+        val isQueryCandidate: Boolean,
+        val createdAtMs: Long = System.currentTimeMillis()
+    )
+
+    // Active dynamic session header state (ephemeral in-memory only while foregrounded; wiped on sleep)
+    private data class ActiveDynamicSessionState(
+        val sessionTag: String = DEFAULT_SESSION_TAG,
+        val authorizationHeader: String? = null,
+        val cookieHeader: String? = null,
+        val authUserHeader: String? = null,
+        val transport: String = "init",
+        val updatedAtMs: Long = 0L
+    )
+
+    private val activeDynamicSession = AtomicReference(ActiveDynamicSessionState())
+
+    private val builderHeaderMap = Collections.synchronizedMap(WeakHashMap<Any, EphemeralSessionHeaders>())
+    private val requestContextMap = ConcurrentHashMap<Int, BoundRequestContext>()
+    private val cronetRollingStreams = ConcurrentHashMap<Int, RollingStreamBuffer>()
 
     private val activeHudRef = AtomicReference<WeakReference<QuotaHudView>>(WeakReference(null))
     private val activeActivityRef = AtomicReference<WeakReference<Activity>>(WeakReference(null))
@@ -159,30 +241,27 @@ object QuotaCoreEngine {
 
     private val hookedDynamicClasses = ConcurrentHashMap.newKeySet<String>()
     private val classCandidateCache = ConcurrentHashMap<Class<*>, Boolean>()
-    private val cronetRollingStreams = ConcurrentHashMap<Int, RollingStreamBuffer>()
-    private val grpcCallMethodNames = ConcurrentHashMap<Int, String>()
 
-    private val lastMemoryScanMs = AtomicLong(0L)
+    private val lastRefreshMs = AtomicLong(0L)
+    private val lastQueryEventMs = AtomicLong(0L)
 
-    private val ipcExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "bard-quota-ipc").apply { isDaemon = true }
-    }
-
-    // Bounded worker pool so high-throughput Cronet/gRPC streams never stall or OOM host threads
-    private val inspectorExecutor = ThreadPoolExecutor(
+    // Single on-demand foreground executor: allowCoreThreadTimeOut(true) guarantees 0 threads when idle/backgrounded
+    private val onDemandExecutor = ThreadPoolExecutor(
         1,
         2,
-        30L,
+        5L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(64),
+        LinkedBlockingQueue(32),
         { r ->
-            Thread(r, "bard-quota-inspect").apply {
+            Thread(r, "bard-quota-fg").apply {
                 isDaemon = true
                 priority = Thread.NORM_PRIORITY - 1
             }
         },
         ThreadPoolExecutor.DiscardOldestPolicy()
-    )
+    ).apply {
+        allowCoreThreadTimeOut(true)
+    }
 
     @Volatile private var appContext: Context? = null
     @Volatile private var mainHandler: Handler? = null
@@ -191,9 +270,11 @@ object QuotaCoreEngine {
     @Volatile private var hostProcessName: String = ""
     @Volatile private var activeBridgeName: String = ""
     @Volatile private var isModernApi102Bridge: Boolean = false
-    @Volatile private var lastHeartbeatMs: Long = 0L
 
-    private class RollingStreamBuffer(val urlHint: String?) {
+    private class RollingStreamBuffer(
+        val urlHint: String?,
+        val sessionTag: String
+    ) {
         private val out = ByteArrayOutputStream(4096)
         val createdAtMs: Long = System.currentTimeMillis()
 
@@ -244,6 +325,33 @@ object QuotaCoreEngine {
             packageName.contains("gemini", ignoreCase = true)
     }
 
+    /**
+     * Zero-Background Process Filter:
+     * Rejects non-UI background daemons (`:interactor` hotword service, `:crash_report`,
+     * `:primes_lifeboat`, `:background`, `:gms`, `:sandboxed_process`) so background processes
+     * are never instrumented or kept awake.
+     */
+    fun isEligibleUiProcess(packageName: String, processName: String): Boolean {
+        if (!isTargetHostPackage(packageName)) return false
+        val proc = processName.lowercase()
+        val blockedSuffixes = arrayOf(
+            ":interactor",
+            ":crash_report",
+            ":primes_lifeboat",
+            ":leakcanary",
+            ":background",
+            ":gms",
+            ":pheno",
+            ":download",
+            ":sandboxed_process"
+        )
+        if (blockedSuffixes.any { proc.contains(it) }) return false
+        if (packageName == "com.google.android.googlequicksearchbox") {
+            return proc == packageName || proc.endsWith(":search")
+        }
+        return true
+    }
+
     private fun safeLog(bridge: HookBridge?, msg: String) {
         try {
             bridge?.log("[BardQuota] $msg")
@@ -256,7 +364,7 @@ object QuotaCoreEngine {
     }
 
     /**
-     * Full in-process installation convenience entrypoint invoking all 3 purely in-app stages.
+     * Convenience entrypoint installing the complete Zero-Background Dynamic Session architecture.
      */
     fun install(
         packageName: String,
@@ -264,15 +372,44 @@ object QuotaCoreEngine {
         classLoader: ClassLoader?,
         bridge: HookBridge
     ) {
-        if (!isTargetHostPackage(packageName)) return
-        installInAppHudAndExclusivity(packageName, processName, classLoader, bridge)
-        installNativeGrpcAndCronetInterceptors(classLoader, bridge)
-        installMemoryAndViewModelHooks(classLoader, bridge)
+        if (!isEligibleUiProcess(packageName, processName)) return
+        installForegroundHudLifecycle(packageName, processName, classLoader, bridge)
+        installDynamicSessionAndNetworkHooks(classLoader, bridge)
+        installForegroundMemoryHooks(classLoader, bridge)
     }
 
+    // Legacy compatibility aliases delegating to the v2.1.0 zero-background stages
+    fun installInAppHudAndExclusivity(
+        packageName: String,
+        processName: String,
+        classLoader: ClassLoader?,
+        bridge: HookBridge
+    ) = installForegroundHudLifecycle(packageName, processName, classLoader, bridge)
+
+    fun installNativeGrpcAndCronetInterceptors(
+        classLoader: ClassLoader?,
+        bridge: HookBridge
+    ) = installDynamicSessionAndNetworkHooks(classLoader, bridge)
+
+    fun installMemoryAndViewModelHooks(
+        classLoader: ClassLoader?,
+        bridge: HookBridge
+    ) = installForegroundMemoryHooks(classLoader, bridge)
+
     // =========================================================================
-    // Reflection Safety Helpers (100% try-catch Throwable)
+    // Reflection & Task Submission Helpers (100% try-catch Throwable)
     // =========================================================================
+
+    private fun submitForegroundWork(block: () -> Unit) {
+        if (!isForegroundActive.get()) return
+        try {
+            onDemandExecutor.execute {
+                if (!isForegroundActive.get()) return@execute
+                withReentrancyGuard(block)
+            }
+        } catch (_: Throwable) {
+        }
+    }
 
     private fun findClassSafe(name: String, classLoader: ClassLoader?): Class<*>? {
         if (name.isBlank()) return null
@@ -324,29 +461,25 @@ object QuotaCoreEngine {
     }
 
     private fun markDynamicHookOnce(category: String, clazz: Class<*>): Boolean {
-        val key = "$category:${clazz.ClassLoaderId()}:${clazz.name}"
-        return hookedDynamicClasses.add(key)
-    }
-
-    private fun Class<*>.ClassLoaderId(): Int {
-        return try {
-            System.identityHashCode(this.classLoader)
+        val loaderId = try {
+            System.identityHashCode(clazz.classLoader)
         } catch (_: Throwable) {
             0
         }
+        return hookedDynamicClasses.add("$category:$loaderId:${clazz.name}")
     }
 
     // =========================================================================
-    // Stage 1: Single-Line Capsule HUD & Single-HUD Exclusion (API 102)
+    // Stage 1: Zero-Background Foreground HUD Lifecycle
     // =========================================================================
 
-    fun installInAppHudAndExclusivity(
+    fun installForegroundHudLifecycle(
         packageName: String,
         processName: String,
         classLoader: ClassLoader?,
         bridge: HookBridge
     ) {
-        if (!isTargetHostPackage(packageName)) return
+        if (!isEligibleUiProcess(packageName, processName)) return
         activeBridgeRef.set(bridge)
         hostPackageName = packageName
         hostProcessName = processName
@@ -355,20 +488,10 @@ object QuotaCoreEngine {
             isModernApi102Bridge = true
         }
 
-        if (!hudInstalledGuard.compareAndSet(false, true)) {
-            appContext?.let { syncHeartbeatWithProviderAsync(it, force = true) }
-            return
-        }
+        if (!lifecycleInstalledGuard.compareAndSet(false, true)) return
 
-        safeLog(
-            bridge,
-            "Stage 1 [HUD + Single-HUD Exclusion] bound via ${bridge.bridgeName} (api102=${bridge.isModernApi102}) in $packageName [$processName]"
-        )
-
-        // Immediately check if Application already exists in ActivityThread so API 102 suppresses
-        // the App System Overlay immediately on module bind without waiting for next Activity resume.
-        captureExistingApplicationIfReady()
-
+        // Register Application lifecycle + UI-hidden memory trim callbacks when Application initializes,
+        // WITHOUT waking any threads, observers, or HUD views while in the background.
         hookMethodSafe(
             bridge = bridge,
             clazz = Application::class.java,
@@ -376,13 +499,34 @@ object QuotaCoreEngine {
             paramTypes = emptyArray(),
             after = cb@{ thisObj, _, _ ->
                 val app = thisObj as? Application ?: return@cb
-                onContextCaptured(app)
-                registerActivityCallbacksOnce(app)
+                if (appContext == null) {
+                    appContext = app
+                }
+                registerZeroBackgroundCallbacksOnce(app)
                 bindHooksForClassLoader(app.classLoader, bridge)
-                scheduleInProcessMemoryScan(delayMs = 1200L)
             }
         )
 
+        // Pre-arm foreground gate in Activity.onCreate so initial startup ViewModels & RPCs
+        // fired between onCreate and onResume are captured seamlessly on cold app launch.
+        hookMethodSafe(
+            bridge = bridge,
+            clazz = Activity::class.java,
+            name = "onCreate",
+            paramTypes = arrayOf(Bundle::class.java),
+            before = cb@{ thisObj, _ ->
+                val activity = thisObj as? Activity ?: return@cb
+                val app = activity.application
+                if (app != null) registerZeroBackgroundCallbacksOnce(app)
+                if (shouldDisplayHudInActivity(activity)) {
+                    isForegroundActive.set(true)
+                    inspectActivityAccountIntent(activity)
+                    bindHooksForClassLoader(activity.classLoader, bridge)
+                }
+            }
+        )
+
+        // Fallback direct Activity hooks in case Application.onCreate already ran prior to module load
         hookMethodSafe(
             bridge = bridge,
             clazz = Activity::class.java,
@@ -390,15 +534,10 @@ object QuotaCoreEngine {
             paramTypes = emptyArray(),
             after = cb@{ thisObj, _, _ ->
                 val activity = thisObj as? Activity ?: return@cb
-                val ctx = activity.applicationContext ?: activity
-                onContextCaptured(ctx)
-                bindHooksForClassLoader(activity.classLoader, bridge)
+                val app = activity.application
+                if (app != null) registerZeroBackgroundCallbacksOnce(app)
                 if (shouldDisplayHudInActivity(activity)) {
-                    activeActivityRef.set(WeakReference(activity))
-                    attachOrUpdateOverlay(activity)
-                    syncHeartbeatWithProviderAsync(ctx, force = true)
-                    scheduleInProcessMemoryScan(delayMs = 450L)
-                    scheduleScreenBannerCheck()
+                    enterForeground(activity, attachHudNow = true)
                 }
             }
         )
@@ -408,39 +547,69 @@ object QuotaCoreEngine {
         }
     }
 
-    private fun captureExistingApplicationIfReady() {
-        try {
-            val atClass = Class.forName("android.app.ActivityThread")
-            val currentAppMethod = atClass.getDeclaredMethod("currentApplication")
-            currentAppMethod.isAccessible = true
-            val app = currentAppMethod.invoke(null) as? Application
-            if (app != null) {
-                onContextCaptured(app)
-                registerActivityCallbacksOnce(app)
-            }
-        } catch (_: Throwable) {
-        }
-    }
+    private fun registerZeroBackgroundCallbacksOnce(app: Application) {
+        if (!callbacksRegistered.compareAndSet(false, true)) return
+        if (appContext == null) appContext = app
 
-    private fun registerActivityCallbacksOnce(app: Application) {
-        if (!lifecycleRegistered.compareAndSet(false, true)) return
         try {
             app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
-                override fun onActivityStarted(activity: Activity) {}
-                override fun onActivityResumed(activity: Activity) {
+                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
                     if (shouldDisplayHudInActivity(activity)) {
-                        activeActivityRef.set(WeakReference(activity))
-                        attachOrUpdateOverlay(activity)
-                        syncHeartbeatWithProviderAsync(activity.applicationContext ?: activity, force = true)
-                        scheduleInProcessMemoryScan(delayMs = 450L)
-                        scheduleScreenBannerCheck()
+                        isForegroundActive.set(true)
+                        inspectActivityAccountIntent(activity)
                     }
                 }
+
+                override fun onActivityStarted(activity: Activity) {
+                    if (shouldDisplayHudInActivity(activity)) {
+                        startedActivityCount.incrementAndGet()
+                        enterForeground(activity, attachHudNow = true)
+                    }
+                }
+
+                override fun onActivityResumed(activity: Activity) {
+                    if (shouldDisplayHudInActivity(activity)) {
+                        if (startedActivityCount.get() <= 0) {
+                            startedActivityCount.set(1)
+                        }
+                        enterForeground(activity, attachHudNow = true)
+                    }
+                }
+
                 override fun onActivityPaused(activity: Activity) {}
-                override fun onActivityStopped(activity: Activity) {}
+
+                override fun onActivityStopped(activity: Activity) {
+                    if (shouldDisplayHudInActivity(activity)) {
+                        val remaining = startedActivityCount.decrementAndGet()
+                        if (remaining <= 0) {
+                            startedActivityCount.set(0)
+                            enterBackgroundSleep(stoppedActivity = activity)
+                        }
+                    }
+                }
+
                 override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
-                override fun onActivityDestroyed(activity: Activity) {}
+
+                override fun onActivityDestroyed(activity: Activity) {
+                    val cur = activeActivityRef.get().get()
+                    if (cur === activity) {
+                        detachHudFromActivity(activity)
+                        activeActivityRef.set(WeakReference(null))
+                    }
+                }
+            })
+
+            app.registerComponentCallbacks(object : ComponentCallbacks2 {
+                override fun onConfigurationChanged(newConfig: Configuration) {}
+                override fun onLowMemory() {
+                    clearTransientBuffers()
+                }
+                override fun onTrimMemory(level: Int) {
+                    if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+                        startedActivityCount.set(0)
+                        enterBackgroundSleep(stoppedActivity = activeActivityRef.get().get())
+                    }
+                }
             })
         } catch (_: Throwable) {
         }
@@ -466,28 +635,370 @@ object QuotaCoreEngine {
             intentStr.contains("robin")
     }
 
-    private fun onContextCaptured(ctx: Context) {
+    /**
+     * Wakes the module ONLY when a Gemini `Activity` enters the foreground:
+     * - Restores preferences & active session snapshot
+     * - Registers foreground-only `ContentObserver`
+     * - Attaches `QuotaHudView`
+     * - Triggers a single lightweight `APP_OPEN` quota refresh
+     */
+    private fun enterForeground(activity: Activity, attachHudNow: Boolean) {
+        val ctx = activity.applicationContext ?: activity
         if (appContext == null) {
-            appContext = ctx.applicationContext ?: ctx
-            loadSanitizedHostMirror(appContext)
+            appContext = ctx
+            loadSanitizedHostMirror(ctx)
         }
-        val targetCtx = appContext ?: ctx
-        registerUnifiedObserverOnce(targetCtx)
-        registerReceiversOnce(targetCtx)
-        syncHeartbeatWithProviderAsync(targetCtx, force = false)
+
+        val wasSleeping = !isForegroundActive.getAndSet(true)
+        val prevActivity = activeActivityRef.get().get()
+        activeActivityRef.set(WeakReference(activity))
+
+        // Check if Activity intent carries an explicit switched Google account identity
+        inspectActivityAccountIntent(activity)
+
+        // Register preference observer strictly while foregrounded
+        registerForegroundObserver(ctx)
+
+        if (attachHudNow) {
+            attachOrUpdateOverlay(activity)
+        }
+
+        if (wasSleeping || prevActivity !== activity) {
+            safeLog(
+                activeBridgeRef.get(),
+                "Foreground wake in ${activity.javaClass.simpleName} [session=${activeSessionTag.get()}]"
+            )
+            syncForegroundStateWithProviderAsync(ctx)
+            triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 350L)
+        }
+    }
+
+    /**
+     * Puts the HUD and interception engine completely to sleep when Gemini leaves the foreground:
+     * - Flips `isForegroundActive = false` (silences all hook callbacks in 1ns)
+     * - Detaches `QuotaHudView` from the window
+     * - Unregisters `ContentObserver` (zero background Binder wakeups)
+     * - Cancels pending Handler tasks, wipes ephemeral credentials/buffers, and drains worker queue
+     */
+    private fun enterBackgroundSleep(stoppedActivity: Activity?) {
+        val wasActive = isForegroundActive.getAndSet(false)
+        if (!wasActive && activeHudRef.get().get() == null) return
+
+        try {
+            mainHandler?.removeCallbacksAndMessages(null)
+        } catch (_: Throwable) {
+        }
+
+        val ctx = appContext ?: stoppedActivity?.applicationContext
+        if (ctx != null) {
+            unregisterForegroundObserver(ctx)
+        }
+
+        val actToClean = stoppedActivity ?: activeActivityRef.get().get()
+        if (actToClean != null) {
+            detachHudFromActivity(actToClean)
+        }
+        activeHudRef.set(WeakReference(null))
+        activeActivityRef.set(WeakReference(null))
+
+        clearTransientBuffers()
+        safeLog(activeBridgeRef.get(), "Entered zero-background sleep (0 active threads / HUD detached)")
+    }
+
+    fun forceSleepForHotReload() {
+        startedActivityCount.set(0)
+        enterBackgroundSleep(activeActivityRef.get().get())
+    }
+
+    private fun clearTransientBuffers() {
+        try {
+            cronetRollingStreams.clear()
+            requestContextMap.clear()
+            synchronized(builderHeaderMap) {
+                builderHeaderMap.clear()
+            }
+            // Wipe raw in-memory header values while keeping only the non-reversible session tag
+            val cur = activeDynamicSession.get()
+            activeDynamicSession.set(
+                ActiveDynamicSessionState(
+                    sessionTag = cur.sessionTag,
+                    authorizationHeader = null,
+                    cookieHeader = null,
+                    authUserHeader = null,
+                    transport = cur.transport,
+                    updatedAtMs = cur.updatedAtMs
+                )
+            )
+            onDemandExecutor.queue.clear()
+            onDemandExecutor.purge()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun detachHudFromActivity(activity: Activity) {
+        postToMain(requireForeground = false) {
+            try {
+                val decorGroup = activity.window?.decorView as? ViewGroup ?: return@postToMain
+                val existing = decorGroup.findViewWithTag<View>(QuotaHudView.HUD_VIEW_TAG)
+                if (existing != null) {
+                    existing.visibility = View.GONE
+                    decorGroup.removeView(existing)
+                }
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     // =========================================================================
-    // Stage 2: Native Cronet & gRPC Raw ByteArray / ProtoBuf Stream Interception
+    // Dynamic Session & Cookie / Authorization Interception (Account-Switch Safe)
     // =========================================================================
 
-    fun installNativeGrpcAndCronetInterceptors(
+    private fun recordOutgoingBuilderHeader(builderObj: Any, rawName: String, rawValue: String) {
+        if (!isForegroundActive.get()) return
+        val lower = rawName.trim().lowercase()
+        val isRelevant = lower == "authorization" ||
+            lower == "cookie" ||
+            lower == "x-goog-authuser" ||
+            lower == "x-goog-pageid"
+        if (!isRelevant || rawValue.isBlank()) return
+
+        val snapshotHeaders = synchronized(builderHeaderMap) {
+            val entry = builderHeaderMap.getOrPut(builderObj) { EphemeralSessionHeaders() }
+            when (lower) {
+                "authorization" -> entry.authorization = rawValue.trim()
+                "cookie" -> entry.cookie = rawValue.trim()
+                "x-goog-authuser" -> entry.authUser = rawValue.trim()
+                "x-goog-pageid" -> entry.pageId = rawValue.trim()
+            }
+            entry.copy()
+        }
+
+        onDynamicHeadersIntercepted(snapshotHeaders, transport = "Cronet")
+    }
+
+    private fun onDynamicHeadersIntercepted(
+        headers: EphemeralSessionHeaders,
+        transport: String
+    ): String {
+        val computedTag = computeDynamicSessionTag(
+            authorization = headers.authorization,
+            cookie = headers.cookie,
+            authUser = headers.authUser,
+            pageId = headers.pageId
+        ) ?: return activeSessionTag.get()
+
+        val now = System.currentTimeMillis()
+        activeDynamicSession.set(
+            ActiveDynamicSessionState(
+                sessionTag = computedTag,
+                authorizationHeader = headers.authorization,
+                cookieHeader = headers.cookie,
+                authUserHeader = headers.authUser,
+                transport = transport,
+                updatedAtMs = now
+            )
+        )
+
+        activateSessionTag(computedTag, sourceReason = "$transport-Header")
+        return computedTag
+    }
+
+    /**
+     * Computes a deterministic, non-reversible 12-hex SHA-256 session tag (`sess_<12hex>`)
+     * from Gemini's active outgoing `Cookie`, `Authorization`, and `X-Goog-AuthUser` headers:
+     * - Anchors on stable Google account session cookies (`__Secure-1PSID`, `SAPISID`, `SID`, etc.)
+     *   when present so short-lived rotating cookies (`__Secure-1PSIDTS`) or hourly OAuth token
+     *   refreshes on the *same* account never trigger false resets.
+     * - Immediately produces a distinct tag whenever the user switches Google accounts!
+     */
+    private fun computeDynamicSessionTag(
+        authorization: String?,
+        cookie: String?,
+        authUser: String?,
+        pageId: String?
+    ): String? {
+        val stableCookieToken = extractStableGoogleSessionCookie(cookie)
+        val cleanAuthUser = authUser?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanPageId = pageId?.trim()?.takeIf { it.isNotEmpty() }
+        val pageSlot = cleanPageId ?: "0"
+        val cleanBearer = authorization?.trim()?.takeIf { it.isNotEmpty() }
+
+        val canonicalMaterial = when {
+            stableCookieToken != null -> buildString {
+                append("cookie:").append(stableCookieToken)
+                if (cleanAuthUser != null) append("|u:").append(cleanAuthUser)
+                if (cleanPageId != null) append("|p:").append(cleanPageId)
+            }
+            cleanAuthUser != null && cleanBearer != null -> {
+                // Anchor on explicit Google account slot + pageId when X-Goog-AuthUser is present,
+                // otherwise hash the active OAuth2 Bearer token directly.
+                "authuser:$cleanAuthUser|p:$pageSlot"
+            }
+            cleanBearer != null -> "bearer:$cleanBearer"
+            cleanAuthUser != null -> "authuser:$cleanAuthUser|p:$pageSlot"
+            else -> return null
+        }
+
+        return sha256SessionTag(canonicalMaterial)
+    }
+
+    private fun extractStableGoogleSessionCookie(rawCookieHeader: String?): String? {
+        if (rawCookieHeader.isNullOrBlank()) return null
+        val cookiePairs = HashMap<String, String>(8)
+        for (segment in rawCookieHeader.split(';')) {
+            val eqIdx = segment.indexOf('=')
+            if (eqIdx <= 0) continue
+            val k = segment.substring(0, eqIdx).trim()
+            val v = segment.substring(eqIdx + 1).trim()
+            if (k.isNotEmpty() && v.isNotEmpty()) {
+                cookiePairs[k] = v
+            }
+        }
+        val sb = StringBuilder()
+        for (stableKey in STABLE_COOKIE_KEYS) {
+            val v = cookiePairs[stableKey]
+            if (!v.isNullOrEmpty()) {
+                if (sb.isNotEmpty()) sb.append('&')
+                sb.append(stableKey).append('=').append(v)
+            }
+        }
+        return if (sb.isNotEmpty()) sb.toString() else null
+    }
+
+    private fun sha256SessionTag(material: String): String {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(material.toByteArray(StandardCharsets.UTF_8))
+            val sb = StringBuilder("sess_")
+            for (i in 0 until 6) {
+                val b = digest[i].toInt() and 0xFF
+                if (b < 0x10) sb.append('0')
+                sb.append(Integer.toHexString(b))
+            }
+            sb.toString()
+        } catch (_: Throwable) {
+            "sess_${Integer.toHexString(material.hashCode())}"
+        }
+    }
+
+    private fun inspectActivityAccountIntent(activity: Activity) {
+        try {
+            val extras = activity.intent?.extras ?: return
+            val candidateKeys = arrayOf(
+                "authAccount",
+                "account_name",
+                "tiktok_account_id",
+                "account_id",
+                "selected_account_id"
+            )
+            for (key in candidateKeys) {
+                if (!extras.containsKey(key)) continue
+                @Suppress("DEPRECATION")
+                val raw = extras.get(key)?.toString()?.trim()
+                if (!raw.isNullOrEmpty() && raw != "-1") {
+                    // Only switch via Activity intent if we haven't locked onto a live HTTP/gRPC header yet,
+                    // or if the Activity itself was recreated with an explicit different account extra.
+                    val intentTag = sha256SessionTag("intent_acct:$key:$raw")
+                    val curDyn = activeDynamicSession.get()
+                    if (curDyn.transport == "init" || curDyn.transport == "ActivityIntent") {
+                        activeDynamicSession.set(
+                            ActiveDynamicSessionState(
+                                sessionTag = intentTag,
+                                transport = "ActivityIntent",
+                                updatedAtMs = System.currentTimeMillis()
+                            )
+                        )
+                        activateSessionTag(intentTag, sourceReason = "ActivityAccount")
+                    }
+                    break
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Switches the active session cleanly whenever a new Google account session is detected:
+     * 1. Archives outgoing account's `Snapshot` under `prevTag`.
+     * 2. Restores incoming account's `Snapshot` (if cached in memory) OR resets cleanly to `--`
+     *    so the previous Google account's quota never bleeds into the newly selected account.
+     * 3. Updates `QuotaHudView` & `QuotaSyncProvider` (`replaceSession = true`) and triggers a
+     *    lightweight foreground refresh.
+     */
+    private fun activateSessionTag(newTag: String, sourceReason: String) {
+        if (newTag.isBlank() || newTag == DEFAULT_SESSION_TAG) return
+        val prevTag = activeSessionTag.get()
+        if (prevTag == newTag) return
+
+        synchronized(sessionSnapshotsLock) {
+            val curPrev = activeSessionTag.get()
+            if (curPrev == newTag) return
+
+            val prevSnap = latestSnapshot.get().sanitized()
+            if (curPrev != DEFAULT_SESSION_TAG && prevSnap.hasLiveData) {
+                perSessionSnapshots[curPrev] = prevSnap
+            }
+
+            activeSessionTag.set(newTag)
+
+            // If transitioning from uninitialized default slot to the very first observed account
+            // on app startup, adopt any valid startup snapshot; otherwise switch cleanly to the
+            // target account's isolated slot (or fresh `--` if unseen).
+            val nextSnap = if (curPrev == DEFAULT_SESSION_TAG && prevSnap.hasLiveData) {
+                perSessionSnapshots[newTag] = prevSnap
+                prevSnap
+            } else {
+                perSessionSnapshots[newTag] ?: QuotaHudView.Snapshot(source = "AccountSwitch")
+            }
+
+            latestSnapshot.set(nextSnap)
+            saveSanitizedHostMirror(nextSnap, currentLang.get(), currentTheme.get(), newTag)
+        }
+
+        safeLog(activeBridgeRef.get(), "Dynamic account session active -> $newTag ($sourceReason)")
+
+        if (isForegroundActive.get()) {
+            refreshHudOnUiThread()
+            val ctx = appContext
+            if (ctx != null) {
+                val snapNow = latestSnapshot.get().sanitized()
+                submitForegroundWork {
+                    val state = QuotaSyncProvider.publishSessionQuota(
+                        context = ctx,
+                        snapshot = snapNow,
+                        sessionId = newTag,
+                        replaceSession = true
+                    )
+                    applyUnifiedState(state)
+                }
+            }
+            triggerLightweightQuotaRefresh(RefreshReason.ACCOUNT_SWITCH, delayMs = 300L)
+        }
+    }
+
+    /**
+     * Fired when the user actually sends a query over Cronet or gRPC while Gemini is foregrounded.
+     * Triggers a single debounced post-query refresh (zero polling loops).
+     */
+    private fun onUserQueryDispatched(transport: String) {
+        if (!isForegroundActive.get()) return
+        val now = System.currentTimeMillis()
+        if (now - lastQueryEventMs.get() < 2_000L) return
+        lastQueryEventMs.set(now)
+
+        triggerLightweightQuotaRefresh(RefreshReason.QUERY_SENT, delayMs = 1_100L)
+    }
+
+    // =========================================================================
+    // Stage 2: Dynamic Network Header + ProtoBuf Stream Interception
+    // =========================================================================
+
+    fun installDynamicSessionAndNetworkHooks(
         classLoader: ClassLoader?,
         bridge: HookBridge
     ) {
         activeBridgeRef.set(bridge)
 
-        // Watch newly created dynamic ClassLoaders (e.g. GMS Chimera Cronet / split feature DEXs)
         if (classLoaderWatcherInstalled.compareAndSet(false, true)) {
             bridge.hookAllConstructors(
                 clazz = BaseDexClassLoader::class.java,
@@ -498,8 +1009,6 @@ object QuotaCoreEngine {
                     }
                 }
             )
-
-            // Passive in-process JSON payload inspection (never initiates network calls)
             hookStructuredJsonPayloads(bridge)
         }
 
@@ -517,26 +1026,23 @@ object QuotaCoreEngine {
         }
         if (!added) return
 
-        // 1. Native Cronet Engine & UrlRequest / BidirectionalStream hooks
-        installCronetHooksInClassLoader(classLoader, bridge)
-
-        // 2. gRPC Channel / ClientInterceptor / ClientCall.Listener hooks
-        installGrpcHooksInClassLoader(classLoader, bridge)
-
-        // 3. Passive OkHttp ResponseBody hook (if OkHttp exists in this ClassLoader)
-        installPassiveOkHttpHooksInClassLoader(classLoader, bridge)
-
-        // 4. Reactive StateFlow / LiveData / ViewModel hooks in this ClassLoader
+        installCronetSessionAndStreamHooks(classLoader, bridge)
+        installGrpcSessionAndStreamHooks(classLoader, bridge)
+        installOkHttpSessionAndBodyHooks(classLoader, bridge)
         installReactiveStateHooksInClassLoader(classLoader, bridge)
     }
 
-    private fun installCronetHooksInClassLoader(cl: ClassLoader, bridge: HookBridge) {
-        val builderNames = arrayOf(
+    // -------------------------------------------------------------------------
+    // Cronet Outgoing Headers (`Authorization`/`Cookie`) + Query & Stream Hooks
+    // -------------------------------------------------------------------------
+
+    private fun installCronetSessionAndStreamHooks(cl: ClassLoader, bridge: HookBridge) {
+        val engineBuilders = arrayOf(
             "org.chromium.net.CronetEngine\$Builder",
             "org.chromium.net.ExperimentalCronetEngine\$Builder",
             "org.chromium.net.ICronetEngineBuilder"
         )
-        for (bName in builderNames) {
+        for (bName in engineBuilders) {
             val builderCls = findClassSafe(bName, cl) ?: continue
             bridge.hookAllMethodsByName(
                 clazz = builderCls,
@@ -549,41 +1055,38 @@ object QuotaCoreEngine {
             )
         }
 
-        val knownEngineImpls = arrayOf(
+        val knownEngines = arrayOf(
             "org.chromium.net.impl.CronetUrlRequestContext",
             "org.chromium.net.impl.JavaCronetEngine",
             "org.chromium.net.CronetEngine",
             "org.chromium.net.ExperimentalCronetEngine"
         )
-        for (eName in knownEngineImpls) {
+        for (eName in knownEngines) {
             val engineCls = findClassSafe(eName, cl) ?: continue
             hookConcreteCronetEngineClass(engineCls, bridge)
         }
 
-        val knownRequestImpls = arrayOf(
+        val knownReqBuilders = arrayOf(
+            "org.chromium.net.UrlRequest\$Builder",
+            "org.chromium.net.ExperimentalUrlRequest\$Builder",
+            "org.chromium.net.BidirectionalStream\$Builder",
+            "org.chromium.net.ExperimentalBidirectionalStream\$Builder",
+            "org.chromium.net.impl.UrlRequestBuilderImpl",
+            "org.chromium.net.impl.BidirectionalStreamBuilderImpl"
+        )
+        for (rbName in knownReqBuilders) {
+            val rbCls = findClassSafe(rbName, cl) ?: continue
+            hookConcreteCronetRequestBuilderClass(rbCls, bridge)
+        }
+
+        val knownReqImpls = arrayOf(
             "org.chromium.net.impl.CronetUrlRequest",
+            "org.chromium.net.impl.CronetBidirectionalStream",
             "org.chromium.net.impl.JavaUrlRequest"
         )
-        for (rName in knownRequestImpls) {
+        for (rName in knownReqImpls) {
             val reqCls = findClassSafe(rName, cl) ?: continue
-            if (!markDynamicHookOnce("cronet_req_ctor", reqCls)) continue
-            bridge.hookAllConstructors(
-                clazz = reqCls,
-                after = { thisObj, args ->
-                    var urlStr: String? = null
-                    for (arg in args) {
-                        if (arg is String && (arg.startsWith("https://") || arg.startsWith("http://"))) {
-                            urlStr = arg
-                        } else if (arg != null && isCronetCallbackCandidate(arg.javaClass)) {
-                            hookConcreteCronetCallbackClass(arg.javaClass, bridge)
-                        }
-                    }
-                    if (thisObj != null && urlStr != null && !isStaticAssetUrl(urlStr)) {
-                        pruneCronetStreamsIfNeeded()
-                        cronetRollingStreams[System.identityHashCode(thisObj)] = RollingStreamBuffer(urlStr)
-                    }
-                }
-            )
+            hookConcreteCronetRequestInstanceClass(reqCls, bridge)
         }
     }
 
@@ -601,18 +1104,121 @@ object QuotaCoreEngine {
                 clazz = engineCls,
                 methodName = mName,
                 before = cb@{ _, args ->
+                    if (!isForegroundActive.get()) return@cb
                     val url = args.firstOrNull { it is String } as? String
                     if (url != null && isStaticAssetUrl(url)) return@cb
                     for (arg in args) {
                         if (arg == null || arg is String) continue
-                        val argCls = arg.javaClass
-                        if (isCronetCallbackCandidate(argCls)) {
-                            hookConcreteCronetCallbackClass(argCls, bridge)
+                        if (isCronetCallbackCandidate(arg.javaClass)) {
+                            hookConcreteCronetCallbackClass(arg.javaClass, bridge)
                         }
+                    }
+                },
+                after = cb@{ _, args, result ->
+                    if (result == null) return@cb
+                    val url = args.firstOrNull { it is String } as? String
+                    if (url != null && isStaticAssetUrl(url)) return@cb
+
+                    if (mName.endsWith("Builder")) {
+                        hookConcreteCronetRequestBuilderClass(result.javaClass, bridge)
+                        if (isForegroundActive.get() && url != null) {
+                            synchronized(builderHeaderMap) {
+                                builderHeaderMap.getOrPut(result) { EphemeralSessionHeaders() }.url = url
+                            }
+                        }
+                    } else {
+                        hookConcreteCronetRequestInstanceClass(result.javaClass, bridge)
                     }
                 }
             )
         }
+    }
+
+    private fun hookConcreteCronetRequestBuilderClass(builderCls: Class<*>, bridge: HookBridge) {
+        if (!markDynamicHookOnce("cronet_req_builder", builderCls)) return
+
+        // Dynamically intercept outgoing Authorization / Cookie / X-Goog-AuthUser headers on the fly!
+        bridge.hookAllMethodsByName(
+            clazz = builderCls,
+            methodName = "addHeader",
+            before = cb@{ thisObj, args ->
+                if (!isForegroundActive.get() || thisObj == null || args.size < 2) return@cb
+                val k = args[0] as? String ?: return@cb
+                val v = args[1] as? String ?: return@cb
+                recordOutgoingBuilderHeader(thisObj, k, v)
+            }
+        )
+
+        bridge.hookAllMethodsByName(
+            clazz = builderCls,
+            methodName = "build",
+            after = cb@{ thisObj, _, result ->
+                if (result == null) return@cb
+                hookConcreteCronetRequestInstanceClass(result.javaClass, bridge)
+                if (!isForegroundActive.get() || thisObj == null) return@cb
+
+                val captured = synchronized(builderHeaderMap) {
+                    builderHeaderMap.remove(thisObj)
+                }
+                val sessTag = if (captured != null && captured.hasCredentials) {
+                    onDynamicHeadersIntercepted(captured, transport = "Cronet")
+                } else {
+                    activeSessionTag.get()
+                }
+                val url = captured?.url
+                if (url == null || !isStaticAssetUrl(url)) {
+                    pruneRequestMapsIfNeeded()
+                    requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
+                        urlOrMethod = url,
+                        sessionTag = sessTag,
+                        isQueryCandidate = isGeminiQueryEndpoint(url)
+                    )
+                }
+            }
+        )
+    }
+
+    private fun hookConcreteCronetRequestInstanceClass(reqCls: Class<*>, bridge: HookBridge) {
+        if (!markDynamicHookOnce("cronet_req_inst", reqCls)) return
+
+        bridge.hookAllConstructors(
+            clazz = reqCls,
+            after = cb@{ thisObj, args ->
+                var urlStr: String? = null
+                for (arg in args) {
+                    if (arg is String && (arg.startsWith("https://") || arg.startsWith("http://"))) {
+                        urlStr = arg
+                    } else if (arg != null && isCronetCallbackCandidate(arg.javaClass)) {
+                        hookConcreteCronetCallbackClass(arg.javaClass, bridge)
+                    }
+                }
+                if (isForegroundActive.get() && thisObj != null && urlStr != null && !isStaticAssetUrl(urlStr)) {
+                    val reqId = System.identityHashCode(thisObj)
+                    pruneRequestMapsIfNeeded()
+                    requestContextMap.putIfAbsent(
+                        reqId,
+                        BoundRequestContext(
+                            urlOrMethod = urlStr,
+                            sessionTag = activeSessionTag.get(),
+                            isQueryCandidate = isGeminiQueryEndpoint(urlStr)
+                        )
+                    )
+                }
+            }
+        )
+
+        // Detect when Gemini actually dispatches a query request in the foreground
+        bridge.hookAllMethodsByName(
+            clazz = reqCls,
+            methodName = "start",
+            after = cb@{ thisObj, _, _ ->
+                if (!isForegroundActive.get() || thisObj == null) return@cb
+                val ctx = requestContextMap[System.identityHashCode(thisObj)]
+                if (ctx != null && ctx.isQueryCandidate) {
+                    onUserQueryDispatched("Cronet")
+                }
+            }
+        )
     }
 
     private fun isCronetCallbackCandidate(cls: Class<*>): Boolean {
@@ -642,21 +1248,24 @@ object QuotaCoreEngine {
     private fun hookConcreteCronetCallbackClass(callbackCls: Class<*>, bridge: HookBridge) {
         if (!markDynamicHookOnce("cronet_cb", callbackCls)) return
 
-        // Hook onReadCompleted(request/stream, info, byteBuffer [, endOfStream])
         bridge.hookAllMethodsByName(
             clazz = callbackCls,
             methodName = "onReadCompleted",
             before = cb@{ _, args ->
+                // Zero-Background Gate: 1ns exit if Gemini is not in foreground
+                if (!isForegroundActive.get()) return@cb
                 val reqObj = args.getOrNull(0) ?: return@cb
                 val infoObj = args.getOrNull(1)
                 val byteBuf = args.firstOrNull { it is ByteBuffer } as? ByteBuffer ?: return@cb
 
-                val urlHint = extractCronetUrlSafe(infoObj)
+                val reqId = System.identityHashCode(reqObj)
+                val boundCtx = requestContextMap[reqId]
+                val urlHint = boundCtx?.urlOrMethod ?: extractCronetUrlSafe(infoObj)
                 if (urlHint != null && isStaticAssetUrl(urlHint)) return@cb
 
                 val copied = copyCronetByteBufferNonDestructive(byteBuf) ?: return@cb
-                val reqId = System.identityHashCode(reqObj)
-                submitCronetChunk(reqId, urlHint, copied)
+                val reqSession = boundCtx?.sessionTag ?: activeSessionTag.get()
+                submitCronetChunk(reqId, urlHint, reqSession, copied)
             }
         )
 
@@ -668,17 +1277,15 @@ object QuotaCoreEngine {
                 after = { _, args, _ ->
                     val reqObj = args.getOrNull(0)
                     if (reqObj != null) {
-                        cronetRollingStreams.remove(System.identityHashCode(reqObj))
+                        val id = System.identityHashCode(reqObj)
+                        cronetRollingStreams.remove(id)
+                        requestContextMap.remove(id)
                     }
                 }
             )
         }
     }
 
-    /**
-     * Non-destructively copies fresh bytes from a Cronet `ByteBuffer` via `duplicate()`
-     * without mutating the original buffer's `position`, `limit`, or `mark`.
-     */
     private fun copyCronetByteBufferNonDestructive(rawBuf: ByteBuffer): ByteArray? {
         return try {
             val dup = rawBuf.duplicate()
@@ -714,6 +1321,19 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun isGeminiQueryEndpoint(urlOrMethod: String?): Boolean {
+        if (urlOrMethod.isNullOrBlank()) return false
+        val u = urlOrMethod.lowercase()
+        return u.contains("streamgenerate") ||
+            u.contains("bardchatui") ||
+            u.contains("assistant.lamda") ||
+            u.contains("aratea") ||
+            u.contains("robin") ||
+            u.contains("batchexecute") ||
+            u.contains("generativelanguage") ||
+            u.contains("quota")
+    }
+
     private fun isStaticAssetUrl(url: String): Boolean {
         val u = url.lowercase()
         return u.endsWith(".png") ||
@@ -730,46 +1350,76 @@ object QuotaCoreEngine {
             u.contains("fonts.gstatic.com")
     }
 
-    private fun pruneCronetStreamsIfNeeded() {
-        if (cronetRollingStreams.size < 48) return
-        val cutoff = System.currentTimeMillis() - 60_000L
-        val it = cronetRollingStreams.entries.iterator()
-        while (it.hasNext()) {
-            val entry = it.next()
-            if (entry.value.createdAtMs < cutoff || cronetRollingStreams.size > 64) {
-                it.remove()
-            }
-        }
-    }
-
-    private fun submitCronetChunk(reqId: Int, urlHint: String?, chunk: ByteArray) {
-        try {
-            inspectorExecutor.execute {
-                withReentrancyGuard {
-                    pruneCronetStreamsIfNeeded()
-                    val holder = cronetRollingStreams.getOrPut(reqId) { RollingStreamBuffer(urlHint) }
-                    val combined = holder.appendAndSnapshot(chunk, chunk.size) ?: return@withReentrancyGuard
-                    val snap = QuotaTextParser.scanProtoBufBytes(
-                        rawBytes = combined,
-                        length = combined.size,
-                        prev = latestSnapshot.get(),
-                        source = "Cronet-PB",
-                        rpcMethodHint = urlHint ?: holder.urlHint
-                    )
-                    if (snap != null) {
-                        publishSnapshot(snap)
-                    }
+    private fun pruneRequestMapsIfNeeded() {
+        val now = System.currentTimeMillis()
+        if (cronetRollingStreams.size >= 32) {
+            val cutoff = now - 45_000L
+            val it = cronetRollingStreams.entries.iterator()
+            while (it.hasNext()) {
+                if (it.next().value.createdAtMs < cutoff || cronetRollingStreams.size > 48) {
+                    it.remove()
                 }
             }
-        } catch (_: Throwable) {
+        }
+        if (requestContextMap.size >= 64) {
+            val cutoff = now - 45_000L
+            val it = requestContextMap.entries.iterator()
+            while (it.hasNext()) {
+                if (it.next().value.createdAtMs < cutoff || requestContextMap.size > 96) {
+                    it.remove()
+                }
+            }
+        }
+    }
+
+    private fun submitCronetChunk(
+        reqId: Int,
+        urlHint: String?,
+        sessionTag: String,
+        chunk: ByteArray
+    ) {
+        submitForegroundWork {
+            pruneRequestMapsIfNeeded()
+            val holder = cronetRollingStreams.getOrPut(reqId) {
+                RollingStreamBuffer(urlHint, sessionTag)
+            }
+            val combined = holder.appendAndSnapshot(chunk, chunk.size) ?: return@submitForegroundWork
+            val baseSnap = getBaseSnapshotForSession(holder.sessionTag)
+            val snap = QuotaTextParser.scanProtoBufBytes(
+                rawBytes = combined,
+                length = combined.size,
+                prev = baseSnap,
+                source = "Cronet-PB",
+                rpcMethodHint = urlHint ?: holder.urlHint
+            )
+            if (snap != null) {
+                publishSnapshotForSession(snap, holder.sessionTag)
+            }
         }
     }
 
     // -------------------------------------------------------------------------
-    // gRPC Interception (`io.grpc.ClientInterceptor`, `Channel`, `ClientCall`)
+    // gRPC Dynamic Metadata (`authorization`/`cookie`) + Query & Stream Hooks
     // -------------------------------------------------------------------------
 
-    private fun installGrpcHooksInClassLoader(cl: ClassLoader, bridge: HookBridge) {
+    private fun installGrpcSessionAndStreamHooks(cl: ClassLoader, bridge: HookBridge) {
+        // Hook io.grpc.Metadata.put(Key, value) to capture OAuth2 Bearer tokens & cookies injected
+        // dynamically on the fly by Google's CallCredentials (even on async token refreshes!).
+        val metadataCls = findClassSafe("io.grpc.Metadata", cl)
+        if (metadataCls != null && markDynamicHookOnce("grpc_metadata", metadataCls)) {
+            bridge.hookAllMethodsByName(
+                clazz = metadataCls,
+                methodName = "put",
+                before = cb@{ thisObj, args ->
+                    if (!isForegroundActive.get() || thisObj == null || args.size < 2) return@cb
+                    val keyObj = args[0] ?: return@cb
+                    val valStr = (args[1] as? String) ?: return@cb
+                    val keyName = extractGrpcMetadataKeyNameSafe(keyObj) ?: return@cb
+                    recordOutgoingBuilderHeader(thisObj, keyName, valStr)
+                }
+            )
+        }
+
         val interceptorsHelper = findClassSafe("io.grpc.ClientInterceptors", cl)
         if (interceptorsHelper != null) {
             val helperMethods = arrayOf("intercept", "interceptForward")
@@ -823,18 +1473,79 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun extractGrpcMetadataKeyNameSafe(keyObj: Any): String? {
+        return try {
+            val m = keyObj.javaClass.getMethod("name")
+            m.invoke(keyObj) as? String
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun extractSessionFromGrpcMetadataObject(metadataObj: Any?): String? {
+        if (metadataObj == null) return null
+        // Check if Metadata.put already recorded headers on this Metadata instance
+        val recorded = synchronized(builderHeaderMap) {
+            builderHeaderMap[metadataObj]?.copy()
+        }
+        if (recorded != null && recorded.hasCredentials) {
+            return onDynamicHeadersIntercepted(recorded, transport = "gRPC")
+        }
+
+        // Reflective fallback for pre-populated io.grpc.Metadata internal namesAndValues array
+        return try {
+            val f = findFieldInHierarchy(metadataObj.javaClass, "namesAndValues") ?: return null
+            val arr = f.get(metadataObj) as? Array<*> ?: return null
+            val headers = EphemeralSessionHeaders()
+            var i = 0
+            while (i + 1 < arr.size) {
+                val rawK = arr[i]
+                val rawV = arr[i + 1]
+                val k = when (rawK) {
+                    is ByteArray -> String(rawK, StandardCharsets.US_ASCII)
+                    is String -> rawK
+                    else -> null
+                }?.lowercase()
+                val v = when (rawV) {
+                    is ByteArray -> String(rawV, StandardCharsets.UTF_8)
+                    is String -> rawV
+                    else -> null
+                }
+                if (k != null && !v.isNullOrBlank()) {
+                    when (k) {
+                        "authorization" -> headers.authorization = v.trim()
+                        "cookie" -> headers.cookie = v.trim()
+                        "x-goog-authuser" -> headers.authUser = v.trim()
+                        "x-goog-pageid" -> headers.pageId = v.trim()
+                    }
+                }
+                i += 2
+            }
+            if (headers.hasCredentials) {
+                onDynamicHeadersIntercepted(headers, transport = "gRPC")
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun hookConcreteGrpcInterceptorClass(interceptorCls: Class<*>, bridge: HookBridge) {
         if (!markDynamicHookOnce("grpc_interceptor", interceptorCls)) return
         bridge.hookAllMethodsByName(
             clazz = interceptorCls,
             methodName = "interceptCall",
             after = { _, args, result ->
-                val methodDesc = args.getOrNull(0)
-                val fullMethod = extractGrpcMethodNameSafe(methodDesc)
                 if (result != null) {
-                    if (fullMethod != null) {
-                        if (grpcCallMethodNames.size > 128) grpcCallMethodNames.clear()
-                        grpcCallMethodNames[System.identityHashCode(result)] = fullMethod
+                    if (isForegroundActive.get()) {
+                        val fullMethod = extractGrpcMethodNameSafe(args.getOrNull(0))
+                        pruneRequestMapsIfNeeded()
+                        requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
+                            urlOrMethod = fullMethod,
+                            sessionTag = activeSessionTag.get(),
+                            isQueryCandidate = isGeminiQueryEndpoint(fullMethod)
+                        )
                     }
                     hookConcreteGrpcClientCallClass(result.javaClass, bridge)
                 }
@@ -848,12 +1559,15 @@ object QuotaCoreEngine {
             clazz = channelCls,
             methodName = "newCall",
             after = { _, args, result ->
-                val methodDesc = args.getOrNull(0)
-                val fullMethod = extractGrpcMethodNameSafe(methodDesc)
                 if (result != null) {
-                    if (fullMethod != null) {
-                        if (grpcCallMethodNames.size > 128) grpcCallMethodNames.clear()
-                        grpcCallMethodNames[System.identityHashCode(result)] = fullMethod
+                    if (isForegroundActive.get()) {
+                        val fullMethod = extractGrpcMethodNameSafe(args.getOrNull(0))
+                        pruneRequestMapsIfNeeded()
+                        requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
+                            urlOrMethod = fullMethod,
+                            sessionTag = activeSessionTag.get(),
+                            isQueryCandidate = isGeminiQueryEndpoint(fullMethod)
+                        )
                     }
                     hookConcreteGrpcClientCallClass(result.javaClass, bridge)
                 }
@@ -863,35 +1577,79 @@ object QuotaCoreEngine {
 
     private fun hookConcreteGrpcClientCallClass(callCls: Class<*>, bridge: HookBridge) {
         if (!markDynamicHookOnce("grpc_call", callCls)) return
+
+        // ClientCall.start(Listener, Metadata): capture outgoing session Metadata + hook Listener
         bridge.hookAllMethodsByName(
             clazz = callCls,
             methodName = "start",
-            before = { thisObj, args ->
-                val listener = args.getOrNull(0)
-                if (listener != null) {
-                    val rpcName = if (thisObj != null) {
-                        grpcCallMethodNames[System.identityHashCode(thisObj)]
-                    } else {
-                        null
+            before = cb@{ thisObj, args ->
+                val listener = args.getOrNull(0) ?: return@cb
+                val metadata = args.getOrNull(1)
+                val callId = if (thisObj != null) System.identityHashCode(thisObj) else 0
+                val existingCtx = if (callId != 0) requestContextMap[callId] else null
+
+                if (isForegroundActive.get()) {
+                    val dynamicSess = extractSessionFromGrpcMetadataObject(metadata)
+                        ?: activeSessionTag.get()
+                    val rpcName = existingCtx?.urlOrMethod
+                    val updatedCtx = BoundRequestContext(
+                        urlOrMethod = rpcName,
+                        sessionTag = dynamicSess,
+                        isQueryCandidate = isGeminiQueryEndpoint(rpcName)
+                    )
+                    if (callId != 0) {
+                        requestContextMap[callId] = updatedCtx
                     }
-                    hookConcreteGrpcListenerClass(listener.javaClass, rpcName, bridge)
+                    requestContextMap[System.identityHashCode(listener)] = updatedCtx
+                }
+
+                hookConcreteGrpcListenerClass(listener.javaClass, bridge)
+            }
+        )
+
+        // ClientCall.sendMessage(ReqT): detect user query dispatch in foreground
+        bridge.hookAllMethodsByName(
+            clazz = callCls,
+            methodName = "sendMessage",
+            after = cb@{ thisObj, _, _ ->
+                if (!isForegroundActive.get() || thisObj == null) return@cb
+                val ctx = requestContextMap[System.identityHashCode(thisObj)]
+                if (ctx == null || ctx.isQueryCandidate) {
+                    onUserQueryDispatched("gRPC")
                 }
             }
         )
     }
 
-    private fun hookConcreteGrpcListenerClass(
-        listenerCls: Class<*>,
-        rpcHint: String?,
-        bridge: HookBridge
-    ) {
+    private fun hookConcreteGrpcListenerClass(listenerCls: Class<*>, bridge: HookBridge) {
         if (!markDynamicHookOnce("grpc_listener", listenerCls)) return
+
         bridge.hookAllMethodsByName(
             clazz = listenerCls,
             methodName = "onMessage",
-            after = cb@{ _, args, _ ->
+            after = cb@{ thisObj, args, _ ->
+                if (!isForegroundActive.get()) return@cb
                 val msg = args.firstOrNull() ?: return@cb
-                inspectGrpcResponseMessageAsync(msg, rpcHint)
+                val listenerCtx = if (thisObj != null) {
+                    requestContextMap[System.identityHashCode(thisObj)]
+                } else {
+                    null
+                }
+                inspectGrpcResponseMessageAsync(
+                    message = msg,
+                    rpcHint = listenerCtx?.urlOrMethod,
+                    sessionTag = listenerCtx?.sessionTag ?: activeSessionTag.get()
+                )
+            }
+        )
+
+        bridge.hookAllMethodsByName(
+            clazz = listenerCls,
+            methodName = "onClose",
+            after = { thisObj, _, _ ->
+                if (thisObj != null) {
+                    requestContextMap.remove(System.identityHashCode(thisObj))
+                }
             }
         )
     }
@@ -906,58 +1664,58 @@ object QuotaCoreEngine {
         }
     }
 
-    private fun inspectGrpcResponseMessageAsync(message: Any, rpcHint: String?) {
-        try {
-            inspectorExecutor.execute {
-                withReentrancyGuard {
-                    when (message) {
-                        is ByteArray -> {
-                            val snap = QuotaTextParser.scanProtoBufBytes(
-                                rawBytes = message,
-                                length = message.size,
-                                prev = latestSnapshot.get(),
-                                source = "gRPC-PB",
-                                rpcMethodHint = rpcHint
-                            )
-                            if (snap != null) publishSnapshot(snap)
-                        }
-                        is ByteBuffer -> {
-                            val bytes = copyCronetByteBufferNonDestructive(message)
-                            if (bytes != null) {
-                                val snap = QuotaTextParser.scanProtoBufBytes(
-                                    rawBytes = bytes,
-                                    length = bytes.size,
-                                    prev = latestSnapshot.get(),
-                                    source = "gRPC-PB",
-                                    rpcMethodHint = rpcHint
-                                )
-                                if (snap != null) publishSnapshot(snap)
-                            }
-                        }
-                        else -> {
-                            // 1. Inspect deserialized ProtoLite / Kotlin response object fields directly
-                            val fieldSnap = inspectObjectGraphForQuota(message, "gRPC-Model")
-                            if (fieldSnap != null) {
-                                publishSnapshot(fieldSnap)
-                                return@withReentrancyGuard
-                            }
-                            // 2. If message exposes ProtoBuf `toByteArray()`, scan wire bytes when compact
-                            val serialized = trySerializeProtoLite(message)
-                            if (serialized != null && serialized.size in 6..MAX_STREAM_ACCUM_BYTES) {
-                                val protoSnap = QuotaTextParser.scanProtoBufBytes(
-                                    rawBytes = serialized,
-                                    length = serialized.size,
-                                    prev = latestSnapshot.get(),
-                                    source = "gRPC-PB",
-                                    rpcMethodHint = rpcHint
-                                )
-                                if (protoSnap != null) publishSnapshot(protoSnap)
-                            }
-                        }
+    private fun inspectGrpcResponseMessageAsync(
+        message: Any,
+        rpcHint: String?,
+        sessionTag: String
+    ) {
+        submitForegroundWork {
+            val targetSession = if (sessionTag != DEFAULT_SESSION_TAG) sessionTag else activeSessionTag.get()
+            val baseSnap = getBaseSnapshotForSession(targetSession)
+
+            when (message) {
+                is ByteArray -> {
+                    val snap = QuotaTextParser.scanProtoBufBytes(
+                        rawBytes = message,
+                        length = message.size,
+                        prev = baseSnap,
+                        source = "gRPC-PB",
+                        rpcMethodHint = rpcHint
+                    )
+                    if (snap != null) publishSnapshotForSession(snap, targetSession)
+                }
+                is ByteBuffer -> {
+                    val bytes = copyCronetByteBufferNonDestructive(message)
+                    if (bytes != null) {
+                        val snap = QuotaTextParser.scanProtoBufBytes(
+                            rawBytes = bytes,
+                            length = bytes.size,
+                            prev = baseSnap,
+                            source = "gRPC-PB",
+                            rpcMethodHint = rpcHint
+                        )
+                        if (snap != null) publishSnapshotForSession(snap, targetSession)
+                    }
+                }
+                else -> {
+                    val fieldSnap = inspectObjectGraphForQuota(message, "gRPC-Model", baseSnap)
+                    if (fieldSnap != null) {
+                        publishSnapshotForSession(fieldSnap, targetSession)
+                        return@submitForegroundWork
+                    }
+                    val serialized = trySerializeProtoLite(message)
+                    if (serialized != null && serialized.size in 6..MAX_STREAM_ACCUM_BYTES) {
+                        val protoSnap = QuotaTextParser.scanProtoBufBytes(
+                            rawBytes = serialized,
+                            length = serialized.size,
+                            prev = baseSnap,
+                            source = "gRPC-PB",
+                            rpcMethodHint = rpcHint
+                        )
+                        if (protoSnap != null) publishSnapshotForSession(protoSnap, targetSession)
                     }
                 }
             }
-        } catch (_: Throwable) {
         }
     }
 
@@ -974,7 +1732,28 @@ object QuotaCoreEngine {
         }
     }
 
-    private fun installPassiveOkHttpHooksInClassLoader(cl: ClassLoader, bridge: HookBridge) {
+    // -------------------------------------------------------------------------
+    // OkHttp Outgoing Header Interception & Passive Response Hooks
+    // -------------------------------------------------------------------------
+
+    private fun installOkHttpSessionAndBodyHooks(cl: ClassLoader, bridge: HookBridge) {
+        val reqBuilderCls = findClassSafe("okhttp3.Request\$Builder", cl)
+        if (reqBuilderCls != null && markDynamicHookOnce("okhttp_req_builder", reqBuilderCls)) {
+            val headerMethods = arrayOf("header", "addHeader")
+            for (mName in headerMethods) {
+                bridge.hookAllMethodsByName(
+                    clazz = reqBuilderCls,
+                    methodName = mName,
+                    before = cb@{ thisObj, args ->
+                        if (!isForegroundActive.get() || thisObj == null || args.size < 2) return@cb
+                        val k = args[0] as? String ?: return@cb
+                        val v = args[1] as? String ?: return@cb
+                        recordOutgoingBuilderHeader(thisObj, k, v)
+                    }
+                )
+            }
+        }
+
         val respBodyCls = findClassSafe("okhttp3.ResponseBody", cl) ?: return
         if (!markDynamicHookOnce("okhttp_body", respBodyCls)) return
 
@@ -982,18 +1761,18 @@ object QuotaCoreEngine {
             clazz = respBodyCls,
             methodName = "bytes",
             after = cb@{ _, _, result ->
+                if (!isForegroundActive.get()) return@cb
                 val bytes = result as? ByteArray ?: return@cb
                 if (bytes.size !in 6..MAX_STREAM_ACCUM_BYTES) return@cb
-                inspectorExecutor.execute {
-                    withReentrancyGuard {
-                        val snap = QuotaTextParser.scanProtoBufBytes(
-                            rawBytes = bytes,
-                            length = bytes.size,
-                            prev = latestSnapshot.get(),
-                            source = "OkHttp-PB"
-                        )
-                        if (snap != null) publishSnapshot(snap)
-                    }
+                val sess = activeSessionTag.get()
+                submitForegroundWork {
+                    val snap = QuotaTextParser.scanProtoBufBytes(
+                        rawBytes = bytes,
+                        length = bytes.size,
+                        prev = getBaseSnapshotForSession(sess),
+                        source = "OkHttp-PB"
+                    )
+                    if (snap != null) publishSnapshotForSession(snap, sess)
                 }
             }
         )
@@ -1002,17 +1781,17 @@ object QuotaCoreEngine {
             clazz = respBodyCls,
             methodName = "string",
             after = cb@{ _, _, result ->
+                if (!isForegroundActive.get()) return@cb
                 val raw = result as? String ?: return@cb
                 if (raw.length > MAX_STREAM_ACCUM_BYTES || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@cb
-                inspectorExecutor.execute {
-                    withReentrancyGuard {
-                        val snap = QuotaTextParser.parseInAppStructuredPayload(
-                            payload = raw,
-                            prev = latestSnapshot.get(),
-                            source = "OkHttp-JSON"
-                        )
-                        if (snap != null) publishSnapshot(snap)
-                    }
+                val sess = activeSessionTag.get()
+                submitForegroundWork {
+                    val snap = QuotaTextParser.parseInAppStructuredPayload(
+                        payload = raw,
+                        prev = getBaseSnapshotForSession(sess),
+                        source = "OkHttp-JSON"
+                    )
+                    if (snap != null) publishSnapshotForSession(snap, sess)
                 }
             }
         )
@@ -1024,12 +1803,14 @@ object QuotaCoreEngine {
             clazz = JSONObject::class.java,
             paramTypes = arrayOf(String::class.java)
         ) ctor@{ thisObj, args ->
+            if (!isForegroundActive.get()) return@ctor
             val raw = args.firstOrNull() as? String ?: return@ctor
             if (raw.length > MAX_STREAM_ACCUM_BYTES || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@ctor
             withReentrancyGuard {
                 val obj = thisObj as? JSONObject ?: return@withReentrancyGuard
-                val snap = QuotaTextParser.inspectJsonObject(obj, latestSnapshot.get(), "InApp-JSON")
-                if (snap != null) publishSnapshot(snap)
+                val sess = activeSessionTag.get()
+                val snap = QuotaTextParser.inspectJsonObject(obj, getBaseSnapshotForSession(sess), "InApp-JSON")
+                if (snap != null) publishSnapshotForSession(snap, sess)
             }
         }
 
@@ -1037,61 +1818,56 @@ object QuotaCoreEngine {
             bridge = bridge,
             clazz = JSONObject::class.java,
             paramTypes = arrayOf(JSONTokener::class.java)
-        ) { thisObj, _ ->
+        ) ctor@{ thisObj, _ ->
+            if (!isForegroundActive.get()) return@ctor
             withReentrancyGuard {
                 val obj = thisObj as? JSONObject ?: return@withReentrancyGuard
-                val snap = QuotaTextParser.inspectJsonObject(obj, latestSnapshot.get(), "InApp-JSON")
-                if (snap != null) publishSnapshot(snap)
+                val sess = activeSessionTag.get()
+                val snap = QuotaTextParser.inspectJsonObject(obj, getBaseSnapshotForSession(sess), "InApp-JSON")
+                if (snap != null) publishSnapshotForSession(snap, sess)
             }
         }
     }
 
     // =========================================================================
-    // Stage 3: Memory / ViewModel / StateFlow / LiveData / Repository Hook
+    // Stage 3: Foreground-Only ViewModel / StateFlow / LiveData Inspection
     // =========================================================================
 
-    fun installMemoryAndViewModelHooks(
+    fun installForegroundMemoryHooks(
         classLoader: ClassLoader?,
         bridge: HookBridge
     ) {
         activeBridgeRef.set(bridge)
         if (classLoader != null) {
             bindHooksForClassLoader(classLoader, bridge)
-            scheduleLoadedDexStateHolderScanOnce(classLoader)
         }
     }
 
     private fun installReactiveStateHooksInClassLoader(cl: ClassLoader, bridge: HookBridge) {
-        // 1. Hook Jetpack ViewModel constructors to track every live ViewModel in memory
         val vmCls = findClassSafe("androidx.lifecycle.ViewModel", cl)
         if (vmCls != null && markDynamicHookOnce("androidx_vm", vmCls)) {
             bridge.hookAllConstructors(
                 clazz = vmCls,
                 after = { thisObj, _ ->
-                    if (thisObj != null) {
+                    if (thisObj != null && isForegroundActive.get()) {
                         try {
                             liveViewModels.add(thisObj)
                         } catch (_: Throwable) {
                         }
-                        scheduleInProcessMemoryScan(delayMs = 900L)
                     }
                 }
             )
         }
 
-        // 2. Hook Kotlin Coroutines StateFlowImpl updates (setValue / updateState)
-        val stateFlowNames = arrayOf(
-            "kotlinx.coroutines.flow.StateFlowImpl"
-        )
-        for (sfName in stateFlowNames) {
-            val sfCls = findClassSafe(sfName, cl) ?: continue
-            if (!markDynamicHookOnce("stateflow_impl", sfCls)) continue
+        val sfCls = findClassSafe("kotlinx.coroutines.flow.StateFlowImpl", cl)
+        if (sfCls != null && markDynamicHookOnce("stateflow_impl", sfCls)) {
             val mutators = arrayOf("setValue", "updateState")
             for (mName in mutators) {
                 bridge.hookAllMethodsByName(
                     clazz = sfCls,
                     methodName = mName,
                     after = cb@{ _, args, _ ->
+                        if (!isForegroundActive.get()) return@cb
                         val emitted = if (args.size >= 2) args[1] else args.firstOrNull()
                         if (emitted != null && isFastQuotaModelCandidate(emitted)) {
                             inspectStateEmissionAsync(emitted, "StateFlow")
@@ -1101,7 +1877,6 @@ object QuotaCoreEngine {
             }
         }
 
-        // 3. Hook AndroidX LiveData / MutableLiveData updates (setValue / postValue)
         val liveDataNames = arrayOf(
             "androidx.lifecycle.LiveData",
             "androidx.lifecycle.MutableLiveData"
@@ -1115,6 +1890,7 @@ object QuotaCoreEngine {
                     clazz = ldCls,
                     methodName = mName,
                     after = cb@{ _, args, _ ->
+                        if (!isForegroundActive.get()) return@cb
                         val emitted = args.firstOrNull() ?: return@cb
                         if (isFastQuotaModelCandidate(emitted)) {
                             inspectStateEmissionAsync(emitted, "LiveData")
@@ -1125,10 +1901,6 @@ object QuotaCoreEngine {
         }
     }
 
-    /**
-     * Fast O(1)-cached eligibility check so high-frequency UI StateFlows exit in nanoseconds
-     * when carrying primitives, Strings, Compose layout structs, or non-quota models.
-     */
     private fun isFastQuotaModelCandidate(obj: Any): Boolean {
         val cls = obj.javaClass
         if (cls.isPrimitive || cls.isArray || cls.isEnum) return false
@@ -1185,7 +1957,6 @@ object QuotaCoreEngine {
                             objectOrTimeCount++
                         }
                     }
-                    // Allow compact R8-obfuscated data/proto classes with numeric + timestamp/nested fields
                     hasQuotaFieldName || (fields.size in 2..16 && numericCount >= 1 && (numericCount + objectOrTimeCount) >= 2)
                 }
             }
@@ -1201,34 +1972,48 @@ object QuotaCoreEngine {
     }
 
     private fun inspectStateEmissionAsync(stateObj: Any, source: String) {
-        try {
-            inspectorExecutor.execute {
-                withReentrancyGuard {
-                    val snap = inspectObjectGraphForQuota(stateObj, source)
-                    if (snap != null) {
-                        publishSnapshot(snap)
-                    }
-                }
+        val sess = activeSessionTag.get()
+        submitForegroundWork {
+            val snap = inspectObjectGraphForQuota(stateObj, source, getBaseSnapshotForSession(sess))
+            if (snap != null) {
+                publishSnapshotForSession(snap, sess)
             }
-        } catch (_: Throwable) {
         }
     }
 
     /**
-     * Scans loaded DEX classes in the host ClassLoader once on a background daemon thread
-     * for singleton Repository / StateFlow / LiveData holders containing quota fields.
-     * Every reflection & DEX lookup is wrapped in `try-catch (Throwable)`.
+     * Lightweight, strictly event-driven foreground refresh (`APP_OPEN`, `QUERY_SENT`,
+     * `ACCOUNT_SWITCH`, `MANUAL_TAP`). Never runs on a recurring timer or in background.
      */
-    private fun scheduleLoadedDexStateHolderScanOnce(classLoader: ClassLoader) {
-        if (!dexScanCompleted.compareAndSet(false, true)) return
-        try {
-            inspectorExecutor.execute {
-                try {
-                    scanDexClassesForRepositoriesSafe(classLoader)
-                } catch (_: Throwable) {
+    private fun triggerLightweightQuotaRefresh(
+        reason: RefreshReason,
+        delayMs: Long = 0L
+    ) {
+        if (!isForegroundActive.get()) return
+        val force = reason == RefreshReason.MANUAL_TAP || reason == RefreshReason.ACCOUNT_SWITCH
+        val now = System.currentTimeMillis()
+        if (!force && now - lastRefreshMs.get() < 1_500L) return
+        lastRefreshMs.set(now)
+
+        val executeRefresh = {
+            if (isForegroundActive.get()) {
+                val sess = activeSessionTag.get()
+                submitForegroundWork {
+                    if (dexRepoScanCompleted.compareAndSet(false, true)) {
+                        appContext?.classLoader?.let { scanDexClassesForRepositoriesSafe(it) }
+                    }
+                    runForegroundViewModelAndRepoScan(sess)
+                }
+                postToMain(delayMs = 250L, requireForeground = true) {
+                    scanForExhaustedBannerOnly(sess)
                 }
             }
-        } catch (_: Throwable) {
+        }
+
+        if (delayMs > 0L) {
+            postToMain(delayMs = delayMs, requireForeground = true) { executeRefresh() }
+        } else {
+            executeRefresh()
         }
     }
 
@@ -1238,18 +2023,16 @@ object QuotaCoreEngine {
             var currentCl: ClassLoader? = classLoader
             var inspectedCount = 0
 
-            while (currentCl != null && inspectedCount < 4000) {
+            while (currentCl != null && inspectedCount < 2500 && isForegroundActive.get()) {
                 if (currentCl is BaseDexClassLoader) {
-                    val pathListField = findFieldInHierarchy(currentCl.javaClass, "pathList")
-                    val pathList = pathListField?.get(currentCl)
-                    val dexElementsField = pathList?.let { findFieldInHierarchy(it.javaClass, "dexElements") }
-                    val dexElements = dexElementsField?.get(pathList) as? Array<*>
+                    val pathList = findFieldInHierarchy(currentCl.javaClass, "pathList")?.get(currentCl)
+                    val dexElements = pathList
+                        ?.let { findFieldInHierarchy(it.javaClass, "dexElements")?.get(it) } as? Array<*>
 
                     if (dexElements != null) {
                         for (element in dexElements) {
-                            if (element == null) continue
-                            val dexFileField = findFieldInHierarchy(element.javaClass, "dexFile")
-                            val dexFile = dexFileField?.get(element) ?: continue
+                            if (element == null || !isForegroundActive.get()) break
+                            val dexFile = findFieldInHierarchy(element.javaClass, "dexFile")?.get(element) ?: continue
                             val entriesMethod = try {
                                 dexFile.javaClass.getMethod("entries")
                             } catch (_: Throwable) {
@@ -1263,7 +2046,7 @@ object QuotaCoreEngine {
                                 null
                             } ?: continue
 
-                            while (entries.hasMoreElements() && inspectedCount < 4000) {
+                            while (entries.hasMoreElements() && inspectedCount < 2500 && isForegroundActive.get()) {
                                 val clsName = try {
                                     entries.nextElement()
                                 } catch (_: Throwable) {
@@ -1278,18 +2061,31 @@ object QuotaCoreEngine {
                                 }
 
                                 val lower = clsName.lowercase()
-                                val matchesDomain = lower.contains("quota") ||
-                                    lower.contains("usage") ||
-                                    lower.contains("limit") ||
-                                    lower.contains("allowance") ||
-                                    lower.contains("ratelimit") ||
-                                    lower.contains("tier")
-                                if (!matchesDomain) continue
+                                if (!lower.contains("quota") &&
+                                    !lower.contains("usage") &&
+                                    !lower.contains("limit") &&
+                                    !lower.contains("allowance")
+                                ) {
+                                    continue
+                                }
 
                                 inspectedCount++
                                 try {
                                     val loaded = Class.forName(clsName, false, currentCl)
-                                    inspectLoadedClassStaticHolders(loaded)
+                                    for (f in loaded.declaredFields) {
+                                        if (!Modifier.isStatic(f.modifiers)) continue
+                                        try {
+                                            f.isAccessible = true
+                                            val staticVal = f.get(null) ?: continue
+                                            if (staticVal.javaClass == loaded ||
+                                                isReactiveHolder(staticVal) ||
+                                                isFastQuotaModelCandidate(staticVal)
+                                            ) {
+                                                liveRepositories.add(staticVal)
+                                            }
+                                        } catch (_: Throwable) {
+                                        }
+                                    }
                                 } catch (_: Throwable) {
                                 }
                             }
@@ -1306,80 +2102,28 @@ object QuotaCoreEngine {
         }
     }
 
-    private fun inspectLoadedClassStaticHolders(clazz: Class<*>) {
-        try {
-            for (f in clazz.declaredFields) {
-                if (!Modifier.isStatic(f.modifiers)) continue
-                try {
-                    f.isAccessible = true
-                    val staticVal = f.get(null) ?: continue
-                    if (staticVal.javaClass == clazz ||
-                        isReactiveHolder(staticVal) ||
-                        isFastQuotaModelCandidate(staticVal)
-                    ) {
-                        liveRepositories.add(staticVal)
-                        val snap = inspectObjectGraphForQuota(staticVal, "RepoScan")
-                        if (snap != null) publishSnapshot(snap)
-                    }
-                } catch (_: Throwable) {
-                }
-            }
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun scheduleInProcessMemoryScan(delayMs: Long = 0L, force: Boolean = false) {
-        val now = System.currentTimeMillis()
-        if (!force && now - lastMemoryScanMs.get() < 3_500L) return
-        lastMemoryScanMs.set(now)
-
-        val trigger = {
-            try {
-                inspectorExecutor.execute {
-                    withReentrancyGuard {
-                        runLiveMemoryAndViewModelScan()
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-        }
-
-        if (delayMs > 0L) {
-            postToMain(delayMs = delayMs) { trigger() }
-        } else {
-            trigger()
-        }
-    }
-
-    /**
-     * Walks active Activity `ViewModelStore`, tracked `ViewModel` instances, and `Application`
-     * Dagger/Hilt `@Singleton` Repositories to extract live quota states and discover any
-     * dynamically loaded Cronet/gRPC engines in isolated GMS Chimera ClassLoaders.
-     */
-    private fun runLiveMemoryAndViewModelScan() {
+    private fun runForegroundViewModelAndRepoScan(sessionTag: String) {
+        if (!isForegroundActive.get()) return
         val roots = ArrayList<Pair<Any, String>>(24)
 
-        // 1. Collect ViewModels from active Activity's ViewModelStore
         val activity = activeActivityRef.get().get()
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
             collectViewModelsFromActivitySafe(activity, roots)
         }
 
-        // 2. Collect tracked ViewModel instances
         try {
             synchronized(liveViewModels) {
                 for (vm in liveViewModels) {
-                    if (roots.size < 40) roots.add(vm to "ViewModel")
+                    if (roots.size < 32) roots.add(vm to "ViewModel")
                 }
             }
         } catch (_: Throwable) {
         }
 
-        // 3. Collect tracked Repository singletons & Application DI graph
         try {
             synchronized(liveRepositories) {
                 for (repo in liveRepositories) {
-                    if (roots.size < 56) roots.add(repo to "Repository")
+                    if (roots.size < 48) roots.add(repo to "Repository")
                 }
             }
         } catch (_: Throwable) {
@@ -1391,9 +2135,11 @@ object QuotaCoreEngine {
         }
 
         for ((rootObj, tag) in roots) {
-            val snap = inspectObjectGraphForQuota(rootObj, tag)
+            if (!isForegroundActive.get()) return
+            val baseSnap = getBaseSnapshotForSession(sessionTag)
+            val snap = inspectObjectGraphForQuota(rootObj, tag, baseSnap)
             if (snap != null) {
-                publishSnapshot(snap)
+                publishSnapshotForSession(snap, sessionTag)
             }
         }
     }
@@ -1424,7 +2170,8 @@ object QuotaCoreEngine {
 
     private fun inspectObjectGraphForQuota(
         root: Any?,
-        source: String
+        source: String,
+        baseSnapshot: QuotaHudView.Snapshot
     ): QuotaHudView.Snapshot? {
         if (root == null) return null
         val visited = IdentityHashMap<Any, Boolean>(128)
@@ -1442,7 +2189,7 @@ object QuotaCoreEngine {
         )
 
         if (namedFields.isNotEmpty()) {
-            val fromNamed = QuotaTextParser.mergeExtractedFields(namedFields, latestSnapshot.get(), source)
+            val fromNamed = QuotaTextParser.mergeExtractedFields(namedFields, baseSnapshot, source)
             if (fromNamed != null) return fromNamed
         }
 
@@ -1454,12 +2201,11 @@ object QuotaCoreEngine {
                 .filter { it.kind == QuotaTextParser.MetricKind.WEEKLY }
                 .maxByOrNull { it.confidence }
 
-            // Require dual windows (5h + Weekly) OR high-confidence structural window
             if ((best5h != null && bestWk != null) ||
                 (best5h?.confidence ?: 0) >= 3 ||
                 (bestWk?.confidence ?: 0) >= 3
             ) {
-                val base = latestSnapshot.get().sanitized()
+                val base = baseSnapshot.sanitized()
                 val next = QuotaHudView.Snapshot(
                     fiveHourQuota = best5h?.metric ?: base.fiveHourQuota,
                     fiveHourReset = best5h?.reset ?: base.fiveHourReset,
@@ -1482,7 +2228,7 @@ object QuotaCoreEngine {
         namedOut: MutableMap<String, String>,
         windowsOut: MutableList<StructuralWindow>
     ) {
-        if (node == null || depth > 4 || visited.size >= 160 || windowsOut.size >= 8) return
+        if (node == null || depth > 4 || visited.size >= 140 || windowsOut.size >= 8) return
         val cls = node.javaClass
         if (cls.isPrimitive ||
             node is String ||
@@ -1501,11 +2247,11 @@ object QuotaCoreEngine {
         val clsName = cls.name
         val bridge = activeBridgeRef.get()
 
-        // Dynamically hook live GMS Chimera CronetEngine or gRPC Channel singletons found in DI memory!
+        // Dynamically bind isolated GMS Chimera CronetEngine or gRPC Channel singletons in DI memory
         if (bridge != null) {
             if (clsName.startsWith("org.chromium.net.")) {
                 bindHooksForClassLoader(cls.classLoader, bridge)
-                if (clsName.contains("Cronet") && clsName.contains("Context") || clsName.endsWith("Engine")) {
+                if ((clsName.contains("Cronet") && clsName.contains("Context")) || clsName.endsWith("Engine")) {
                     hookConcreteCronetEngineClass(cls, bridge)
                 }
                 return
@@ -1526,7 +2272,6 @@ object QuotaCoreEngine {
             return
         }
 
-        // Unwrap StateFlow / LiveData / Compose State / AtomicReference
         if (isReactiveHolder(node)) {
             val inner = unwrapReactiveValueSafe(node)
             if (inner != null) {
@@ -1570,7 +2315,6 @@ object QuotaCoreEngine {
 
         if (clsName.startsWith("java.") || clsName.startsWith("kotlin.")) return
 
-        // Inspect fields of app/domain/ViewModel/Repository/ProtoLite classes
         val fields = collectInstanceFieldsSafe(cls)
         if (fields.isEmpty()) return
 
@@ -1623,7 +2367,7 @@ object QuotaCoreEngine {
                     }
                 }
                 is String -> {
-                    // Never read arbitrary user chat strings; only check strict quota metrics if field is named
+                    // Skip arbitrary chat strings
                 }
                 else -> {
                     val instantEpoch = tryExtractTimeInstantEpochSec(rawVal)
@@ -1637,7 +2381,6 @@ object QuotaCoreEngine {
             }
         }
 
-        // Structural R8-obfuscated quota window match: future reset timestamp + usage/limit or fraction
         if (objResetWindow != null && fields.size in 2..14) {
             var metric = "--"
             var conf = if (hasDomainClassHint) 3 else 1
@@ -1708,7 +2451,6 @@ object QuotaCoreEngine {
                 val m = obj.javaClass.getMethod("getEpochSecond")
                 m.invoke(obj) as? Long
             } else {
-                // ProtoLite google.protobuf.Timestamp { long seconds_; int nanos_; }
                 val fields = obj.javaClass.declaredFields.filter { !Modifier.isStatic(it.modifiers) }
                 if (fields.size in 1..3) {
                     val secField = fields.firstOrNull {
@@ -1805,15 +2547,8 @@ object QuotaCoreEngine {
         return null
     }
 
-    // =========================================================================
-    // Rate-Limit Banner Check (In-App Native Views Only, Zero Chat Scraping)
-    // =========================================================================
-
-    private fun scheduleScreenBannerCheck() {
-        postToMain(delayMs = 550L) { scanForExhaustedBannerOnly() }
-    }
-
-    private fun scanForExhaustedBannerOnly() {
+    private fun scanForExhaustedBannerOnly(sessionTag: String) {
+        if (!isForegroundActive.get()) return
         val activity = activeActivityRef.get().get() ?: return
         if (activity.isFinishing || activity.isDestroyed) return
         val decor = activity.window?.decorView ?: return
@@ -1823,8 +2558,12 @@ object QuotaCoreEngine {
             val text = sb.toString()
             if (QuotaTextParser.fastHasQuotaKeyword(text)) {
                 withReentrancyGuard {
-                    val snap = QuotaTextParser.parseExhaustedBannerOnly(text, latestSnapshot.get(), "InApp-Banner")
-                    if (snap != null) publishSnapshot(snap)
+                    val snap = QuotaTextParser.parseExhaustedBannerOnly(
+                        rawText = text,
+                        prev = getBaseSnapshotForSession(sessionTag),
+                        source = "InApp-Banner"
+                    )
+                    if (snap != null) publishSnapshotForSession(snap, sessionTag)
                 }
             }
         }
@@ -1853,8 +2592,59 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Cross-Process Unified Sync & Single-Line Capsule HUD Rendering
+    // Session-Scoped Quota Store & Foreground-Only HUD Rendering
     // =========================================================================
+
+    private fun getBaseSnapshotForSession(sessionTag: String): QuotaHudView.Snapshot {
+        synchronized(sessionSnapshotsLock) {
+            if (sessionTag == activeSessionTag.get()) {
+                return latestSnapshot.get().sanitized()
+            }
+            return perSessionSnapshots[sessionTag]?.sanitized() ?: QuotaHudView.Snapshot()
+        }
+    }
+
+    private fun publishSnapshotForSession(snapshot: QuotaHudView.Snapshot, sessionTag: String) {
+        val clean = snapshot.sanitized()
+        if (!clean.hasLiveData) return
+
+        var shouldUpdateActiveHud = false
+        synchronized(sessionSnapshotsLock) {
+            val prevForSession = if (sessionTag == activeSessionTag.get()) {
+                latestSnapshot.get().sanitized()
+            } else {
+                perSessionSnapshots[sessionTag]?.sanitized() ?: QuotaHudView.Snapshot()
+            }
+            if (clean == prevForSession) return
+
+            if (sessionTag != DEFAULT_SESSION_TAG) {
+                perSessionSnapshots[sessionTag] = clean
+            }
+            if (sessionTag == activeSessionTag.get()) {
+                latestSnapshot.set(clean)
+                shouldUpdateActiveHud = true
+            }
+        }
+
+        if (!shouldUpdateActiveHud) return
+
+        saveSanitizedHostMirror(clean, currentLang.get(), currentTheme.get(), sessionTag)
+        if (isForegroundActive.get()) {
+            refreshHudOnUiThread()
+            val ctx = appContext
+            if (ctx != null) {
+                submitForegroundWork {
+                    val merged = QuotaSyncProvider.publishSessionQuota(
+                        context = ctx,
+                        snapshot = clean,
+                        sessionId = sessionTag,
+                        replaceSession = false
+                    )
+                    applyUnifiedState(merged)
+                }
+            }
+        }
+    }
 
     private fun loadSanitizedHostMirror(ctx: Context?) {
         if (ctx == null) return
@@ -1862,41 +2652,27 @@ object QuotaCoreEngine {
             val prefs = ctx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
             val langCode = prefs.getString("ui_lang", null)
             val themeCode = prefs.getString("ui_theme", null)
+            val savedSession = prefs.getString("session_id", null)
             if (langCode != null) currentLang.set(QuotaHudView.Lang.fromCode(langCode))
             if (themeCode != null) currentTheme.set(QuotaHudView.ThemeMode.fromCode(themeCode))
-
-            val rawFive = prefs.getString("five", "--") ?: "--"
-            val rawFiveReset = prefs.getString("five_reset", null)
-                ?: prefs.getString("reset", "--")
-                ?: "--"
-            val rawWeek = prefs.getString("week", "--") ?: "--"
-            val rawWeekReset = prefs.getString("week_reset", "--") ?: "--"
-            val src = prefs.getString("src", "InAppCache") ?: "InAppCache"
+            if (!savedSession.isNullOrBlank()) activeSessionTag.set(savedSession)
 
             val clean = QuotaHudView.Snapshot(
-                fiveHourQuota = rawFive,
-                fiveHourReset = rawFiveReset,
-                weeklyLimit = rawWeek,
-                weeklyReset = rawWeekReset,
-                source = src
+                fiveHourQuota = prefs.getString("five", "--") ?: "--",
+                fiveHourReset = prefs.getString("five_reset", "--") ?: "--",
+                weeklyLimit = prefs.getString("week", "--") ?: "--",
+                weeklyReset = prefs.getString("week_reset", "--") ?: "--",
+                source = prefs.getString("src", "InAppCache") ?: "InAppCache"
             ).sanitized()
 
-            if (clean.fiveHourQuota != rawFive ||
-                clean.fiveHourReset != rawFiveReset ||
-                clean.weeklyLimit != rawWeek ||
-                clean.weeklyReset != rawWeekReset
-            ) {
-                prefs.edit()
-                    .putString("five", clean.fiveHourQuota)
-                    .putString("five_reset", clean.fiveHourReset)
-                    .putString("week", clean.weeklyLimit)
-                    .putString("week_reset", clean.weeklyReset)
-                    .remove("reset")
-                    .apply()
-            }
-
             if (clean.hasLiveData) {
-                latestSnapshot.set(clean)
+                synchronized(sessionSnapshotsLock) {
+                    latestSnapshot.set(clean)
+                    val s = activeSessionTag.get()
+                    if (s != DEFAULT_SESSION_TAG) {
+                        perSessionSnapshots[s] = clean
+                    }
+                }
             }
         } catch (_: Throwable) {
         }
@@ -1905,7 +2681,8 @@ object QuotaCoreEngine {
     private fun saveSanitizedHostMirror(
         snapshot: QuotaHudView.Snapshot,
         lang: QuotaHudView.Lang,
-        theme: QuotaHudView.ThemeMode
+        theme: QuotaHudView.ThemeMode,
+        sessionTag: String
     ) {
         val ctx = appContext ?: return
         val clean = snapshot.sanitized()
@@ -1917,6 +2694,7 @@ object QuotaCoreEngine {
                 .putString("week", clean.weeklyLimit)
                 .putString("week_reset", clean.weeklyReset)
                 .putString("src", clean.source)
+                .putString("session_id", sessionTag)
                 .putString("ui_lang", lang.code)
                 .putString("ui_theme", theme.code)
                 .apply()
@@ -1924,247 +2702,86 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun registerForegroundObserver(ctx: Context) {
+        if (!observerRegistered.compareAndSet(false, true)) return
+        providerObserver = QuotaSyncProvider.registerStateObserver(ctx) {
+            if (isForegroundActive.get()) {
+                submitForegroundWork {
+                    val state = QuotaSyncProvider.readUnifiedState(ctx)
+                    applyUnifiedState(state)
+                }
+            }
+        }
+    }
+
+    private fun unregisterForegroundObserver(ctx: Context) {
+        if (!observerRegistered.compareAndSet(true, false)) return
+        QuotaSyncProvider.unregisterStateObserver(ctx, providerObserver)
+        providerObserver = null
+    }
+
+    private fun syncForegroundStateWithProviderAsync(ctx: Context) {
+        submitForegroundWork {
+            val localSnap = latestSnapshot.get().sanitized()
+            val sess = activeSessionTag.get()
+            val state = QuotaSyncProvider.sendHeartbeatAndFetchState(
+                context = ctx,
+                pkg = hostPackageName,
+                proc = hostProcessName,
+                bridge = activeBridgeName,
+                isApi102 = isModernApi102Bridge,
+                localSnapshot = localSnap,
+                sessionId = sess
+            )
+            applyUnifiedState(state)
+        }
+    }
+
     private fun applyUnifiedState(state: QuotaSyncProvider.UnifiedState?) {
-        if (state == null) return
-        val cleanSnap = state.snapshot.sanitized()
-        var changed = false
+        if (state == null || !isForegroundActive.get()) return
+        var uiChanged = false
 
         if (currentLang.get() != state.lang) {
             currentLang.set(state.lang)
-            changed = true
+            uiChanged = true
         }
         if (currentTheme.get() != state.theme) {
             currentTheme.set(state.theme)
-            changed = true
-        }
-        if (latestSnapshot.get() != cleanSnap && (cleanSnap.hasLiveData || !latestSnapshot.get().hasLiveData)) {
-            latestSnapshot.set(cleanSnap)
-            changed = true
+            uiChanged = true
         }
 
-        if (changed) {
-            saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get())
+        // Only adopt snapshot from QuotaSyncProvider if it belongs to the same active session
+        // (prevents overwriting a newly switched Google account with stale cached values).
+        val curSess = activeSessionTag.get()
+        val sameOrDefaultSession = state.sessionId.isBlank() ||
+            curSess == DEFAULT_SESSION_TAG ||
+            state.sessionId == curSess
+
+        if (sameOrDefaultSession) {
+            val cleanSnap = state.snapshot.sanitized()
+            if (cleanSnap.hasLiveData && latestSnapshot.get() != cleanSnap && !latestSnapshot.get().hasLiveData) {
+                latestSnapshot.set(cleanSnap)
+                uiChanged = true
+            }
+        }
+
+        if (uiChanged) {
+            saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get(), curSess)
             refreshHudOnUiThread()
         }
     }
 
-    private fun registerUnifiedObserverOnce(ctx: Context) {
-        if (!observerRegistered.compareAndSet(false, true)) return
-        providerObserver = QuotaSyncProvider.registerStateObserver(ctx) {
-            pullFromUnifiedProviderAsync(ctx)
-        }
-    }
-
-    private fun pullFromUnifiedProviderAsync(ctx: Context, delayMs: Long = 0L) {
-        val runPull = {
-            try {
-                ipcExecutor.execute {
-                    try {
-                        val state = QuotaSyncProvider.readUnifiedState(ctx)
-                        applyUnifiedState(state)
-                    } catch (_: Throwable) {
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-        }
-        if (delayMs > 0L) {
-            postToMain(delayMs = delayMs) { runPull() }
-        } else {
-            runPull()
-        }
-    }
-
-    private fun syncHeartbeatWithProviderAsync(ctx: Context, force: Boolean) {
-        val now = System.currentTimeMillis()
-        if (!force && now - lastHeartbeatMs < 6_000L) return
-        lastHeartbeatMs = now
-
-        try {
-            ipcExecutor.execute {
-                val localSnap = latestSnapshot.get().sanitized()
-                val state = QuotaSyncProvider.sendHeartbeatAndFetchState(
-                    context = ctx,
-                    pkg = hostPackageName,
-                    proc = hostProcessName,
-                    bridge = activeBridgeName,
-                    isApi102 = isModernApi102Bridge,
-                    localSnapshot = localSnap
-                )
-                if (state != null) {
-                    applyUnifiedState(state)
-                } else {
-                    sendFallbackHeartbeatBroadcast(ctx, localSnap)
-                }
-            }
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun sendFallbackHeartbeatBroadcast(ctx: Context, snap: QuotaHudView.Snapshot) {
-        try {
-            val clean = snap.sanitized()
-            val hb = Intent(QuotaTextParser.ACTION_HOOK_HEARTBEAT).apply {
-                setClassName(
-                    QuotaSyncProvider.MODULE_PACKAGE,
-                    "com.example.bardquotahook.HookTelemetryReceiver"
-                )
-                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                putExtra("pkg", hostPackageName)
-                putExtra("proc", hostProcessName)
-                putExtra("bridge", activeBridgeName)
-                putExtra("api_102", isModernApi102Bridge)
-                putExtra("five", clean.fiveHourQuota)
-                putExtra("five_reset", clean.fiveHourReset)
-                putExtra("week", clean.weeklyLimit)
-                putExtra("week_reset", clean.weeklyReset)
-                putExtra("src", clean.source)
-            }
-            ctx.sendBroadcast(hb)
-        } catch (_: Throwable) {
-        }
-    }
-
-    @Suppress("UnspecifiedRegisterReceiverFlag")
-    private fun registerReceiversOnce(ctx: Context) {
-        if (!receiverRegistered.compareAndSet(false, true)) return
-        try {
-            val filter = IntentFilter().apply {
-                addAction(QuotaTextParser.ACTION_QUOTA_INTERNAL_SYNC)
-                addAction(QuotaTextParser.ACTION_QUOTA_EXTERNAL_SYNC)
-            }
-            val receiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    val act = intent?.action ?: return
-                    if (act != QuotaTextParser.ACTION_QUOTA_INTERNAL_SYNC &&
-                        act != QuotaTextParser.ACTION_QUOTA_EXTERNAL_SYNC
-                    ) {
-                        return
-                    }
-
-                    var uiUpdated = false
-
-                    val langExtra = intent.getStringExtra("ui_lang")
-                    if (!langExtra.isNullOrBlank()) {
-                        currentLang.set(QuotaHudView.Lang.fromCode(langExtra))
-                        uiUpdated = true
-                    }
-                    val themeExtra = intent.getStringExtra("ui_theme")
-                    if (!themeExtra.isNullOrBlank()) {
-                        currentTheme.set(QuotaHudView.ThemeMode.fromCode(themeExtra))
-                        uiUpdated = true
-                    }
-
-                    if (intent.getBooleanExtra("rescan_memory", false)) {
-                        scheduleInProcessMemoryScan(delayMs = 0L, force = true)
-                        scheduleScreenBannerCheck()
-                    }
-
-                    if (intent.getBooleanExtra("ping", false) && context != null) {
-                        syncHeartbeatWithProviderAsync(context, force = true)
-                    }
-
-                    val incoming = QuotaHudView.Snapshot(
-                        fiveHourQuota = intent.getStringExtra("five") ?: "--",
-                        fiveHourReset = intent.getStringExtra("five_reset")
-                            ?: intent.getStringExtra("reset")
-                            ?: "--",
-                        weeklyLimit = intent.getStringExtra("week") ?: "--",
-                        weeklyReset = intent.getStringExtra("week_reset") ?: "--",
-                        source = intent.getStringExtra("src") ?: "Sync"
-                    ).sanitized()
-
-                    val prev = latestSnapshot.get().sanitized()
-                    val merged = QuotaHudView.Snapshot(
-                        fiveHourQuota = if (incoming.fiveHourQuota != "--") incoming.fiveHourQuota else prev.fiveHourQuota,
-                        fiveHourReset = if (incoming.fiveHourReset != "--") incoming.fiveHourReset else prev.fiveHourReset,
-                        weeklyLimit = if (incoming.weeklyLimit != "--") incoming.weeklyLimit else prev.weeklyLimit,
-                        weeklyReset = if (incoming.weeklyReset != "--") incoming.weeklyReset else prev.weeklyReset,
-                        source = incoming.source
-                    ).sanitized()
-
-                    if (merged.hasLiveData && merged != prev) {
-                        latestSnapshot.set(merged)
-                        uiUpdated = true
-                    }
-
-                    if (uiUpdated) {
-                        saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get())
-                        refreshHudOnUiThread()
-                    }
-                }
-            }
-            if (Build.VERSION.SDK_INT >= 33) {
-                ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
-            } else {
-                ctx.registerReceiver(receiver, filter)
-            }
-        } catch (_: Throwable) {
-        }
-    }
-
-    /**
-     * Triggered when user taps Refresh (↻) on the in-app `QuotaHudView`.
-     * Runs an immediate in-process ViewModel / StateFlow / Repository scan and queries
-     * sibling Gemini processes via `QuotaSyncProvider` (strictly zero web/HTTP polling).
-     */
-    private fun triggerInProcessQuotaRefresh(ctx: Context) {
-        scheduleInProcessMemoryScan(delayMs = 0L, force = true)
-        scheduleScreenBannerCheck()
-
-        try {
-            ipcExecutor.execute {
-                QuotaSyncProvider.requestInProcessRefresh(ctx, hostPackageName)
-            }
-        } catch (_: Throwable) {
-        }
-
-        pullFromUnifiedProviderAsync(ctx, delayMs = 600L)
-        pullFromUnifiedProviderAsync(ctx, delayMs = 1800L)
-    }
-
-    private fun publishSnapshot(snapshot: QuotaHudView.Snapshot) {
-        val clean = snapshot.sanitized()
-        if (!clean.hasLiveData) return
-        val current = latestSnapshot.get().sanitized()
-        if (clean == current) return
-
-        latestSnapshot.set(clean)
-        saveSanitizedHostMirror(clean, currentLang.get(), currentTheme.get())
-        refreshHudOnUiThread()
-
-        val ctx = appContext
-        if (ctx != null) {
-            try {
-                val sync = Intent(QuotaTextParser.ACTION_QUOTA_INTERNAL_SYNC).apply {
-                    if (hostPackageName.isNotEmpty()) setPackage(hostPackageName)
-                    putExtra("five", clean.fiveHourQuota)
-                    putExtra("five_reset", clean.fiveHourReset)
-                    putExtra("week", clean.weeklyLimit)
-                    putExtra("week_reset", clean.weeklyReset)
-                    putExtra("src", clean.source)
-                }
-                ctx.sendBroadcast(sync)
-            } catch (_: Throwable) {
-            }
-
-            try {
-                ipcExecutor.execute {
-                    val merged = QuotaSyncProvider.publishQuota(ctx, clean)
-                    if (merged != null) {
-                        applyUnifiedState(merged)
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-        }
-    }
-
-    private fun postToMain(delayMs: Long = 0L, action: () -> Unit) {
+    private fun postToMain(
+        delayMs: Long = 0L,
+        requireForeground: Boolean = true,
+        action: () -> Unit
+    ) {
+        if (requireForeground && !isForegroundActive.get()) return
         try {
             val looper = Looper.getMainLooper() ?: return
             val handler = mainHandler ?: Handler(looper).also { mainHandler = it }
             val runnable = Runnable {
+                if (requireForeground && !isForegroundActive.get()) return@Runnable
                 try {
                     action()
                 } catch (_: Throwable) {
@@ -2182,9 +2799,11 @@ object QuotaCoreEngine {
     }
 
     private fun refreshHudOnUiThread() {
-        postToMain {
+        if (!isForegroundActive.get()) return
+        postToMain(requireForeground = true) {
             val hud = activeHudRef.get().get()
             if (hud != null && hud.isAttachedToWindow) {
+                hud.visibility = View.VISIBLE
                 hud.applyPreferences(currentLang.get(), currentTheme.get())
                 hud.updateSnapshot(latestSnapshot.get().sanitized())
             } else {
@@ -2197,8 +2816,9 @@ object QuotaCoreEngine {
     }
 
     private fun attachOrUpdateOverlay(activity: Activity) {
-        postToMain {
-            if (activity.isFinishing || activity.isDestroyed) return@postToMain
+        if (!isForegroundActive.get()) return
+        postToMain(requireForeground = true) {
+            if (!isForegroundActive.get() || activity.isFinishing || activity.isDestroyed) return@postToMain
             val decorGroup = activity.window?.decorView as? ViewGroup ?: return@postToMain
 
             var hud = decorGroup.findViewWithTag<View>(QuotaHudView.HUD_VIEW_TAG) as? QuotaHudView
@@ -2206,7 +2826,7 @@ object QuotaCoreEngine {
                 hud = QuotaHudView(
                     context = activity,
                     onRefreshClick = {
-                        triggerInProcessQuotaRefresh(activity.applicationContext ?: activity)
+                        triggerLightweightQuotaRefresh(RefreshReason.MANUAL_TAP, delayMs = 0L)
                     },
                     onOpenUsageClick = {
                         QuotaHudView.openModuleSettings(activity)
@@ -2225,6 +2845,7 @@ object QuotaCoreEngine {
                 decorGroup.addView(hud, lp)
             }
 
+            hud.visibility = View.VISIBLE
             hud.applyPreferences(currentLang.get(), currentTheme.get())
             hud.updateSnapshot(latestSnapshot.get().sanitized())
             hud.bringToFront()

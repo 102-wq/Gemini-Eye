@@ -103,7 +103,9 @@
     *;
 }
 -keep public class com.example.bardquotahook.HookTelemetryReceiver {
-    public <init>();
+    *;
+}
+-keep class com.example.bardquotahook.HookTelemetryReceiver$* {
     *;
 }
 -keep public class com.example.bardquotahook.MainActivity {
