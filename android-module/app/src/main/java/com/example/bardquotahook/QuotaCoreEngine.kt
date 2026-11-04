@@ -131,13 +131,10 @@ object QuotaCoreEngine {
         // 1. Application, Unified QuotaSyncProvider Observer & Activity HUD Hooks
         hookApplicationAndActivities(bridge)
 
-        // 2. 原生 UI 渲染层截获（直接 Hook TextView.setText 获取 App 内配额）
-        hookTextViewSetText(bridge)
-
-        // 3. Targeted Embedded Usage WebView Inspection (gemini.google.com/usage only)
+        // 2. Targeted Embedded Usage WebView Inspection (gemini.google.com/usage only)
         hookWebViewDom(bridge)
 
-        // 4. Structured JSON Quota Inspection (strict schema keys + sanitized metrics only)
+        // 3. Structured JSON Quota Inspection (strict schema keys + sanitized metrics only)
         hookStructuredJsonPayloads(bridge)
     }
 
@@ -182,37 +179,6 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Native TextView Hook Implementation (Clean Syntax)
-    // =========================================================================
-
-    private fun hookTextViewSetText(bridge: HookBridge) {
-        hookMethodSafe(
-            bridge = bridge,
-            clazz = TextView::class.java,
-            name = "setText",
-            paramTypes = arrayOf(CharSequence::class.java),
-            after = { _, args, _ ->
-                val text = args.firstOrNull() as? CharSequence ?: return@after
-                val str = text.toString()
-
-                if (str.contains("剩余") || str.contains("额度") || str.contains("Quota") || str.contains("Reset") || str.contains("remaining")) {
-                    withReentrancyGuard {
-                        val current = latestSnapshot.get()
-                        val newSnap = QuotaHudView.Snapshot(
-                            fiveHourQuota = str,
-                            fiveHourReset = current.fiveHourReset,
-                            weeklyLimit = current.weeklyLimit,
-                            weeklyReset = current.weeklyReset,
-                            source = "NativeTextView"
-                        )
-                        publishSnapshot(newSnap)
-                    }
-                }
-            }
-        )
-    }
-
-    // =========================================================================
     // 1. Unified Provider Sync, Application & Activity HUD Injection
     // =========================================================================
 
@@ -222,8 +188,8 @@ object QuotaCoreEngine {
             clazz = Application::class.java,
             name = "onCreate",
             paramTypes = emptyArray(),
-            after = { thisObj, _, _ ->
-                val app = thisObj as? Application ?: return@after
+            after = cb@{ thisObj, _, _ ->
+                val app = thisObj as? Application ?: return@cb
                 onContextCaptured(app)
                 registerActivityCallbacksOnce(app)
             }
@@ -234,13 +200,14 @@ object QuotaCoreEngine {
             clazz = Activity::class.java,
             name = "onResume",
             paramTypes = emptyArray(),
-            after = { thisObj, _, _ ->
-                val activity = thisObj as? Activity ?: return@after
+            after = cb@{ thisObj, _, _ ->
+                val activity = thisObj as? Activity ?: return@cb
                 val ctx = activity.applicationContext ?: activity
                 onContextCaptured(ctx)
                 if (shouldDisplayHudInActivity(activity)) {
                     activeActivityRef.set(WeakReference(activity))
                     attachOrUpdateOverlay(activity)
+                    // Always pull authoritative state from QuotaSyncProvider on resume
                     syncHeartbeatWithProviderAsync(ctx, force = true)
                     scheduleScreenBannerCheck()
                 }
@@ -304,6 +271,10 @@ object QuotaCoreEngine {
         syncHeartbeatWithProviderAsync(targetCtx, force = false)
     }
 
+    /**
+     * Loads and sanitizes the local host cache, immediately purging any legacy corrupted strings
+     * (such as accidentally scraped prompt/config text from earlier versions).
+     */
     private fun loadSanitizedHostMirror(ctx: Context?) {
         if (ctx == null) return
         try {
@@ -442,6 +413,7 @@ object QuotaCoreEngine {
                 if (state != null) {
                     applyUnifiedState(state)
                 } else {
+                    // Fallback broadcast if ContentProvider is temporarily starting up
                     sendFallbackHeartbeatBroadcast(ctx, localSnap)
                 }
             }
@@ -546,6 +518,11 @@ object QuotaCoreEngine {
         }
     }
 
+    /**
+     * Triggered when user clicks the Refresh icon button on the in-app `QuotaHudView`.
+     * Invokes `QuotaSyncProvider.requestBackgroundRefresh` synchronously over ContentResolver
+     * and polls follow-up snapshots so the HUD updates immediately.
+     */
     private fun triggerBackgroundQuotaRefresh(ctx: Context) {
         scheduleScreenBannerCheck()
         scheduleWebViewPoll(150L)
@@ -557,6 +534,7 @@ object QuotaCoreEngine {
         } catch (_: Throwable) {
         }
 
+        // Follow-up state pulls in case OEM battery saver throttles ContentObserver broadcasts
         pullFromUnifiedProviderAsync(ctx, delayMs = 1600L)
         pullFromUnifiedProviderAsync(ctx, delayMs = 3600L)
     }
@@ -571,8 +549,8 @@ object QuotaCoreEngine {
             clazz = View::class.java,
             name = "onAttachedToWindow",
             paramTypes = emptyArray(),
-            after = { thisObj, _, _ ->
-                val wv = thisObj as? WebView ?: return@after
+            after = cb@{ thisObj, _, _ ->
+                val wv = thisObj as? WebView ?: return@cb
                 activeWebViewRef.set(WeakReference(wv))
                 scheduleWebViewPoll(1000L)
                 scheduleWebViewPoll(2500L)
@@ -584,8 +562,8 @@ object QuotaCoreEngine {
             clazz = WebView::class.java,
             name = "loadUrl",
             paramTypes = arrayOf(String::class.java),
-            after = { thisObj, args, _ ->
-                val wv = thisObj as? WebView ?: return@after
+            after = cb@{ thisObj, args, _ ->
+                val wv = thisObj as? WebView ?: return@cb
                 val url = (args.firstOrNull() as? String).orEmpty().lowercase()
                 if (url.contains("gemini.google.com/usage")) {
                     activeWebViewRef.set(WeakReference(wv))
@@ -601,9 +579,9 @@ object QuotaCoreEngine {
             bridge = bridge,
             clazz = JSONObject::class.java,
             paramTypes = arrayOf(String::class.java)
-        ) { thisObj, args ->
-            val raw = args.firstOrNull() as? String ?: return@hookConstructorSafe
-            if (raw.length > 65_536 || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@hookConstructorSafe
+        ) ctor@{ thisObj, args ->
+            val raw = args.firstOrNull() as? String ?: return@ctor
+            if (raw.length > 65_536 || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@ctor
             withReentrancyGuard {
                 val obj = thisObj as? JSONObject ?: return@withReentrancyGuard
                 val snap = QuotaTextParser.inspectJsonObject(obj, latestSnapshot.get(), "JSONObj")
@@ -625,7 +603,7 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Rate-Limit Banner & Usage WebView Inspection
+    // Rate-Limit Banner & Usage WebView Inspection (Zero Chat Contamination)
     // =========================================================================
 
     private fun scheduleScreenBannerCheck() {
@@ -711,7 +689,7 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Publishing & HUD Rendering (`QuotaHudView`)
+    // Publishing & Single-Line Capsule HUD Rendering (`QuotaHudView`)
     // =========================================================================
 
     private fun publishSnapshot(snapshot: QuotaHudView.Snapshot) {
@@ -790,7 +768,8 @@ object QuotaCoreEngine {
     private fun attachOrUpdateOverlay(activity: Activity) {
         postToMain {
             if (activity.isFinishing || activity.isDestroyed) return@postToMain
-            val decorGroup = activity.window?.decorView as? ViewGroup ?: return@postYuvMain // 修复完毕，纯淨无标签
+            val decorGroup = activity.window?.decorView as? ViewGroup ?: return@postToMain
+
             var hud = decorGroup.findViewWithTag<View>(QuotaHudView.HUD_VIEW_TAG) as? QuotaHudView
             if (hud == null) {
                 hud = QuotaHudView(
