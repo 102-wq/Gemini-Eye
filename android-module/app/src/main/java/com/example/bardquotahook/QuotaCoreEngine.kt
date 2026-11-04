@@ -131,10 +131,13 @@ object QuotaCoreEngine {
         // 1. Application, Unified QuotaSyncProvider Observer & Activity HUD Hooks
         hookApplicationAndActivities(bridge)
 
-        // 2. Targeted Embedded Usage WebView Inspection (gemini.google.com/usage only)
+        // 2. 原生 UI 渲染层截获（直接 Hook TextView.setText）
+        hookTextViewSetText(bridge)
+
+        // 3. Targeted Embedded Usage WebView Inspection (gemini.google.com/usage only)
         hookWebViewDom(bridge)
 
-        // 3. Structured JSON Quota Inspection (strict schema keys + sanitized metrics only)
+        // 4. Structured JSON Quota Inspection (strict schema keys + sanitized metrics only)
         hookStructuredJsonPayloads(bridge)
     }
 
@@ -179,6 +182,38 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
+    // Native TextView Hook Implementation
+    // =========================================================================
+
+    private fun hookTextViewSetText(bridge: HookBridge) {
+        hookMethodSafe(
+            bridge = bridge,
+            clazz = TextView::class.java,
+            name = "setText",
+            paramTypes = arrayOf(CharSequence::class.java),
+            after = { _, args, _ ->
+                val text = args.firstOrNull() as? CharSequence ?: return@after
+                val str = text.toString()
+
+                // 快速过滤配额关键字，避免不必要的正则计算
+                if (QuotaTextParser.fastHasQuotaKeyword(str)) {
+                    withReentrancyGuard {
+                        val snap = QuotaTextParser.parseUiBlock(
+                            block = str,
+                            prev = latestSnapshot.get(),
+                            source = "NativeTextView",
+                            requireUsageStructure = false
+                        )
+                        if (snap != null) {
+                            publishSnapshot(snap)
+                        }
+                    }
+                }
+            }
+        )
+    }
+
+    // =========================================================================
     // 1. Unified Provider Sync, Application & Activity HUD Injection
     // =========================================================================
 
@@ -207,7 +242,6 @@ object QuotaCoreEngine {
                 if (shouldDisplayHudInActivity(activity)) {
                     activeActivityRef.set(WeakReference(activity))
                     attachOrUpdateOverlay(activity)
-                    // Always pull authoritative state from QuotaSyncProvider on resume
                     syncHeartbeatWithProviderAsync(ctx, force = true)
                     scheduleScreenBannerCheck()
                 }
@@ -271,10 +305,6 @@ object QuotaCoreEngine {
         syncHeartbeatWithProviderAsync(targetCtx, force = false)
     }
 
-    /**
-     * Loads and sanitizes the local host cache, immediately purging any legacy corrupted strings
-     * (such as accidentally scraped prompt/config text from earlier versions).
-     */
     private fun loadSanitizedHostMirror(ctx: Context?) {
         if (ctx == null) return
         try {
@@ -413,7 +443,6 @@ object QuotaCoreEngine {
                 if (state != null) {
                     applyUnifiedState(state)
                 } else {
-                    // Fallback broadcast if ContentProvider is temporarily starting up
                     sendFallbackHeartbeatBroadcast(ctx, localSnap)
                 }
             }
@@ -518,11 +547,6 @@ object QuotaCoreEngine {
         }
     }
 
-    /**
-     * Triggered when user clicks the Refresh icon button on the in-app `QuotaHudView`.
-     * Invokes `QuotaSyncProvider.requestBackgroundRefresh` synchronously over ContentResolver
-     * and polls follow-up snapshots so the HUD updates immediately.
-     */
     private fun triggerBackgroundQuotaRefresh(ctx: Context) {
         scheduleScreenBannerCheck()
         scheduleWebViewPoll(150L)
@@ -534,7 +558,6 @@ object QuotaCoreEngine {
         } catch (_: Throwable) {
         }
 
-        // Follow-up state pulls in case OEM battery saver throttles ContentObserver broadcasts
         pullFromUnifiedProviderAsync(ctx, delayMs = 1600L)
         pullFromUnifiedProviderAsync(ctx, delayMs = 3600L)
     }
@@ -603,7 +626,7 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Rate-Limit Banner & Usage WebView Inspection (Zero Chat Contamination)
+    // Rate-Limit Banner & Usage WebView Inspection
     // =========================================================================
 
     private fun scheduleScreenBannerCheck() {
@@ -689,7 +712,7 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Publishing & Single-Line Capsule HUD Rendering (`QuotaHudView`)
+    // Publishing & HUD Rendering (`QuotaHudView`)
     // =========================================================================
 
     private fun publishSnapshot(snapshot: QuotaHudView.Snapshot) {
