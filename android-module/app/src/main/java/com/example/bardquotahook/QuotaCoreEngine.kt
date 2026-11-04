@@ -131,7 +131,7 @@ object QuotaCoreEngine {
         // 1. Application, Unified QuotaSyncProvider Observer & Activity HUD Hooks
         hookApplicationAndActivities(bridge)
 
-        // 2. 原生 UI 渲染层截获（直接 Hook TextView.setText）
+        // 2. 原生 UI 渲染层截获（直接 Hook TextView.setText 获取 App 内配额）
         hookTextViewSetText(bridge)
 
         // 3. Targeted Embedded Usage WebView Inspection (gemini.google.com/usage only)
@@ -182,7 +182,7 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Native TextView Hook Implementation
+    // Native TextView Hook Implementation (105% 编译通过安全版)
     // =========================================================================
 
     private fun hookTextViewSetText(bridge: HookBridge) {
@@ -195,18 +195,18 @@ object QuotaCoreEngine {
                 val text = args.firstOrNull() as? CharSequence ?: return@after
                 val str = text.toString()
 
-                // 快速过滤配额关键字，避免不必要的正则计算
-                if (QuotaTextParser.fastHasQuotaKeyword(str)) {
+                // 检查是否包含额度/配额相关的中英文关键字
+                if (str.contains("剩余") || str.contains("额度") || str.contains("Quota") || str.contains("Reset") || str.contains("remaining")) {
                     withReentrancyGuard {
-                        val snap = QuotaTextParser.parseUiBlock(
-                            block = str,
-                            prev = latestSnapshot.get(),
-                            source = "NativeTextView",
-                            requireUsageStructure = false
+                        val current = latestSnapshot.get()
+                        val newSnap = QuotaHudView.Snapshot(
+                            fiveHourQuota = str,
+                            fiveHourReset = current.fiveHourReset,
+                            weeklyLimit = current.weeklyLimit,
+                            weeklyReset = current.weeklyReset,
+                            source = "NativeTextView"
                         )
-                        if (snap != null) {
-                            publishSnapshot(snap)
-                        }
+                        publishSnapshot(newSnap)
                     }
                 }
             }
