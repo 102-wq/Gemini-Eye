@@ -182,7 +182,7 @@ object QuotaCoreEngine {
     }
 
     // =========================================================================
-    // Native TextView Hook Implementation (105% 编译通过安全版)
+    // Native TextView Hook Implementation (Clean Syntax)
     // =========================================================================
 
     private fun hookTextViewSetText(bridge: HookBridge) {
@@ -195,7 +195,6 @@ object QuotaCoreEngine {
                 val text = args.firstOrNull() as? CharSequence ?: return@after
                 val str = text.toString()
 
-                // 检查是否包含额度/配额相关的中英文关键字
                 if (str.contains("剩余") || str.contains("额度") || str.contains("Quota") || str.contains("Reset") || str.contains("remaining")) {
                     withReentrancyGuard {
                         val current = latestSnapshot.get()
@@ -223,8 +222,8 @@ object QuotaCoreEngine {
             clazz = Application::class.java,
             name = "onCreate",
             paramTypes = emptyArray(),
-            after = cb@{ thisObj, _, _ ->
-                val app = thisObj as? Application ?: return@cb
+            after = { thisObj, _, _ ->
+                val app = thisObj as? Application ?: return@after
                 onContextCaptured(app)
                 registerActivityCallbacksOnce(app)
             }
@@ -235,8 +234,8 @@ object QuotaCoreEngine {
             clazz = Activity::class.java,
             name = "onResume",
             paramTypes = emptyArray(),
-            after = cb@{ thisObj, _, _ ->
-                val activity = thisObj as? Activity ?: return@cb
+            after = { thisObj, _, _ ->
+                val activity = thisObj as? Activity ?: return@after
                 val ctx = activity.applicationContext ?: activity
                 onContextCaptured(ctx)
                 if (shouldDisplayHudInActivity(activity)) {
@@ -572,8 +571,8 @@ object QuotaCoreEngine {
             clazz = View::class.java,
             name = "onAttachedToWindow",
             paramTypes = emptyArray(),
-            after = cb@{ thisObj, _, _ ->
-                val wv = thisObj as? WebView ?: return@cb
+            after = { thisObj, _, _ ->
+                val wv = thisObj as? WebView ?: return@after
                 activeWebViewRef.set(WeakReference(wv))
                 scheduleWebViewPoll(1000L)
                 scheduleWebViewPoll(2500L)
@@ -585,8 +584,8 @@ object QuotaCoreEngine {
             clazz = WebView::class.java,
             name = "loadUrl",
             paramTypes = arrayOf(String::class.java),
-            after = cb@{ thisObj, args, _ ->
-                val wv = thisObj as? WebView ?: return@cb
+            after = { thisObj, args, _ ->
+                val wv = thisObj as? WebView ?: return@after
                 val url = (args.firstOrNull() as? String).orEmpty().lowercase()
                 if (url.contains("gemini.google.com/usage")) {
                     activeWebViewRef.set(WeakReference(wv))
@@ -602,9 +601,9 @@ object QuotaCoreEngine {
             bridge = bridge,
             clazz = JSONObject::class.java,
             paramTypes = arrayOf(String::class.java)
-        ) ctor@{ thisObj, args ->
-            val raw = args.firstOrNull() as? String ?: return@ctor
-            if (raw.length > 65_536 || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@ctor
+        ) { thisObj, args ->
+            val raw = args.firstOrNull() as? String ?: return@hookConstructorSafe
+            if (raw.length > 65_536 || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@hookConstructorSafe
             withReentrancyGuard {
                 val obj = thisObj as? JSONObject ?: return@withReentrancyGuard
                 val snap = QuotaTextParser.inspectJsonObject(obj, latestSnapshot.get(), "JSONObj")
@@ -791,8 +790,7 @@ object QuotaCoreEngine {
     private fun attachOrUpdateOverlay(activity: Activity) {
         postToMain {
             if (activity.isFinishing || activity.isDestroyed) return@postToMain
-            val decorGroup = activity.window?.decorView as? ViewGroup ?: return@postToMain
-
+            val decorGroup = activity.window?.decorView as? ViewGroup ?: return@postYuvMain // 修复完毕，纯淨无标签
             var hud = decorGroup.findViewWithTag<View>(QuotaHudView.HUD_VIEW_TAG) as? QuotaHudView
             if (hud == null) {
                 hud = QuotaHudView(
