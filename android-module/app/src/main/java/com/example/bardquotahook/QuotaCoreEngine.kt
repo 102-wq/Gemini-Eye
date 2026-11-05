@@ -2834,21 +2834,54 @@ object QuotaCoreEngine {
                     draggableInFrame = true
                 )
 
-                val lp = FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.TOP or Gravity.END
-                ).apply {
-                    topMargin = QuotaHudView.dp(activity, 52f)
-                    rightMargin = QuotaHudView.dp(activity, 10f)
+                // Ensure compatibility with FrameLayout or generic ViewGroup layouts
+                val topMarginPx = QuotaHudView.dp(activity, 52f)
+                val rightMarginPx = QuotaHudView.dp(activity, 10f)
+
+                val lp: ViewGroup.LayoutParams = if (decorGroup is FrameLayout) {
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        Gravity.TOP or Gravity.END
+                    ).apply {
+                        topMargin = topMarginPx
+                        rightMargin = rightMarginPx
+                    }
+                } else {
+                    ViewGroup.MarginLayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        topMargin = topMarginPx
+                        rightMargin = rightMarginPx
+                    }
                 }
-                decorGroup.addView(hud, lp)
+
+                try {
+                    decorGroup.addView(hud, lp)
+                } catch (_: Throwable) {
+                    try {
+                        decorGroup.addView(hud)
+                    } catch (_: Throwable) {
+                    }
+                }
+            } else if (hud.parent !== decorGroup) {
+                // If view was detached or attached elsewhere, re-add cleanly
+                try {
+                    (hud.parent as? ViewGroup)?.removeView(hud)
+                    decorGroup.addView(hud)
+                } catch (_: Throwable) {
+                }
             }
 
             hud.visibility = View.VISIBLE
+            hud.alpha = 1f
             hud.applyPreferences(currentLang.get(), currentTheme.get())
             hud.updateSnapshot(latestSnapshot.get().sanitized())
             hud.bringToFront()
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                hud.translationZ = QuotaHudView.dp(activity, 12f).toFloat()
+            }
             activeHudRef.set(WeakReference(hud))
         }
     }
