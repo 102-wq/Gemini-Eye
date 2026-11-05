@@ -17,14 +17,11 @@ android {
 
     signingConfigs {
         create("fixedRelease") {
-            val ksFile = file("signing.p12")
-            if (ksFile.exists()) {
-                storeFile = ksFile
-                storeType = "PKCS12"
-                storePassword = "android"
-                keyAlias = "androiddebugkey"
-                keyPassword = "android"
-            }
+            storeFile = file("signing.p12")
+            storeType = "PKCS12"
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
@@ -46,12 +43,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = false
-            val ksFile = file("signing.p12")
-            signingConfig = if (ksFile.exists()) {
-                signingConfigs.getByName("fixedRelease")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.getByName("fixedRelease")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
