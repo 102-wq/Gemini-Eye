@@ -16,12 +16,21 @@ android {
     }
 
     signingConfigs {
-        create("fixedRelease") {
-            storeFile = file("signing.p12")
-            storeType = "PKCS12"
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        create("release") {
+            val jks = file("release.jks")
+            val p12 = file("signing.p12")
+            if (jks.exists()) {
+                storeFile = jks
+                storePassword = "android"
+                keyAlias = "release"
+                keyPassword = "android"
+            } else if (p12.exists()) {
+                storeFile = p12
+                storeType = "PKCS12"
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
 
@@ -43,9 +52,10 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = false
-            val p12 = file("signing.p12")
-            if (p12.exists()) {
-                signingConfig = signingConfigs.getByName("fixedRelease")
+            val releaseKeystore = file("release.jks")
+            val p12Keystore = file("signing.p12")
+            if (releaseKeystore.exists() || p12Keystore.exists()) {
+                signingConfig = signingConfigs.getByName("release")
             } else {
                 signingConfig = signingConfigs.getByName("debug")
             }

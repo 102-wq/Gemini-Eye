@@ -12,6 +12,8 @@
 -adaptresourcefilecontents META-INF/xposed/java_init.list,assets/xposed_init
 
 # 2. Suppress R8 warnings for compileOnly Xposed APIs & host-reflected libraries
+-ignorewarnings
+-dontwarn **
 -dontwarn io.github.libxposed.**
 -dontwarn io.github.libxposed.annotation.**
 -dontwarn de.robv.android.xposed.**
