@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
   Check,
+  ChevronDown,
+  ChevronRight,
   Copy,
   Download,
   ExternalLink,
@@ -12,6 +15,8 @@ import {
   Send,
   ShieldCheck,
   Smartphone,
+  Terminal,
+  Trash2,
   UserCheck,
 } from 'lucide-react';
 import { PROJECT_FILES } from './moduleFiles';
@@ -109,6 +114,65 @@ export default function App() {
   const [isRefreshingHud, setIsRefreshingHud] = useState<boolean>(false);
   const [usageSheetOpen, setUsageSheetOpen] = useState<boolean>(false);
   const [lastSyncNote, setLastSyncNote] = useState<string>('');
+  const [devConsoleOpen, setDevConsoleOpen] = useState<boolean>(false);
+  const [devLogs, setDevLogs] = useState<Array<{
+    id: string;
+    timestamp: string;
+    timeMs: string;
+    eventType: 'APP_OPEN' | 'QUERY_SENT' | 'ACCOUNT_SWITCH' | 'MANUAL_TAP' | 'BACKGROUND_SLEEP' | 'PROTO_SCAN';
+    sessionTag: string;
+    detailZh: string;
+    detailEn: string;
+    level: 'info' | 'success' | 'warn' | 'event';
+  }>>([
+    {
+      id: 'init-1',
+      timestamp: '09:41:02',
+      timeMs: '09:41:02.104',
+      eventType: 'APP_OPEN',
+      sessionTag: 'sess_8f3a91c04b12',
+      detailZh: 'Gemini Activity.onCreate / onResume 前台激活。isForegroundActive=true，挂载 QuotaHudView(translationZ=12dp)，初始化轻量级事件刷新',
+      detailEn: 'Gemini Activity.onCreate / onResume foreground wake. isForegroundActive=true, attached QuotaHudView(translationZ=12dp), triggered initial refresh',
+      level: 'success',
+    },
+    {
+      id: 'init-2',
+      timestamp: '09:41:02',
+      timeMs: '09:41:02.350',
+      eventType: 'PROTO_SCAN',
+      sessionTag: 'sess_8f3a91c04b12',
+      detailZh: 'Cronet UrlRequest.onReadCompleted 出站头捕获: [__Secure-1PSID, X-Goog-AuthUser:0]。Protobuf 扫描命中双窗口: 5h=15% (1h52m), Weekly=29% (23h52m)',
+      detailEn: 'Cronet UrlRequest.onReadCompleted header captured: [__Secure-1PSID, X-Goog-AuthUser:0]. Protobuf scanned dual windows: 5h=15% (1h52m), Weekly=29% (23h52m)',
+      level: 'info',
+    },
+  ]);
+
+  const logDevEvent = (
+    eventType: 'APP_OPEN' | 'QUERY_SENT' | 'ACCOUNT_SWITCH' | 'MANUAL_TAP' | 'BACKGROUND_SLEEP' | 'PROTO_SCAN',
+    sessionTag: string,
+    detailZh: string,
+    detailEn: string,
+    level: 'info' | 'success' | 'warn' | 'event' = 'event'
+  ) => {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const padMs = (n: number) => String(n).padStart(3, '0');
+    const timeStr = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const timeMsStr = `${timeStr}.${padMs(d.getMilliseconds())}`;
+    setDevLogs((prev) => [
+      {
+        id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        timestamp: timeStr,
+        timeMs: timeMsStr,
+        eventType,
+        sessionTag,
+        detailZh,
+        detailEn,
+        level,
+      },
+      ...prev.slice(0, 49),
+    ]);
+  };
 
   const hudCapsuleRef = useRef<HTMLDivElement | null>(null);
   const bar5hRef = useRef<HTMLDivElement | null>(null);
@@ -189,7 +253,23 @@ export default function App() {
         ? `检测到出站动态请求头变更 (${acct.sessionTag})：已自动隔离旧账号缓存并切换至当前 Google 账号额度`
         : `Dynamic outgoing auth/cookie header changed (${acct.sessionTag}): isolated previous cache & switched to active Google account quota`
     );
-    setTimeout(() => setIsRefreshingHud(false), 550);
+    logDevEvent(
+      'ACCOUNT_SWITCH',
+      acct.sessionTag,
+      `动态出站头变更 [${acct.accountLabelZh}]。归档上一个账号快照，切换至独立数据槽 [5h=${acct.parsed.fiveHourQuota}, Weekly=${acct.parsed.weeklyLimit}]，无缝隔离防污染`,
+      `Dynamic header change [${acct.accountLabelEn}]. Archived previous session, switched to isolated slot [5h=${acct.parsed.fiveHourQuota}, Weekly=${acct.parsed.weeklyLimit}]`,
+      'warn'
+    );
+    setTimeout(() => {
+      setIsRefreshingHud(false);
+      logDevEvent(
+        'PROTO_SCAN',
+        acct.sessionTag,
+        `出站流拦截完成 (${acct.headerSummary})。QuotaSyncProvider(replaceSession=true) 广播已同步`,
+        `Outbound stream intercepted (${acct.headerSummary}). QuotaSyncProvider(replaceSession=true) broadcast synchronized`,
+        'info'
+      );
+    }, 550);
   };
 
   const handleToggleForeground = (fg: boolean) => {
@@ -204,6 +284,23 @@ export default function App() {
         ? 'Gemini 退至后台 (TRIM_MEMORY_UI_HIDDEN)：HUD 已卸载、注销监听、清空临时凭证缓冲，工作线程降至 0'
         : 'Gemini moved to background: HUD detached, observers unregistered, buffers wiped, 0 active threads'
     );
+    if (fg) {
+      logDevEvent(
+        'APP_OPEN',
+        activeSession.sessionTag,
+        `Gemini Activity.onResume 前台激活。startedActivityCount=1, 挂载 QuotaHudView, 注册 ContentObserver, 触发单次轻量级刷新`,
+        `Gemini Activity.onResume foreground wake. startedActivityCount=1, attached QuotaHudView, registered ContentObserver, triggered lightweight refresh`,
+        'success'
+      );
+    } else {
+      logDevEvent(
+        'BACKGROUND_SLEEP',
+        activeSession.sessionTag,
+        `Gemini 退至后台 (TRIM_MEMORY_UI_HIDDEN)。startedActivityCount=0, isForegroundActive=false, 移除 HUD, 清理临时请求头缓冲, 线程池缩减至 0`,
+        `Gemini left foreground (TRIM_MEMORY_UI_HIDDEN). startedActivityCount=0, isForegroundActive=false, detached HUD, wiped buffers, 0 active threads`,
+        'warn'
+      );
+    }
   };
 
   const handleSimulateQuerySend = () => {
@@ -214,7 +311,23 @@ export default function App() {
         ? `发送提问事件 (QUERY_SENT · ${activeSession.sessionTag})：实时携带当前账号 Authorization/Cookie，流结束后触发单次轻量额度同步`
         : `User query sent (QUERY_SENT · ${activeSession.sessionTag}): intercepted live Authorization/Cookie header & triggered lightweight post-query sync`
     );
-    setTimeout(() => setIsRefreshingHud(false), 600);
+    logDevEvent(
+      'QUERY_SENT',
+      activeSession.sessionTag,
+      `用户提问流出站 (Cronet.start / gRPC ClientCall.sendMessage)。捕获当前账号动态凭据，流结束后触发 1 次防抖轻量刷新`,
+      `User query stream initiated (Cronet.start / gRPC ClientCall.sendMessage). Captured dynamic credentials, debounced post-query refresh queued`,
+      'event'
+    );
+    setTimeout(() => {
+      setIsRefreshingHud(false);
+      logDevEvent(
+        'PROTO_SCAN',
+        activeSession.sessionTag,
+        `提问响应 ProtoBuf 流解析完毕。获取最新额度: 5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), Weekly=${activeSession.parsed.weeklyLimit} (${activeSession.parsed.weeklyReset})`,
+        `Query response ProtoBuf parsed. Current quota: 5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), Weekly=${activeSession.parsed.weeklyLimit} (${activeSession.parsed.weeklyReset})`,
+        'info'
+      );
+    }, 600);
   };
 
   const triggerSimulatedRefresh = (e: React.MouseEvent) => {
@@ -226,8 +339,22 @@ export default function App() {
         ? `手动前台刷新 (MANUAL_TAP · ${activeSession.sessionTag})：扫描当前前台 Activity ViewModel / StateFlow 状态（零网页轮询 / 零常驻服务）`
         : `Manual foreground refresh (MANUAL_TAP · ${activeSession.sessionTag}): scanned foreground Activity ViewModel / StateFlow holders (zero web polling)`
     );
+    logDevEvent(
+      'MANUAL_TAP',
+      activeSession.sessionTag,
+      `HUD 胶囊刷新图标点击 (MANUAL_TAP)。强制触发展开 Activity 实例 ViewModel / StateFlow / Repository 内存扫描`,
+      `HUD capsule refresh icon clicked (MANUAL_TAP). Forcing on-demand scan of foreground Activity ViewModels & StateFlow holders`,
+      'event'
+    );
     setTimeout(() => {
       setIsRefreshingHud(false);
+      logDevEvent(
+        'PROTO_SCAN',
+        activeSession.sessionTag,
+        `内存与出站响应扫描完毕。HUD 视图重绘完成 [Source: ${activeSession.parsed.source}]`,
+        `Memory & response stream scan finished. HUD view redrawn [Source: ${activeSession.parsed.source}]`,
+        'success'
+      );
     }, 650);
   };
 
@@ -985,10 +1112,158 @@ export default function App() {
                       </button>
                     </div>
                   )}
-                </div>
               </div>
             </div>
-          )}
+
+            {/* Developer Console (Collapsible Hook Event Stream with Timestamps) */}
+            <div className="mt-8 bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
+              <button
+                type="button"
+                onClick={() => setDevConsoleOpen((open) => !open)}
+                className="w-full px-5 py-3.5 flex items-center justify-between text-left bg-slate-900/90 hover:bg-slate-800/80 transition-colors border-b border-slate-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2.5">
+                  <div className="w-6 h-6 rounded-md bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                    <Terminal className="w-3.5 h-3.5" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-semibold text-slate-100 flex items-center gap-2">
+                      <span>{isZh ? '开发者控制台 · 模拟事件流' : 'Developer Console · Simulated Event Stream'}</span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                        {devLogs.length} {isZh ? '条事件' : 'events'}
+                      </span>
+                    </span>
+                    <span className="text-[11px] text-slate-400 block mt-0.5">
+                      {isZh
+                        ? '记录出站头拦截、APP_OPEN 前台激活、QUERY_SENT 提问流、ACCOUNT_SWITCH 切号等事件与毫秒时间戳'
+                        : 'Logs APP_OPEN, QUERY_SENT, ACCOUNT_SWITCH, and ProtoBuf scans with millisecond timestamps'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 text-slate-400">
+                  <span className="text-[11px] font-mono text-slate-500 hidden sm:inline">
+                    {devConsoleOpen
+                      ? isZh ? '点击收起' : 'Click to collapse'
+                      : isZh ? '展开日志控制台' : 'Expand event console'}
+                  </span>
+                  {devConsoleOpen ? (
+                    <ChevronDown className="w-4 h-4 text-slate-300" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-slate-300" />
+                  )}
+                </div>
+              </button>
+
+              {devConsoleOpen && (
+                <div className="p-4 space-y-3">
+                  {/* Console Header Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 px-1 text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-slate-400">
+                        <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Active Session:</span>
+                        <span className="text-emerald-400 font-semibold">{activeSession.sessionTag}</span>
+                      </span>
+                      <span className="text-slate-700">|</span>
+                      <span className="text-[11px] text-slate-400 font-mono">
+                        Foreground: <strong className={isGeminiForeground ? 'text-emerald-400' : 'text-amber-400'}>{isGeminiForeground ? 'true' : 'false (0 threads)'}</strong>
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          logDevEvent(
+                            'PROTO_SCAN',
+                            activeSession.sessionTag,
+                            `开发控制台诊断心跳测试: QuotaCoreEngine (v2.1.0) 桥接正常，当前会话指纹 [${activeSession.sessionTag}]`,
+                            `Dev console diagnostic ping: QuotaCoreEngine (v2.1.0) bridge verified, session fingerprint [${activeSession.sessionTag}]`,
+                            'info'
+                          )
+                        }
+                        className="px-2.5 py-1 text-[11px] rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer"
+                      >
+                        {isZh ? '发送测试日志' : 'Send Test Event'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setDevLogs([])}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-slate-800 hover:bg-red-950/40 text-slate-300 hover:text-red-300 border border-slate-700 hover:border-red-800 transition-colors cursor-pointer"
+                        title={isZh ? '清空控制台日志' : 'Clear console logs'}
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>{isZh ? '清空' : 'Clear'}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Terminal Log Stream Area */}
+                  <div className="bg-slate-950 border border-slate-800/80 rounded-xl p-3 max-h-72 overflow-y-auto font-mono text-xs space-y-1.5 shadow-inner">
+                    {devLogs.length === 0 ? (
+                      <div className="text-center py-8 text-slate-500 text-xs">
+                        {isZh
+                          ? '控制台暂无事件记录。在上方切换账号、发送提问或切换前后台状态以产生事件。'
+                          : 'No events logged. Switch accounts, send queries, or toggle foreground state to capture events.'}
+                      </div>
+                    ) : (
+                      devLogs.map((log) => {
+                        const badgeColor =
+                          log.eventType === 'APP_OPEN'
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                            : log.eventType === 'QUERY_SENT'
+                            ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+                            : log.eventType === 'ACCOUNT_SWITCH'
+                            ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                            : log.eventType === 'BACKGROUND_SLEEP'
+                            ? 'bg-purple-500/15 text-purple-300 border-purple-500/30'
+                            : log.eventType === 'MANUAL_TAP'
+                            ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                            : 'bg-zinc-700/40 text-zinc-300 border-zinc-600/40';
+
+                        return (
+                          <div
+                            key={log.id}
+                            className="flex items-start gap-2.5 py-1 px-1.5 rounded hover:bg-slate-900/60 transition-colors"
+                          >
+                            <span className="text-[11px] text-slate-500 shrink-0 select-none">
+                              {log.timeMs}
+                            </span>
+
+                            <span
+                              className={`text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded border shrink-0 ${badgeColor}`}
+                            >
+                              {log.eventType}
+                            </span>
+
+                            <span className="text-[11px] text-slate-400 shrink-0 font-mono">
+                              [{log.sessionTag}]
+                            </span>
+
+                            <span className="text-[11px] text-slate-200 break-words flex-1 leading-relaxed">
+                              {isZh ? log.detailZh : log.detailEn}
+                            </span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <div className="px-1 text-[11px] text-slate-500 flex items-center justify-between">
+                    <span>
+                      {isZh
+                        ? '提示：点击上方模拟器的「发送提问」或切换账号，此处将实时展示对应的出站 Hook 拦截流'
+                        : 'Tip: Click "Send Query" or switch Google accounts above to see real-time outbound hook interceptions'}
+                    </span>
+                    <span className="font-mono">QuotaCoreEngine v2.1.0</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
           {activeView === 'files' && (
             <div className="space-y-4">
