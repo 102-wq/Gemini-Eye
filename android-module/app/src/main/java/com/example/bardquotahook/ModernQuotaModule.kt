@@ -126,18 +126,23 @@ class ModernQuotaModule : XposedModule() {
                             .setExceptionMode(ExceptionMode.PROTECTIVE)
                             .intercept(XposedInterface.Hooker { chain ->
                                 val thisObj = try {
-                                    chain.thisObject
+                                    val m = chain.javaClass.methods.firstOrNull {
+                                        it.name == "getThisObject" || it.name == "getThis" || it.name == "thisObject"
+                                    }
+                                    m?.invoke(chain)
                                 } catch (_: Throwable) {
                                     null
                                 }
-                                val rawArgs = try {
-                                    chain.args
+                                val argsArr = try {
+                                    val m = chain.javaClass.methods.firstOrNull {
+                                        it.name == "getArgs" || it.name == "args"
+                                    }
+                                    when (val res = m?.invoke(chain)) {
+                                        is Array<*> -> Array<Any?>(res.size) { i -> res[i] }
+                                        is List<*> -> Array<Any?>(res.size) { i -> res[i] }
+                                        else -> emptyArray()
+                                    }
                                 } catch (_: Throwable) {
-                                    null
-                                }
-                                val argsArr = if (rawArgs != null) {
-                                    Array<Any?>(rawArgs.size) { i -> rawArgs[i] }
-                                } else {
                                     emptyArray()
                                 }
 
