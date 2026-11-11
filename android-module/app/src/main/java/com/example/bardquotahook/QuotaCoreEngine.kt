@@ -16,10 +16,15 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.webkit.CookieManager
 import dalvik.system.BaseDexClassLoader
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.ByteArrayOutputStream
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
 import java.lang.ref.WeakReference
 import java.lang.reflect.Constructor
 import java.lang.reflect.Executable
@@ -244,6 +249,22 @@ object QuotaCoreEngine {
 
     private val lastRefreshMs = AtomicLong(0L)
     private val lastQueryEventMs = AtomicLong(0L)
+    private val lastHttpFetchMs = AtomicLong(0L)
+    private val rollingQueryTimestamps = Collections.synchronizedList(ArrayList<Long>(64))
+
+    private fun recordUserQueryInRollingWindow(now: Long) {
+        try {
+            synchronized(rollingQueryTimestamps) {
+                val cutoff = now - 5L * 3600L * 1000L
+                val it = rollingQueryTimestamps.iterator()
+                while (it.hasNext()) {
+                    if (it.next() < cutoff) it.remove()
+                }
+                rollingQueryTimestamps.add(now)
+            }
+        } catch (_: Throwable) {
+        }
+    }
 
     // Single on-demand foreground executor: allowCoreThreadTimeOut(true) guarantees 0 threads when idle/backgrounded
     private val onDemandExecutor = ThreadPoolExecutor(
@@ -983,6 +1004,7 @@ object QuotaCoreEngine {
     private fun onUserQueryDispatched(transport: String) {
         if (!isForegroundActive.get()) return
         val now = System.currentTimeMillis()
+        recordUserQueryInRollingWindow(now)
         if (now - lastQueryEventMs.get() < 2_000L) return
         lastQueryEventMs.set(now)
 
@@ -2003,6 +2025,7 @@ object QuotaCoreEngine {
                         appContext?.classLoader?.let { scanDexClassesForRepositoriesSafe(it) }
                     }
                     runForegroundViewModelAndRepoScan(sess)
+                    fetchActiveQuotaOverHttp(sess, reason)
                 }
                 postToMain(delayMs = 250L, requireForeground = true) {
                     scanForExhaustedBannerOnly(sess)
@@ -2558,14 +2581,193 @@ object QuotaCoreEngine {
             val text = sb.toString()
             if (QuotaTextParser.fastHasQuotaKeyword(text)) {
                 withReentrancyGuard {
-                    val snap = QuotaTextParser.parseExhaustedBannerOnly(
-                        rawText = text,
+                    val snap = QuotaTextParser.parseScreenQuotaTexts(
+                        text = text,
                         prev = getBaseSnapshotForSession(sessionTag),
-                        source = "InApp-Banner"
+                        source = "InApp-Screen"
                     )
                     if (snap != null) publishSnapshotForSession(snap, sessionTag)
                 }
             }
+        }
+    }
+
+    private fun fetchActiveQuotaOverHttp(sessionTag: String, reason: RefreshReason) {
+        if (!isForegroundActive.get()) return
+        val now = System.currentTimeMillis()
+        val isManual = reason == RefreshReason.MANUAL_TAP || reason == RefreshReason.ACCOUNT_SWITCH
+        val minInterval = if (isManual) 2_500L else 12_000L
+        if (now - lastHttpFetchMs.get() < minInterval) return
+        lastHttpFetchMs.set(now)
+
+        val dynState = activeDynamicSession.get()
+        val authHeader = dynState.authorizationHeader
+        var cookieHeader = dynState.cookieHeader
+        val authUser = dynState.authUserHeader ?: "0"
+
+        // Fallback: If cookie was not intercepted from Cronet yet, retrieve from Android CookieManager
+        if (cookieHeader.isNullOrBlank()) {
+            cookieHeader = try {
+                CookieManager.getInstance().getCookie("https://gemini.google.com")
+                    ?: CookieManager.getInstance().getCookie(".google.com")
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        // If neither cookie nor OAuth Bearer token is available yet, apply rolling estimation if queries exist
+        if (cookieHeader.isNullOrBlank() && authHeader.isNullOrBlank()) {
+            applySessionQueryEstimationIfNeeded(sessionTag)
+            return
+        }
+
+        var fetchedSnapshot: QuotaHudView.Snapshot? = null
+
+        // 1. Fetch Gemini Web app landing page: contains AF_initDataCallback blobs with user quota & tier
+        try {
+            val url = URL("https://gemini.google.com/app?hl=zh-CN")
+            val conn = (url.openConnection() as? HttpURLConnection)
+            if (conn != null) {
+                conn.instanceFollowRedirects = true
+                conn.connectTimeout = 7_000
+                conn.readTimeout = 7_000
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36")
+                conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+                conn.setRequestProperty("Cache-Control", "no-cache")
+                conn.setRequestProperty("X-Goog-AuthUser", authUser)
+                if (!cookieHeader.isNullOrBlank()) {
+                    conn.setRequestProperty("Cookie", cookieHeader)
+                }
+                if (!authHeader.isNullOrBlank()) {
+                    conn.setRequestProperty("Authorization", authHeader)
+                }
+
+                val code = conn.responseCode
+                if (code in 200..299) {
+                    val stream = conn.inputStream
+                    val reader = InputStreamReader(stream, StandardCharsets.UTF_8)
+                    val sb = StringBuilder(32_768)
+                    val buf = CharArray(4096)
+                    var r: Int
+                    while (reader.read(buf).also { r = it } != -1 && sb.length < 262_144) {
+                        sb.append(buf, 0, r)
+                    }
+                    reader.close()
+                    stream.close()
+
+                    val html = sb.toString()
+                    val parsed = QuotaTextParser.parseHtmlOrJsonPayload(
+                        payload = html,
+                        prev = getBaseSnapshotForSession(sessionTag),
+                        source = "Active-Web"
+                    )
+                    if (parsed != null && parsed.hasLiveData) {
+                        fetchedSnapshot = parsed
+                    }
+                }
+                conn.disconnect()
+            }
+        } catch (t: Throwable) {
+            safeLog(activeBridgeRef.get(), "Active Web fetch attempt: ${t.javaClass.simpleName} (${t.message})")
+        }
+
+        // 2. If not fetched from web, try batchexecute RPC (hOoQ4d)
+        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank()) {
+            try {
+                val rpcUrl = URL("https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=hOoQ4d&source-path=%2Fapp")
+                val conn = (rpcUrl.openConnection() as? HttpURLConnection)
+                if (conn != null) {
+                    conn.requestMethod = "POST"
+                    conn.doOutput = true
+                    conn.connectTimeout = 6_000
+                    conn.readTimeout = 6_000
+                    conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36")
+                    conn.setRequestProperty("X-Goog-AuthUser", authUser)
+                    conn.setRequestProperty("Cookie", cookieHeader)
+                    if (!authHeader.isNullOrBlank()) {
+                        conn.setRequestProperty("Authorization", authHeader)
+                    }
+
+                    val postData = "f.req=" + java.net.URLEncoder.encode("[[[\"hOoQ4d\",\"[]\",null,\"generic\"]]]", "UTF-8")
+                    val out = OutputStreamWriter(conn.outputStream, StandardCharsets.UTF_8)
+                    out.write(postData)
+                    out.flush()
+                    out.close()
+
+                    if (conn.responseCode in 200..299) {
+                        val stream = conn.inputStream
+                        val reader = InputStreamReader(stream, StandardCharsets.UTF_8)
+                        val sb = StringBuilder(16_384)
+                        val buf = CharArray(2048)
+                        var r: Int
+                        while (reader.read(buf).also { r = it } != -1 && sb.length < 131_072) {
+                            sb.append(buf, 0, r)
+                        }
+                        reader.close()
+                        stream.close()
+
+                        val parsed = QuotaTextParser.parseHtmlOrJsonPayload(
+                            payload = sb.toString(),
+                            prev = getBaseSnapshotForSession(sessionTag),
+                            source = "Active-RPC"
+                        )
+                        if (parsed != null && parsed.hasLiveData) {
+                            fetchedSnapshot = parsed
+                        }
+                    }
+                    conn.disconnect()
+                }
+            } catch (t: Throwable) {
+                safeLog(activeBridgeRef.get(), "Active RPC fetch attempt: ${t.javaClass.simpleName} (${t.message})")
+            }
+        }
+
+        if (fetchedSnapshot != null && fetchedSnapshot.hasLiveData) {
+            safeLog(
+                activeBridgeRef.get(),
+                "Active HTTP quota resolved -> 5h=${fetchedSnapshot.fiveHourQuota} (${fetchedSnapshot.fiveHourReset}), Weekly=${fetchedSnapshot.weeklyLimit} (${fetchedSnapshot.weeklyReset})"
+            )
+            publishSnapshotForSession(fetchedSnapshot, sessionTag)
+        } else {
+            applySessionQueryEstimationIfNeeded(sessionTag)
+        }
+    }
+
+    private fun applySessionQueryEstimationIfNeeded(sessionTag: String) {
+        val cur = getBaseSnapshotForSession(sessionTag)
+        if (cur.fiveHourQuota != "--" && cur.source != "SessionEstimate") return
+
+        val now = System.currentTimeMillis()
+        val queryTimes: List<Long>
+        synchronized(rollingQueryTimestamps) {
+            val cutoff = now - 5L * 3600L * 1000L
+            val it = rollingQueryTimestamps.iterator()
+            while (it.hasNext()) {
+                if (it.next() < cutoff) it.remove()
+            }
+            queryTimes = ArrayList(rollingQueryTimestamps)
+        }
+
+        if (queryTimes.isEmpty()) return
+
+        // 5-hour Gemini window: estimate based on 50 prompts standard cap
+        val count = queryTimes.size
+        val oldest = queryTimes.minOrNull() ?: now
+        val resetSec = maxOf(60L, (oldest + 5L * 3600L * 1000L - now) / 1000L)
+        val resetToken = QuotaTextParser.formatDurationSeconds(resetSec)
+        val pct = minOf(100, (count * 100) / 50)
+        val metric = "$pct%"
+
+        val estSnap = cur.copy(
+            fiveHourQuota = metric,
+            fiveHourReset = resetToken,
+            source = "SessionEstimate"
+        ).sanitized()
+
+        if (estSnap.hasLiveData) {
+            publishSnapshotForSession(estSnap, sessionTag)
         }
     }
 

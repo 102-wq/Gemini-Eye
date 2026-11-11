@@ -890,22 +890,89 @@ object QuotaTextParser {
     }
 
     /**
-     * Checks ONLY for explicit Gemini rate-limit exhaustion banners in active screen views
-     * (never scrapes user chat bubbles or config text).
+     * Parses either raw JSON, JSPB array, or full Gemini landing HTML containing
+     * `AF_initDataCallback` data blobs and `window.WIZ_global_data`.
      */
-    fun parseExhaustedBannerOnly(
-        block: String,
+    fun parseHtmlOrJsonPayload(
+        payload: String,
+        prev: QuotaHudView.Snapshot,
+        source: String
+    ): QuotaHudView.Snapshot? {
+        val trimmed = payload.trim()
+        if (trimmed.isEmpty()) return null
+
+        // 1. Direct JSON / JSPB payload
+        val direct = parseInAppStructuredPayload(trimmed, prev, source)
+        if (direct != null && direct.hasLiveData) return direct
+
+        // 2. Extract embedded AF_initDataCallback blobs: AF_initDataCallback({ ... data: [...] })
+        val callbackRegex = Regex("""AF_initDataCallback\s*\(\s*\{.*?data\s*:\s*(\[[^;]+\]|\{[^;]+\})\s*\}\s*\)""", RegexOption.DOT_MATCHES_ALL)
+        var bestSnap = prev
+        var foundAny = false
+
+        for (match in callbackRegex.findAll(trimmed)) {
+            val dataStr = match.groupValues.getOrNull(1)?.trim() ?: continue
+            val parsed = parseInAppStructuredPayload(dataStr, bestSnap, "$source-AF")
+            if (parsed != null && parsed.hasLiveData) {
+                bestSnap = parsed
+                foundAny = true
+            }
+        }
+
+        // 3. Extract window.WIZ_global_data = { ... };
+        val wizMatch = Regex("""window\.WIZ_global_data\s*=\s*(\{.+?\});""", RegexOption.DOT_MATCHES_ALL).find(trimmed)
+        if (wizMatch != null) {
+            val wizJsonStr = wizMatch.groupValues.getOrNull(1)?.trim()
+            if (wizJsonStr != null) {
+                val parsed = parseInAppStructuredPayload(wizJsonStr, bestSnap, "$source-WIZ")
+                if (parsed != null && parsed.hasLiveData) {
+                    bestSnap = parsed
+                    foundAny = true
+                }
+            }
+        }
+
+        // 4. Regex scan for quota JSON properties in minified script text
+        if (!foundAny) {
+            val keyValMatches = Regex(""""([a-zA-Z0-9_]{3,30})"\s*:\s*([0-9.]+|"[^"]+")""").findAll(trimmed)
+            val extracted = mutableMapOf<String, String>()
+            for (m in keyValMatches) {
+                val k = m.groupValues[1].lowercase()
+                val v = m.groupValues[2].trim('"')
+                if (structuredQuotaKeyRegex.matches(k)) {
+                    extracted[k] = v
+                }
+            }
+            if (extracted.isNotEmpty()) {
+                val merged = mergeExtractedFields(extracted, bestSnap, "$source-Regex")
+                if (merged != null && merged.hasLiveData) return merged
+            }
+        }
+
+        return if (foundAny && bestSnap != prev && bestSnap.hasLiveData) bestSnap else null
+    }
+
+    /**
+     * Checks screen views for both explicit rate-limit exhaustion banners and active
+     * quota indicators in dialogs, bottom sheets, or model switcher views.
+     */
+    fun parseScreenQuotaTexts(
+        text: String,
         prev: QuotaHudView.Snapshot,
         source: String
     ): QuotaHudView.Snapshot? {
         val base = sanitizeSnapshot(prev)
         var fiveHour = base.fiveHourQuota
         var fiveReset = base.fiveHourReset
+        var weekly = base.weeklyLimit
+        var weekReset = base.weeklyReset
         var hit = false
 
-        for (rawLine in block.lineSequence()) {
+        for (rawLine in text.lineSequence()) {
             val line = rawLine.trim()
-            if (line.length !in 4..200) continue
+            if (line.length !in 3..250) continue
+
+            // 1. Check for exhaustion banners
             if (exhaustedBannerRegex.matches(line)) {
                 if (fiveHour == "--") {
                     fiveHour = "100%"
@@ -916,16 +983,58 @@ object QuotaTextParser {
                     fiveReset = bannerReset
                     hit = true
                 }
+                continue
+            }
+
+            // 2. Check for explicit 5h / weekly quota usage or remaining count in dialogs
+            val lower = line.lowercase()
+            val is5hContext = lower.contains("5h") || lower.contains("5-hour") || lower.contains("5小时") || lower.contains("short") || lower.contains("五小时")
+            val isWeekContext = lower.contains("week") || lower.contains("周") || lower.contains("7d")
+
+            if (is5hContext || (!isWeekContext && (lower.contains("quota") || lower.contains("限额") || lower.contains("使用") || lower.contains("limit")))) {
+                val pct = extractMetricToken(line, MetricKind.FIVE_HOUR)
+                if (pct != null && pct != "--") {
+                    fiveHour = pct
+                    hit = true
+                }
+                val reset = extractMetricToken(line, MetricKind.RESET)
+                if (reset != null && reset != "--") {
+                    fiveReset = reset
+                    hit = true
+                }
+            } else if (isWeekContext) {
+                val pct = extractMetricToken(line, MetricKind.WEEKLY)
+                if (pct != null && pct != "--") {
+                    weekly = pct
+                    hit = true
+                }
+                val reset = extractMetricToken(line, MetricKind.RESET)
+                if (reset != null && reset != "--") {
+                    weekReset = reset
+                    hit = true
+                }
             }
         }
+
         if (!hit) return null
         val next = base.copy(
             fiveHourQuota = fiveHour,
             fiveHourReset = fiveReset,
+            weeklyLimit = weekly,
+            weeklyReset = weekReset,
             source = source
         ).sanitized()
-        return if (next != base) next else null
+        return if (next != base && next.hasLiveData) next else null
     }
+
+    /**
+     * Backward-compatible alias for banner-only scanning. Accepts rawText or block.
+     */
+    fun parseExhaustedBannerOnly(
+        rawText: String,
+        prev: QuotaHudView.Snapshot,
+        source: String
+    ): QuotaHudView.Snapshot? = parseScreenQuotaTexts(rawText, prev, source)
 
     fun normalizeFieldCandidate(raw: String, kind: MetricKind): String {
         val singleLine = raw.replace(Regex("\\s+"), " ").trim()
