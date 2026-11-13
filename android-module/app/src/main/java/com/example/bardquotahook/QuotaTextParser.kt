@@ -58,7 +58,7 @@ object QuotaTextParser {
 
     private val validResetTokenRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
         Regex(
-            """^(?:\d{1,3}d(?:\d{1,2}h)?|\d{1,3}h(?:\d{1,2}m)?|\d{1,3}m|(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Tomorrow|周一|周二|周三|周四|周五|周六|周日|明天)\s*)?\d{1,2}:\d{2}(?:\s*[AP]M)?)$""",
+            """^(?:\d{1,3}(?:\.\d+)?d(?:\d{1,2}h)?|\d{1,3}h(?:\d{1,2}m)?|\d{1,3}m|(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Tomorrow|周一|周二|周三|周四|周五|周六|周日|明天)\s*)?\d{1,2}:\d{2}(?:\s*[AP]M)?)$""",
             RegexOption.IGNORE_CASE
         )
     }
@@ -207,6 +207,60 @@ object QuotaTextParser {
     }
 
     /**
+     * Formats Weekly quota reset duration strictly in days (`Xd` or `X.Yd`) so the UI renders `天` / `day`.
+     */
+    fun formatWeeklyDurationSeconds(deltaSec: Long): String {
+        if (deltaSec <= 0L) return "--"
+        val daysFloat = (deltaSec.toDouble() / 86400.0).coerceAtLeast(0.1)
+        val roundedTenths = (daysFloat * 10.0).roundToInt()
+        val whole = roundedTenths / 10
+        val frac = roundedTenths % 10
+        val raw = if (frac == 0) "${whole}d" else "${whole}.${frac}d"
+        return sanitizeResetToken(raw)
+    }
+
+    /**
+     * Converts any sanitized weekly reset token (`6d`, `4d12h`, `23h52m`, `11h05m`, etc.)
+     * into localized day display (`6天` / `4.5天` / `1天` for ZH, `6day` / `4.5day` / `1day` for EN).
+     */
+    fun formatWeeklyResetForDisplay(rawToken: String, isZh: Boolean): String {
+        val clean = sanitizeResetToken(rawToken)
+        if (clean == "--") return "--"
+        val unit = if (isZh) "天" else "day"
+
+        val lower = clean.lowercase()
+        val decDayMatch = Regex("""^(\d{1,3}(?:\.\d+)?)d$""").matchEntire(lower)
+        if (decDayMatch != null) {
+            return "${decDayMatch.groupValues[1]}$unit"
+        }
+
+        val dhMatch = Regex("""^(\d{1,3})d(\d{1,2})h$""").matchEntire(lower)
+        if (dhMatch != null) {
+            val d = dhMatch.groupValues[1].toIntOrNull() ?: 0
+            val h = dhMatch.groupValues[2].toIntOrNull() ?: 0
+            val totalTenths = (((d * 24 + h).toDouble() / 24.0) * 10.0).roundToInt().coerceAtLeast(1)
+            val whole = totalTenths / 10
+            val frac = totalTenths % 10
+            val numStr = if (frac == 0) "$whole" else "$whole.$frac"
+            return "$numStr$unit"
+        }
+
+        val hmMatch = Regex("""^(?:(\d{1,3})h)?(?:(\d{1,2})m)?$""").matchEntire(lower)
+        if (hmMatch != null && (hmMatch.groupValues[1].isNotEmpty() || hmMatch.groupValues[2].isNotEmpty())) {
+            val h = hmMatch.groupValues[1].toIntOrNull() ?: 0
+            val m = hmMatch.groupValues[2].toIntOrNull() ?: 0
+            val totalHours = h.toDouble() + m.toDouble() / 60.0
+            val totalTenths = ((totalHours / 24.0) * 10.0).roundToInt().coerceAtLeast(1)
+            val whole = totalTenths / 10
+            val frac = totalTenths % 10
+            val numStr = if (frac == 0) "$whole" else "$whole.$frac"
+            return "$numStr$unit"
+        }
+
+        return clean
+    }
+
+    /**
      * Classifies a candidate future Unix timestamp (in seconds or milliseconds) into
      * `MetricKind.FIVE_HOUR` (`45s .. 5h10m` ahead) or `MetricKind.WEEKLY` (`5h10m .. 7d1h` ahead).
      */
@@ -226,14 +280,15 @@ object QuotaTextParser {
         }
 
         if (deltaSec !in MIN_FUTURE_RESET_SEC..WEEKLY_MAX_WINDOW_SEC) return null
-        val token = formatDurationSeconds(deltaSec)
+        val isFiveHour = deltaSec <= FIVE_HOUR_MAX_WINDOW_SEC
+        val kind = if (isFiveHour) MetricKind.FIVE_HOUR else MetricKind.WEEKLY
+        val token = if (isFiveHour) {
+            formatDurationSeconds(deltaSec)
+        } else {
+            formatWeeklyDurationSeconds(deltaSec)
+        }
         if (token == "--") return null
 
-        val kind = if (deltaSec <= FIVE_HOUR_MAX_WINDOW_SEC) {
-            MetricKind.FIVE_HOUR
-        } else {
-            MetricKind.WEEKLY
-        }
         return kind to token
     }
 

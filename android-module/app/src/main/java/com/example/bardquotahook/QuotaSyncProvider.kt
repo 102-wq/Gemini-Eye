@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -27,7 +28,7 @@ class QuotaSyncProvider : ContentProvider() {
     data class UnifiedState(
         val snapshot: QuotaHudView.Snapshot = QuotaHudView.Snapshot(),
         val sessionId: String = "",
-        val lang: QuotaHudView.Lang = QuotaHudView.Lang.ZH,
+        val lang: QuotaHudView.Lang = defaultLangForDevice(),
         val theme: QuotaHudView.ThemeMode = QuotaHudView.ThemeMode.MIUIX,
         val xposedBound: Boolean = false,
         val isApi102: Boolean = false,
@@ -78,7 +79,7 @@ class QuotaSyncProvider : ContentProvider() {
                 return UnifiedState(
                     snapshot = snap,
                     sessionId = bundle.getString(KEY_SESSION_ID, "") ?: "",
-                    lang = QuotaHudView.Lang.fromCode(bundle.getString(KEY_LANG, "ZH")),
+                    lang = bundle.getString(KEY_LANG, null)?.let { QuotaHudView.Lang.fromCode(it) } ?: defaultLangForDevice(),
                     theme = QuotaHudView.ThemeMode.fromCode(bundle.getString(KEY_THEME, "MIUIX")),
                     xposedBound = bundle.getBoolean(KEY_XPOSED_BOUND, false),
                     isApi102 = bundle.getBoolean(KEY_API_102, false),
@@ -269,6 +270,19 @@ class QuotaSyncProvider : ContentProvider() {
         private val stateLock = Any()
         private val cachedState = AtomicReference<UnifiedState?>(null)
 
+        fun defaultLangForDevice(): QuotaHudView.Lang {
+            val lang = try {
+                Locale.getDefault().language
+            } catch (_: Throwable) {
+                ""
+            }
+            return if (lang.equals("zh", ignoreCase = true)) {
+                QuotaHudView.Lang.ZH
+            } else {
+                QuotaHudView.Lang.EN
+            }
+        }
+
         private fun isInModuleProcess(context: Context): Boolean {
             return context.packageName == MODULE_PACKAGE
         }
@@ -295,7 +309,7 @@ class QuotaSyncProvider : ContentProvider() {
                 val loaded = UnifiedState(
                     snapshot = cleanSnap,
                     sessionId = prefs.getString(KEY_SESSION_ID, "") ?: "",
-                    lang = QuotaHudView.Lang.fromCode(prefs.getString(KEY_LANG, "ZH")),
+                    lang = prefs.getString(KEY_LANG, null)?.let { QuotaHudView.Lang.fromCode(it) } ?: defaultLangForDevice(),
                     theme = QuotaHudView.ThemeMode.fromCode(prefs.getString(KEY_THEME, "MIUIX")),
                     xposedBound = prefs.getBoolean(KEY_XPOSED_BOUND, false),
                     isApi102 = prefs.getBoolean(KEY_API_102, false),

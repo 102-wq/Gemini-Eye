@@ -12,6 +12,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.LocaleList
 import android.util.TypedValue
 import android.view.Gravity
 import android.widget.Button
@@ -49,6 +50,10 @@ class MainActivity : Activity() {
             val locale = if (lang == QuotaHudView.Lang.ZH) Locale.SIMPLIFIED_CHINESE else Locale.ENGLISH
             val cfg = Configuration(resources.configuration).apply {
                 setLocale(locale)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    setLocales(LocaleList(locale))
+                }
+                setLayoutDirection(locale)
             }
             createConfigurationContext(cfg)
         } catch (_: Throwable) {
@@ -171,9 +176,9 @@ class MainActivity : Activity() {
         }
 
         val label5h = loc.getString(R.string.hud_label_5h)
-        val labelWk = loc.getString(R.string.hud_label_weekly)
+        val labelWk = if (zh) "每周" else "Weekly"
         quotaPreviewView?.text =
-            "$label5h: ${snap.formatFiveHourDisplay()}   |   $labelWk: ${snap.formatWeeklyDisplay()}   [${snap.source}]"
+            "$label5h: ${snap.formatFiveHourDisplay()}   |   $labelWk: ${snap.formatWeeklyDisplay(state.lang)}   [${snap.source}]"
 
         engineDescView?.text = loc.getString(R.string.settings_sync_desc)
         launchGeminiBtn?.text = loc.getString(R.string.settings_launch_gemini)

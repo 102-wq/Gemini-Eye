@@ -44,6 +44,7 @@ import java.util.Collections
 import java.util.Enumeration
 import java.util.IdentityHashMap
 import java.util.LinkedHashMap
+import java.util.Locale
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
@@ -208,7 +209,7 @@ object QuotaCoreEngine {
     // Dynamic Session & UI State
     private val activeSessionTag = AtomicReference(DEFAULT_SESSION_TAG)
     private val latestSnapshot = AtomicReference(QuotaHudView.Snapshot())
-    private val currentLang = AtomicReference(QuotaHudView.Lang.ZH)
+    private val currentLang = AtomicReference(QuotaSyncProvider.defaultLangForDevice())
     private val currentTheme = AtomicReference(QuotaHudView.ThemeMode.MIUIX)
 
     // Strong account-switch tracking (never churns across different OAuth scopes on the same account)
@@ -3536,7 +3537,11 @@ object QuotaCoreEngine {
             val themeCode = prefs.getString("ui_theme", null)
             val savedSession = prefs.getString("session_id", null)
             val savedStrong = prefs.getBoolean("session_strong", false)
-            if (langCode != null) currentLang.set(QuotaHudView.Lang.fromCode(langCode))
+            if (langCode != null) {
+                currentLang.set(QuotaHudView.Lang.fromCode(langCode))
+            } else {
+                currentLang.set(QuotaSyncProvider.defaultLangForDevice())
+            }
             if (themeCode != null) currentTheme.set(QuotaHudView.ThemeMode.fromCode(themeCode))
             if (!savedSession.isNullOrBlank()) {
                 activeSessionTag.set(savedSession)

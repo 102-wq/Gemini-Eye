@@ -101,12 +101,13 @@ class QuotaHudView(
             return if (c.fiveHourReset != "--") "${c.fiveHourQuota} (${c.fiveHourReset})" else c.fiveHourQuota
         }
 
-        fun formatWeeklyDisplay(): String {
+        fun formatWeeklyDisplay(lang: Lang = Lang.ZH): String {
             val c = sanitized()
+            val resetDisplay = QuotaTextParser.formatWeeklyResetForDisplay(c.weeklyReset, lang == Lang.ZH)
             if (c.weeklyLimit == "--") {
-                return if (c.weeklyReset != "--") "-- (${c.weeklyReset})" else "--"
+                return if (resetDisplay != "--") "-- ($resetDisplay)" else "--"
             }
-            return if (c.weeklyReset != "--") "${c.weeklyLimit} (${c.weeklyReset})" else c.weeklyLimit
+            return if (resetDisplay != "--") "${c.weeklyLimit} ($resetDisplay)" else c.weeklyLimit
         }
     }
 
@@ -135,7 +136,7 @@ class QuotaHudView(
     )
 
     private var currentSnapshot: Snapshot = Snapshot()
-    var currentLang: Lang = Lang.ZH
+    var currentLang: Lang = QuotaSyncProvider.defaultLangForDevice()
         private set
     var currentTheme: ThemeMode = ThemeMode.MIUIX
         private set
@@ -349,7 +350,7 @@ class QuotaHudView(
         fiveHourValueView.text = safeSnap.formatFiveHourDisplay()
         fiveHourValueView.setTextColor(palette.primaryText)
 
-        weeklyValueView.text = safeSnap.formatWeeklyDisplay()
+        weeklyValueView.text = safeSnap.formatWeeklyDisplay(currentLang)
         weeklyValueView.setTextColor(palette.primaryText)
 
         val p5 = safeSnap.fiveHourProgress
@@ -647,35 +648,13 @@ class QuotaHudView(
         const val MODULE_PACKAGE = "com.example.bardquotahook"
 
         private fun resolveLocalizedHudLabels(context: Context, lang: Lang): LocalizedHudLabels {
-            val fallback5h = "5h"
-            val fallbackWeekly = if (lang == Lang.ZH) "每周" else "Weekly"
-            val fallbackRefresh = if (lang == Lang.ZH) "刷新用量" else "Refresh quota"
-            val fallbackOpen = if (lang == Lang.ZH) "打开用量网页" else "Open usage page"
-            return try {
-                val basePkgCtx = if (context.packageName == MODULE_PACKAGE) {
-                    context
-                } else {
-                    context.createPackageContext(MODULE_PACKAGE, 0)
-                }
-                val locale = if (lang == Lang.ZH) Locale.SIMPLIFIED_CHINESE else Locale.ENGLISH
-                val cfg = Configuration(basePkgCtx.resources.configuration).apply {
-                    setLocale(locale)
-                }
-                val locRes = basePkgCtx.createConfigurationContext(cfg).resources
-                LocalizedHudLabels(
-                    fiveHour = locRes.getString(R.string.hud_label_5h).ifBlank { fallback5h },
-                    weekly = locRes.getString(R.string.hud_label_weekly).ifBlank { fallbackWeekly },
-                    refreshDesc = locRes.getString(R.string.hud_action_refresh).ifBlank { fallbackRefresh },
-                    openUsageDesc = locRes.getString(R.string.hud_action_open_usage).ifBlank { fallbackOpen }
-                )
-            } catch (_: Throwable) {
-                LocalizedHudLabels(
-                    fiveHour = fallback5h,
-                    weekly = fallbackWeekly,
-                    refreshDesc = fallbackRefresh,
-                    openUsageDesc = fallbackOpen
-                )
-            }
+            val isZh = lang == Lang.ZH
+            return LocalizedHudLabels(
+                fiveHour = "5h",
+                weekly = if (isZh) "每周" else "Weekly",
+                refreshDesc = if (isZh) "刷新当前前台额度" else "Refresh foreground quota",
+                openUsageDesc = if (isZh) "打开模块设置" else "Open HUD settings"
+            )
         }
 
         fun dp(context: Context, value: Float): Int {

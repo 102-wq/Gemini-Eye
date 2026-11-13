@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicReference
 object HookTelemetryReceiver {
 
     data class AppUiPrefs(
-        val lang: QuotaHudView.Lang = QuotaHudView.Lang.ZH,
+        val lang: QuotaHudView.Lang = QuotaSyncProvider.defaultLangForDevice(),
         val theme: QuotaHudView.ThemeMode = QuotaHudView.ThemeMode.MIUIX,
         val sessionId: String = "",
         val xposedBound: Boolean = false,

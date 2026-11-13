@@ -45,6 +45,41 @@ interface SimulatedAccountSession {
   parsed: HudSnapshot;
 }
 
+function formatWeeklyResetLabel(rawToken: string, lang: UiLang): string {
+  const clean = rawToken.replace(/\s+/g, '').trim();
+  if (!clean || clean === '--') return '--';
+  const unit = lang === 'zh' ? '天' : 'day';
+  const lower = clean.toLowerCase();
+
+  const decDayMatch = lower.match(/^(\d{1,3}(?:\.\d+)?)d$/);
+  if (decDayMatch) {
+    return `${decDayMatch[1]}${unit}`;
+  }
+
+  const dhMatch = lower.match(/^(\d{1,3})d(\d{1,2})h$/);
+  if (dhMatch) {
+    const d = parseInt(dhMatch[1], 10);
+    const h = parseInt(dhMatch[2], 10);
+    const tenths = Math.max(1, Math.round(((d * 24 + h) / 24) * 10));
+    const whole = Math.floor(tenths / 10);
+    const frac = tenths % 10;
+    return `${frac === 0 ? whole : `${whole}.${frac}`}${unit}`;
+  }
+
+  const hmMatch = lower.match(/^(?:(\d{1,3})h)?(?:(\d{1,2})m)?$/);
+  if (hmMatch && (hmMatch[1] || hmMatch[2])) {
+    const h = hmMatch[1] ? parseInt(hmMatch[1], 10) : 0;
+    const m = hmMatch[2] ? parseInt(hmMatch[2], 10) : 0;
+    const totalHours = h + m / 60;
+    const tenths = Math.max(1, Math.round((totalHours / 24) * 10));
+    const whole = Math.floor(tenths / 10);
+    const frac = tenths % 10;
+    return `${frac === 0 ? whole : `${whole}.${frac}`}${unit}`;
+  }
+
+  return clean;
+}
+
 const ACCOUNT_SESSIONS: SimulatedAccountSession[] = [
   {
     id: 'account-primary',
@@ -141,8 +176,8 @@ export default function App() {
       timeMs: '09:41:02.350',
       eventType: 'PROTO_SCAN',
       sessionTag: 'sess_8f3a91c04b12',
-      detailZh: 'Cronet UrlRequest.onReadCompleted 出站头捕获: [__Secure-1PSID, X-Goog-AuthUser:0]。Protobuf 扫描命中双窗口: 5h=15% (1h52m), Weekly=29% (23h52m)',
-      detailEn: 'Cronet UrlRequest.onReadCompleted header captured: [__Secure-1PSID, X-Goog-AuthUser:0]. Protobuf scanned dual windows: 5h=15% (1h52m), Weekly=29% (23h52m)',
+      detailZh: 'Cronet UrlRequest.onReadCompleted 出站头捕获: [__Secure-1PSID, X-Goog-AuthUser:0]。Protobuf 扫描命中双窗口: 5h=15% (1h52m), 每周=29% (1天)',
+      detailEn: 'Cronet UrlRequest.onReadCompleted header captured: [__Secure-1PSID, X-Goog-AuthUser:0]. Protobuf scanned dual windows: 5h=15% (1h52m), Weekly=29% (1day)',
       level: 'info',
     },
   ]);
@@ -323,8 +358,8 @@ export default function App() {
       logDevEvent(
         'PROTO_SCAN',
         activeSession.sessionTag,
-        `提问响应 ProtoBuf 流解析完毕。获取最新额度: 5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), Weekly=${activeSession.parsed.weeklyLimit} (${activeSession.parsed.weeklyReset})`,
-        `Query response ProtoBuf parsed. Current quota: 5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), Weekly=${activeSession.parsed.weeklyLimit} (${activeSession.parsed.weeklyReset})`,
+        `提问响应 ProtoBuf 流解析完毕。获取最新额度: 5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), 每周=${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, 'zh')})`,
+        `Query response ProtoBuf parsed. Current quota: 5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), Weekly=${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, 'en')})`,
         'info'
       );
     }, 600);
@@ -640,7 +675,10 @@ export default function App() {
           <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
             <button
               type="button"
-              onClick={() => setUiLang('zh')}
+              onClick={() => {
+                setUiLang('zh');
+                setHudLang('zh');
+              }}
               className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
                 uiLang === 'zh'
                   ? 'bg-white text-slate-900 shadow-xs'
@@ -651,7 +689,10 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => setUiLang('en')}
+              onClick={() => {
+                setUiLang('en');
+                setHudLang('en');
+              }}
               className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
                 uiLang === 'en'
                   ? 'bg-white text-slate-900 shadow-xs'
@@ -863,7 +904,7 @@ export default function App() {
                           <span ref={settingsBarWeeklyRef} className="block h-full rounded-full bg-sky-400" />
                         </span>
                         <span>
-                          {activeSession.parsed.weeklyLimit} ({activeSession.parsed.weeklyReset})
+                          {activeSession.parsed.weeklyLimit} ({formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})
                         </span>
                       </span>
                     </div>
@@ -997,9 +1038,9 @@ export default function App() {
                               {activeSession.parsed.fiveHourReset})
                             </div>
                             <div>
-                              Weekly ({activeSession.parsed.source}):{' '}
+                              {hudLang === 'zh' ? '每周' : 'Weekly'} ({activeSession.parsed.source}):{' '}
                               <strong>{activeSession.parsed.weeklyLimit}</strong> (
-                              {activeSession.parsed.weeklyReset})
+                              {formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})
                             </div>
                           </div>
                         </div>
@@ -1080,7 +1121,7 @@ export default function App() {
                         />
                       </span>
                       <span className="font-medium tabular-nums">
-                        {activeSession.parsed.weeklyLimit} ({activeSession.parsed.weeklyReset})
+                        {activeSession.parsed.weeklyLimit} ({formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})
                       </span>
 
                       <span
