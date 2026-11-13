@@ -15,12 +15,22 @@ android {
         versionName = "2.1.0"
     }
 
+    val keystoreCandidate = if (file("release.jks").exists()) {
+        file("release.jks")
+    } else if (file("release.p12").exists()) {
+        file("release.p12")
+    } else {
+        file("release.jks")
+    }
+
     signingConfigs {
         create("release") {
-            storeFile = file("release.jks")
-            storePassword = "android"
-            keyAlias = "release"
-            keyPassword = "android"
+            storeFile = keystoreCandidate
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
+            keyAlias = System.getenv("KEY_ALIAS") ?: "release"
+            keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+            enableV1Signing = true
+            enableV2Signing = true
         }
     }
 
@@ -42,8 +52,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = false
-            val releaseKeystore = file("release.jks")
-            signingConfig = if (releaseKeystore.exists()) {
+            signingConfig = if (keystoreCandidate.exists()) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")

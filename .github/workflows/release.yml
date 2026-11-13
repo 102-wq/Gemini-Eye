@@ -30,11 +30,23 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Generate Persistent Signing Keystore
+      - name: Prepare Persistent Signing Keystore
         working-directory: android-module/app
+        env:
+          RELEASE_KEYSTORE_SECRET: ${{ secrets.RELEASE_KEYSTORE_BASE64 || secrets.SIGNING_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS_SECRET: ${{ secrets.RELEASE_KEYSTORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_SECRET: ${{ secrets.RELEASE_KEY_ALIAS || secrets.KEY_ALIAS }}
+          KEY_PASS_SECRET: ${{ secrets.RELEASE_KEY_PASSWORD || secrets.KEY_PASSWORD }}
         run: |
-          if [ ! -f release.jks ]; then
-            echo "Generating new release.jks keystore..."
+          if [ -n "$RELEASE_KEYSTORE_SECRET" ]; then
+            echo "Applying persistent signing keystore from repository secrets..."
+            echo "$RELEASE_KEYSTORE_SECRET" | base64 -d > release.jks
+          elif [ -f release.p12 ]; then
+            echo "Using tracked repository persistent release.p12 keystore..."
+          elif [ -f release.jks ]; then
+            echo "Using tracked repository release.jks..."
+          else
+            echo "Generating persistent release.jks keystore..."
             keytool -genkeypair -v \
               -keystore release.jks \
               -storetype JKS \
@@ -44,12 +56,23 @@ jobs:
               -validity 10000 \
               -storepass android \
               -keypass android \
-              -dname "CN=GeminiEye, OU=Release, O=BardQuotaHook, L=Mountain View, ST=California, C=US"
+              -dname "CN=BardQuotaHook, OU=Release, O=Gemini-Eye, L=Mountain View, ST=California, C=US"
           fi
-          ls -la release.jks
+          echo "Active signing keystore verified:"
+          ls -la release.*
+          # Print the cryptographic signature certificate fingerprints for transparency
+          if [ -f release.jks ]; then
+            keytool -list -v -keystore release.jks -storepass "${KEYSTORE_PASS_SECRET:-android}" -alias "${KEY_ALIAS_SECRET:-release}" | grep -E "Owner:|SHA256:|SHA1:" || true
+          elif [ -f release.p12 ]; then
+            keytool -list -v -keystore release.p12 -storetype PKCS12 -storepass "${KEYSTORE_PASS_SECRET:-android}" -alias "${KEY_ALIAS_SECRET:-release}" | grep -E "Owner:|SHA256:|SHA1:" || true
+          fi
 
       - name: Build Signed Single-DEX Release APK
         working-directory: android-module
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD || secrets.KEYSTORE_PASSWORD || 'android' }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS || secrets.KEY_ALIAS || 'release' }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD || secrets.KEY_PASSWORD || 'android' }}
         run: |
           gradle :app:assembleRelease --no-daemon --info --stacktrace
           APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)

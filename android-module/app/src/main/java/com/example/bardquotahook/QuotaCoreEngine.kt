@@ -2,11 +2,13 @@ package com.example.bardquotahook
 
 import android.app.Activity
 import android.app.Application
+import android.app.Dialog
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.database.ContentObserver
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -14,9 +16,12 @@ import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.TextView
-import android.webkit.CookieManager
 import dalvik.system.BaseDexClassLoader
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -25,6 +30,7 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.lang.ref.WeakReference
 import java.lang.reflect.Constructor
 import java.lang.reflect.Executable
@@ -180,12 +186,38 @@ object QuotaCoreEngine {
     // immediately returns to false when all Gemini Activities stop or UI is hidden.
     private val isForegroundActive = AtomicBoolean(false)
     private val startedActivityCount = AtomicInteger(0)
+    private val activeStartedActivities = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<Activity, Boolean>())
+    )
+
+    private enum class IdentityStrength(val rank: Int) {
+        NONE(0),
+        BEARER_ONLY(1),
+        INTENT(2),
+        AUTH_USER(3),
+        COOKIE_SID(4)
+    }
+
+    private data class LearnedEndpoint(
+        val url: String,
+        val method: String = "GET",
+        val rpcHint: String? = null,
+        val updatedAtMs: Long = System.currentTimeMillis()
+    )
 
     // Dynamic Session & UI State
     private val activeSessionTag = AtomicReference(DEFAULT_SESSION_TAG)
     private val latestSnapshot = AtomicReference(QuotaHudView.Snapshot())
     private val currentLang = AtomicReference(QuotaHudView.Lang.ZH)
     private val currentTheme = AtomicReference(QuotaHudView.ThemeMode.MIUIX)
+
+    // Strong account-switch tracking (never churns across different OAuth scopes on the same account)
+    @Volatile private var confirmedIdentityKey: String? = null
+    @Volatile private var confirmedIdentityStrength: IdentityStrength = IdentityStrength.NONE
+    @Volatile private var persistedSessionWasStrong: Boolean = false
+    @Volatile private var cachedXsrfToken: String? = null
+    @Volatile private var cachedFsidToken: String? = null
+    @Volatile private var cachedBuildLabel: String? = null
 
     // Bounded LRU map of per-account quota snapshots so switching Google accounts A <-> B is instant
     private val sessionSnapshotsLock = Any()
@@ -195,9 +227,18 @@ object QuotaCoreEngine {
         }
     }
 
+    // Bounded in-memory learned quota endpoints discovered during foreground inspection
+    private val learnedEndpointsLock = Any()
+    private val learnedQuotaEndpoints = object : LinkedHashMap<String, LearnedEndpoint>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, LearnedEndpoint>?): Boolean {
+            return size > 6
+        }
+    }
+
     // Ephemeral foreground-only outgoing request session header contexts (cleared on background sleep)
     private data class EphemeralSessionHeaders(
         var url: String? = null,
+        var method: String? = null,
         var authorization: String? = null,
         var cookie: String? = null,
         var authUser: String? = null,
@@ -209,8 +250,10 @@ object QuotaCoreEngine {
 
     private data class BoundRequestContext(
         val urlOrMethod: String?,
+        val httpMethod: String?,
         val sessionTag: String,
         val isQueryCandidate: Boolean,
+        val isQuotaEndpointCandidate: Boolean,
         val createdAtMs: Long = System.currentTimeMillis()
     )
 
@@ -547,6 +590,24 @@ object QuotaCoreEngine {
             }
         )
 
+        // Ensure Activity.onStart also records active started activities even if Application callbacks were registered late
+        hookMethodSafe(
+            bridge = bridge,
+            clazz = Activity::class.java,
+            name = "onStart",
+            paramTypes = emptyArray(),
+            after = cb@{ thisObj, _, _ ->
+                val activity = thisObj as? Activity ?: return@cb
+                val app = activity.application
+                if (app != null) registerZeroBackgroundCallbacksOnce(app)
+                if (shouldDisplayHudInActivity(activity)) {
+                    activeStartedActivities.add(activity)
+                    startedActivityCount.set(activeStartedActivities.size)
+                    enterForeground(activity, attachHudNow = true)
+                }
+            }
+        )
+
         // Fallback direct Activity hooks in case Application.onCreate already ran prior to module load
         hookMethodSafe(
             bridge = bridge,
@@ -558,10 +619,50 @@ object QuotaCoreEngine {
                 val app = activity.application
                 if (app != null) registerZeroBackgroundCallbacksOnce(app)
                 if (shouldDisplayHudInActivity(activity)) {
+                    activeStartedActivities.add(activity)
+                    startedActivityCount.set(activeStartedActivities.size)
                     enterForeground(activity, attachHudNow = true)
                 }
             }
         )
+
+        // Re-assert HUD Z-order & scan screen banners whenever an in-app bottom sheet/dialog opens
+        hookMethodSafe(
+            bridge = bridge,
+            clazz = Dialog::class.java,
+            name = "show",
+            paramTypes = emptyArray(),
+            after = cb@{ thisObj, _, _ ->
+                if (!isForegroundActive.get()) return@cb
+                val dlg = thisObj as? Dialog ?: return@cb
+                val sess = activeSessionTag.get()
+                postToMain(delayMs = 350L, requireForeground = true) {
+                    val decor = dlg.window?.decorView
+                    if (decor != null) {
+                        val sb = StringBuilder()
+                        collectViewTexts(decor, sb, 0)
+                        if (sb.isNotEmpty()) {
+                            val text = sb.toString()
+                            if (QuotaTextParser.fastHasQuotaKeyword(text)) {
+                                submitForegroundWork {
+                                    val snap = QuotaTextParser.parseScreenQuotaTexts(
+                                        text = text,
+                                        prev = getBaseSnapshotForSession(sess),
+                                        source = "InApp-Dialog"
+                                    )
+                                    if (snap != null) publishSnapshotForSession(snap, sess)
+                                }
+                            }
+                        }
+                    }
+                    scanForExhaustedBannerOnly(sess)
+                    refreshHudOnUiThread()
+                }
+            }
+        )
+
+        // Hook in-app WebView if Gemini opens its quota/subscription details inside a WebView
+        installWebViewQuotaHooks(bridge)
 
         if (classLoader != null) {
             bindHooksForClassLoader(classLoader, bridge)
@@ -583,16 +684,16 @@ object QuotaCoreEngine {
 
                 override fun onActivityStarted(activity: Activity) {
                     if (shouldDisplayHudInActivity(activity)) {
-                        startedActivityCount.incrementAndGet()
+                        activeStartedActivities.add(activity)
+                        startedActivityCount.set(activeStartedActivities.size)
                         enterForeground(activity, attachHudNow = true)
                     }
                 }
 
                 override fun onActivityResumed(activity: Activity) {
                     if (shouldDisplayHudInActivity(activity)) {
-                        if (startedActivityCount.get() <= 0) {
-                            startedActivityCount.set(1)
-                        }
+                        activeStartedActivities.add(activity)
+                        startedActivityCount.set(activeStartedActivities.size)
                         enterForeground(activity, attachHudNow = true)
                     }
                 }
@@ -601,7 +702,10 @@ object QuotaCoreEngine {
 
                 override fun onActivityStopped(activity: Activity) {
                     if (shouldDisplayHudInActivity(activity)) {
-                        val remaining = startedActivityCount.decrementAndGet()
+                        if (activity.isChangingConfigurations) return
+                        activeStartedActivities.remove(activity)
+                        val remaining = activeStartedActivities.size
+                        startedActivityCount.set(remaining)
                         if (remaining <= 0) {
                             startedActivityCount.set(0)
                             enterBackgroundSleep(stoppedActivity = activity)
@@ -612,6 +716,8 @@ object QuotaCoreEngine {
                 override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
 
                 override fun onActivityDestroyed(activity: Activity) {
+                    activeStartedActivities.remove(activity)
+                    startedActivityCount.set(activeStartedActivities.size)
                     val cur = activeActivityRef.get().get()
                     if (cur === activity) {
                         detachHudFromActivity(activity)
@@ -626,7 +732,7 @@ object QuotaCoreEngine {
                     clearTransientBuffers()
                 }
                 override fun onTrimMemory(level: Int) {
-                    if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+                    if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && activeStartedActivities.isEmpty()) {
                         startedActivityCount.set(0)
                         enterBackgroundSleep(stoppedActivity = activeActivityRef.get().get())
                     }
@@ -691,6 +797,16 @@ object QuotaCoreEngine {
             )
             syncForegroundStateWithProviderAsync(ctx)
             triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 350L)
+            // Secondary cold-launch check: once cookies / ViewModels settle (~1.8s), verify if still empty
+            postToMain(delayMs = 1_850L, requireForeground = true) {
+                val cur = latestSnapshot.get().sanitized()
+                if (!cur.hasLiveData || cur.source == "SessionEstimate") {
+                    lastHttpFetchMs.set(0L)
+                    triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 0L)
+                } else {
+                    refreshHudOnUiThread()
+                }
+            }
         }
     }
 
@@ -727,6 +843,7 @@ object QuotaCoreEngine {
     }
 
     fun forceSleepForHotReload() {
+        activeStartedActivities.clear()
         startedActivityCount.set(0)
         enterBackgroundSleep(activeActivityRef.get().get())
     }
@@ -738,6 +855,9 @@ object QuotaCoreEngine {
             synchronized(builderHeaderMap) {
                 builderHeaderMap.clear()
             }
+            cachedXsrfToken = null
+            cachedFsidToken = null
+            cachedBuildLabel = null
             // Wipe raw in-memory header values while keeping only the non-reversible session tag
             val cur = activeDynamicSession.get()
             activeDynamicSession.set(
@@ -774,7 +894,12 @@ object QuotaCoreEngine {
     // Dynamic Session & Cookie / Authorization Interception (Account-Switch Safe)
     // =========================================================================
 
-    private fun recordOutgoingBuilderHeader(builderObj: Any, rawName: String, rawValue: String) {
+    private fun recordOutgoingBuilderHeader(
+        builderObj: Any,
+        rawName: String,
+        rawValue: String,
+        transport: String = "Cronet"
+    ) {
         if (!isForegroundActive.get()) return
         val lower = rawName.trim().lowercase()
         val isRelevant = lower == "authorization" ||
@@ -785,6 +910,7 @@ object QuotaCoreEngine {
 
         val snapshotHeaders = synchronized(builderHeaderMap) {
             val entry = builderHeaderMap.getOrPut(builderObj) { EphemeralSessionHeaders() }
+            if (isNonQuotaTelemetryUrl(entry.url)) return
             when (lower) {
                 "authorization" -> entry.authorization = rawValue.trim()
                 "cookie" -> entry.cookie = rawValue.trim()
@@ -794,73 +920,148 @@ object QuotaCoreEngine {
             entry.copy()
         }
 
-        onDynamicHeadersIntercepted(snapshotHeaders, transport = "Cronet")
+        if (isNonQuotaTelemetryUrl(snapshotHeaders.url)) return
+        onDynamicHeadersIntercepted(snapshotHeaders, transport = transport)
+    }
+
+    private data class ComputedIdentity(
+        val sessionTag: String,
+        val strength: IdentityStrength,
+        val canonicalKey: String
+    )
+
+    private fun computeIdentityDescriptor(
+        authorization: String?,
+        cookie: String?,
+        authUser: String?,
+        pageId: String?
+    ): ComputedIdentity? {
+        val stableCookieToken = extractStableGoogleSessionCookie(cookie)
+        val cleanAuthUser = authUser?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanPageId = pageId?.trim()?.takeIf { it.isNotEmpty() && it != "0" }
+        val cleanBearer = authorization?.trim()?.takeIf { it.isNotEmpty() }
+
+        return when {
+            stableCookieToken != null -> {
+                val key = buildString {
+                    append("cookie:").append(stableCookieToken)
+                    if (cleanPageId != null) append("|p:").append(cleanPageId)
+                }
+                ComputedIdentity(sha256SessionTag(key), IdentityStrength.COOKIE_SID, key)
+            }
+            cleanAuthUser != null -> {
+                val key = "authuser:$cleanAuthUser|p:${cleanPageId ?: "0"}"
+                ComputedIdentity(sha256SessionTag(key), IdentityStrength.AUTH_USER, key)
+            }
+            cleanBearer != null -> {
+                // OAuth2 Bearer tokens vary per API scope on the SAME Google account and rotate hourly;
+                // never treat different Bearer strings on the same account as an account switch!
+                val key = "bearer:active"
+                ComputedIdentity(sha256SessionTag(key), IdentityStrength.BEARER_ONLY, key)
+            }
+            else -> null
+        }
     }
 
     private fun onDynamicHeadersIntercepted(
         headers: EphemeralSessionHeaders,
         transport: String
     ): String {
-        val computedTag = computeDynamicSessionTag(
+        if (isNonQuotaTelemetryUrl(headers.url)) return activeSessionTag.get()
+
+        val computed = computeIdentityDescriptor(
             authorization = headers.authorization,
             cookie = headers.cookie,
             authUser = headers.authUser,
             pageId = headers.pageId
         ) ?: return activeSessionTag.get()
 
+        val prevDyn = activeDynamicSession.get()
         val now = System.currentTimeMillis()
+        val hadNoCredentialsBefore = prevDyn.cookieHeader.isNullOrBlank() && prevDyn.authorizationHeader.isNullOrBlank()
+        val gainedNewCookie = prevDyn.cookieHeader.isNullOrBlank() && !headers.cookie.isNullOrBlank()
+
+        val prevStrongKey = confirmedIdentityKey
+        val prevStrongStrength = confirmedIdentityStrength
+
+        // Determine if this genuinely represents a different Google account
+        val isGenuineAccountSwitch = when {
+            computed.strength == IdentityStrength.COOKIE_SID &&
+                prevStrongStrength == IdentityStrength.COOKIE_SID &&
+                prevStrongKey != null &&
+                prevStrongKey != computed.canonicalKey -> true
+            computed.strength == IdentityStrength.AUTH_USER &&
+                prevStrongStrength == IdentityStrength.AUTH_USER &&
+                prevStrongKey != null &&
+                prevStrongKey != computed.canonicalKey -> true
+            else -> false
+        }
+
+        // Preserve existing complementary credentials (e.g. Cookie from Web/Cronet + Bearer from gRPC) on SAME account
+        val mergedAuth = headers.authorization ?: if (isGenuineAccountSwitch) null else prevDyn.authorizationHeader
+        val mergedCookie = mergeCookieStrings(
+            if (isGenuineAccountSwitch) null else prevDyn.cookieHeader,
+            headers.cookie
+        )
+        val mergedAuthUser = headers.authUser ?: if (isGenuineAccountSwitch) null else prevDyn.authUserHeader
+
+        // Decide which sessionTag stays active without churning on weak Bearer/AuthUser emissions
+        val targetTag: String = when {
+            isGenuineAccountSwitch -> {
+                confirmedIdentityKey = computed.canonicalKey
+                confirmedIdentityStrength = computed.strength
+                computed.sessionTag
+            }
+            computed.strength == IdentityStrength.COOKIE_SID -> {
+                confirmedIdentityKey = computed.canonicalKey
+                confirmedIdentityStrength = IdentityStrength.COOKIE_SID
+                computed.sessionTag
+            }
+            prevStrongStrength >= IdentityStrength.INTENT -> {
+                // Keep confirmed Cookie / Intent account tag even when per-scope Bearer or AuthUser arrives
+                activeSessionTag.get()
+            }
+            persistedSessionWasStrong && activeSessionTag.get() != DEFAULT_SESSION_TAG -> {
+                // Keep yesterday's confirmed session tag until a COOKIE_SID confirms whether it matches or switched
+                activeSessionTag.get()
+            }
+            computed.strength >= prevStrongStrength -> {
+                if (computed.strength >= IdentityStrength.AUTH_USER) {
+                    confirmedIdentityKey = computed.canonicalKey
+                    confirmedIdentityStrength = computed.strength
+                }
+                computed.sessionTag
+            }
+            else -> activeSessionTag.get()
+        }
+
         activeDynamicSession.set(
             ActiveDynamicSessionState(
-                sessionTag = computedTag,
-                authorizationHeader = headers.authorization,
-                cookieHeader = headers.cookie,
-                authUserHeader = headers.authUser,
+                sessionTag = targetTag,
+                authorizationHeader = mergedAuth,
+                cookieHeader = mergedCookie,
+                authUserHeader = mergedAuthUser,
                 transport = transport,
                 updatedAtMs = now
             )
         )
 
-        activateSessionTag(computedTag, sourceReason = "$transport-Header")
-        return computedTag
-    }
-
-    /**
-     * Computes a deterministic, non-reversible 12-hex SHA-256 session tag (`sess_<12hex>`)
-     * from Gemini's active outgoing `Cookie`, `Authorization`, and `X-Goog-AuthUser` headers:
-     * - Anchors on stable Google account session cookies (`__Secure-1PSID`, `SAPISID`, `SID`, etc.)
-     *   when present so short-lived rotating cookies (`__Secure-1PSIDTS`) or hourly OAuth token
-     *   refreshes on the *same* account never trigger false resets.
-     * - Immediately produces a distinct tag whenever the user switches Google accounts!
-     */
-    private fun computeDynamicSessionTag(
-        authorization: String?,
-        cookie: String?,
-        authUser: String?,
-        pageId: String?
-    ): String? {
-        val stableCookieToken = extractStableGoogleSessionCookie(cookie)
-        val cleanAuthUser = authUser?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanPageId = pageId?.trim()?.takeIf { it.isNotEmpty() }
-        val pageSlot = cleanPageId ?: "0"
-        val cleanBearer = authorization?.trim()?.takeIf { it.isNotEmpty() }
-
-        val canonicalMaterial = when {
-            stableCookieToken != null -> buildString {
-                append("cookie:").append(stableCookieToken)
-                if (cleanAuthUser != null) append("|u:").append(cleanAuthUser)
-                if (cleanPageId != null) append("|p:").append(cleanPageId)
+        val tagChanged = targetTag != activeSessionTag.get()
+        if (tagChanged) {
+            activateSessionTag(
+                newTag = targetTag,
+                sourceReason = "$transport-Header",
+                preserveUnconfirmedSnapshot = !isGenuineAccountSwitch &&
+                    (!persistedSessionWasStrong || prevStrongStrength < IdentityStrength.COOKIE_SID)
+            )
+        } else if ((hadNoCredentialsBefore || gainedNewCookie) && isForegroundActive.get()) {
+            val curSnap = latestSnapshot.get().sanitized()
+            if (!curSnap.hasLiveData || curSnap.source == "SessionEstimate") {
+                lastHttpFetchMs.set(0L)
+                triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 150L)
             }
-            cleanAuthUser != null && cleanBearer != null -> {
-                // Anchor on explicit Google account slot + pageId when X-Goog-AuthUser is present,
-                // otherwise hash the active OAuth2 Bearer token directly.
-                "authuser:$cleanAuthUser|p:$pageSlot"
-            }
-            cleanBearer != null -> "bearer:$cleanBearer"
-            cleanAuthUser != null -> "authuser:$cleanAuthUser|p:$pageSlot"
-            else -> return null
         }
-
-        return sha256SessionTag(canonicalMaterial)
+        return targetTag
     }
 
     private fun extractStableGoogleSessionCookie(rawCookieHeader: String?): String? {
@@ -917,19 +1118,31 @@ object QuotaCoreEngine {
                 @Suppress("DEPRECATION")
                 val raw = extras.get(key)?.toString()?.trim()
                 if (!raw.isNullOrEmpty() && raw != "-1") {
-                    // Only switch via Activity intent if we haven't locked onto a live HTTP/gRPC header yet,
-                    // or if the Activity itself was recreated with an explicit different account extra.
-                    val intentTag = sha256SessionTag("intent_acct:$key:$raw")
-                    val curDyn = activeDynamicSession.get()
-                    if (curDyn.transport == "init" || curDyn.transport == "ActivityIntent") {
+                    val intentCanon = "intent_acct:$key:$raw"
+                    val intentTag = sha256SessionTag(intentCanon)
+                    val prevKey = confirmedIdentityKey
+                    val isDifferentConfirmedIntent = confirmedIdentityStrength == IdentityStrength.INTENT &&
+                        prevKey != null &&
+                        prevKey != intentCanon
+
+                    if (confirmedIdentityStrength < IdentityStrength.COOKIE_SID &&
+                        (confirmedIdentityStrength < IdentityStrength.INTENT || isDifferentConfirmedIntent)
+                    ) {
+                        confirmedIdentityKey = intentCanon
+                        confirmedIdentityStrength = IdentityStrength.INTENT
+                        val curDyn = activeDynamicSession.get()
                         activeDynamicSession.set(
-                            ActiveDynamicSessionState(
+                            curDyn.copy(
                                 sessionTag = intentTag,
                                 transport = "ActivityIntent",
                                 updatedAtMs = System.currentTimeMillis()
                             )
                         )
-                        activateSessionTag(intentTag, sourceReason = "ActivityAccount")
+                        activateSessionTag(
+                            newTag = intentTag,
+                            sourceReason = "ActivityAccount",
+                            preserveUnconfirmedSnapshot = !isDifferentConfirmedIntent
+                        )
                     }
                     break
                 }
@@ -941,16 +1154,21 @@ object QuotaCoreEngine {
     /**
      * Switches the active session cleanly whenever a new Google account session is detected:
      * 1. Archives outgoing account's `Snapshot` under `prevTag`.
-     * 2. Restores incoming account's `Snapshot` (if cached in memory) OR resets cleanly to `--`
-     *    so the previous Google account's quota never bleeds into the newly selected account.
-     * 3. Updates `QuotaHudView` & `QuotaSyncProvider` (`replaceSession = true`) and triggers a
-     *    lightweight foreground refresh.
+     * 2. Restores incoming account's `Snapshot` (if cached in memory) OR preserves live startup
+     *    data when promoting from an unconfirmed startup slot, OR resets cleanly to `--` ONLY
+     *    when switching between two confirmed distinct Google accounts.
+     * 3. Updates `QuotaHudView` & `QuotaSyncProvider` and triggers a foreground refresh.
      */
-    private fun activateSessionTag(newTag: String, sourceReason: String) {
+    private fun activateSessionTag(
+        newTag: String,
+        sourceReason: String,
+        preserveUnconfirmedSnapshot: Boolean = false
+    ) {
         if (newTag.isBlank() || newTag == DEFAULT_SESSION_TAG) return
         val prevTag = activeSessionTag.get()
         if (prevTag == newTag) return
 
+        var isGenuineAccountSwap = false
         synchronized(sessionSnapshotsLock) {
             val curPrev = activeSessionTag.get()
             if (curPrev == newTag) return
@@ -961,22 +1179,43 @@ object QuotaCoreEngine {
             }
 
             activeSessionTag.set(newTag)
+            if (confirmedIdentityStrength >= IdentityStrength.COOKIE_SID) {
+                persistedSessionWasStrong = true
+            }
 
-            // If transitioning from uninitialized default slot to the very first observed account
-            // on app startup, adopt any valid startup snapshot; otherwise switch cleanly to the
-            // target account's isolated slot (or fresh `--` if unseen).
-            val nextSnap = if (curPrev == DEFAULT_SESSION_TAG && prevSnap.hasLiveData) {
-                perSessionSnapshots[newTag] = prevSnap
-                prevSnap
-            } else {
-                perSessionSnapshots[newTag] ?: QuotaHudView.Snapshot(source = "AccountSwitch")
+            val cachedForNew = perSessionSnapshots[newTag]
+            val nextSnap = when {
+                cachedForNew != null -> cachedForNew
+                (curPrev == DEFAULT_SESSION_TAG || preserveUnconfirmedSnapshot) && prevSnap.hasLiveData -> {
+                    perSessionSnapshots[newTag] = prevSnap
+                    prevSnap
+                }
+                else -> {
+                    isGenuineAccountSwap = true
+                    QuotaHudView.Snapshot(source = "AccountSwitch")
+                }
+            }
+
+            if (isGenuineAccountSwap) {
+                cachedXsrfToken = null
+                cachedFsidToken = null
+                cachedBuildLabel = null
+                synchronized(learnedEndpointsLock) {
+                    learnedQuotaEndpoints.clear()
+                }
             }
 
             latestSnapshot.set(nextSnap)
-            saveSanitizedHostMirror(nextSnap, currentLang.get(), currentTheme.get(), newTag)
+            saveSanitizedHostMirror(
+                nextSnap,
+                currentLang.get(),
+                currentTheme.get(),
+                newTag,
+                isStrongCookieTag = confirmedIdentityStrength >= IdentityStrength.COOKIE_SID
+            )
         }
 
-        safeLog(activeBridgeRef.get(), "Dynamic account session active -> $newTag ($sourceReason)")
+        safeLog(activeBridgeRef.get(), "Dynamic account session active -> $newTag ($sourceReason, swap=$isGenuineAccountSwap)")
 
         if (isForegroundActive.get()) {
             refreshHudOnUiThread()
@@ -988,12 +1227,15 @@ object QuotaCoreEngine {
                         context = ctx,
                         snapshot = snapNow,
                         sessionId = newTag,
-                        replaceSession = true
+                        replaceSession = isGenuineAccountSwap
                     )
                     applyUnifiedState(state)
                 }
             }
-            triggerLightweightQuotaRefresh(RefreshReason.ACCOUNT_SWITCH, delayMs = 300L)
+            if (isGenuineAccountSwap || !latestSnapshot.get().hasLiveData) {
+                lastHttpFetchMs.set(0L)
+                triggerLightweightQuotaRefresh(RefreshReason.ACCOUNT_SWITCH, delayMs = 250L)
+            }
         }
     }
 
@@ -1167,7 +1409,19 @@ object QuotaCoreEngine {
                 if (!isForegroundActive.get() || thisObj == null || args.size < 2) return@cb
                 val k = args[0] as? String ?: return@cb
                 val v = args[1] as? String ?: return@cb
-                recordOutgoingBuilderHeader(thisObj, k, v)
+                recordOutgoingBuilderHeader(thisObj, k, v, transport = "Cronet")
+            }
+        )
+
+        bridge.hookAllMethodsByName(
+            clazz = builderCls,
+            methodName = "setHttpMethod",
+            before = cb@{ thisObj, args ->
+                if (!isForegroundActive.get() || thisObj == null || args.isEmpty()) return@cb
+                val m = args[0] as? String ?: return@cb
+                synchronized(builderHeaderMap) {
+                    builderHeaderMap.getOrPut(thisObj) { EphemeralSessionHeaders() }.method = m.trim().uppercase()
+                }
             }
         )
 
@@ -1182,20 +1436,27 @@ object QuotaCoreEngine {
                 val captured = synchronized(builderHeaderMap) {
                     builderHeaderMap.remove(thisObj)
                 }
+                val url = captured?.url
+                if (url != null && isNonQuotaTelemetryUrl(url)) return@cb
+
                 val sessTag = if (captured != null && captured.hasCredentials) {
                     onDynamicHeadersIntercepted(captured, transport = "Cronet")
                 } else {
                     activeSessionTag.get()
                 }
-                val url = captured?.url
-                if (url == null || !isStaticAssetUrl(url)) {
-                    pruneRequestMapsIfNeeded()
-                    requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
-                        urlOrMethod = url,
-                        sessionTag = sessTag,
-                        isQueryCandidate = isGeminiQueryEndpoint(url)
-                    )
+                val httpMethod = captured?.method ?: "GET"
+                val isQuotaCand = isReplayableQuotaEndpoint(url, httpMethod)
+                if (url != null && isQuotaCand) {
+                    recordLearnedQuotaEndpoint(url, httpMethod, rpcHint = "Cronet-Learned")
                 }
+                pruneRequestMapsIfNeeded()
+                requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
+                    urlOrMethod = url,
+                    httpMethod = httpMethod,
+                    sessionTag = sessTag,
+                    isQueryCandidate = isGeminiQueryEndpoint(url),
+                    isQuotaEndpointCandidate = isQuotaCand
+                )
             }
         )
     }
@@ -1214,15 +1475,21 @@ object QuotaCoreEngine {
                         hookConcreteCronetCallbackClass(arg.javaClass, bridge)
                     }
                 }
-                if (isForegroundActive.get() && thisObj != null && urlStr != null && !isStaticAssetUrl(urlStr)) {
+                if (isForegroundActive.get() && thisObj != null && urlStr != null && !isNonQuotaTelemetryUrl(urlStr)) {
                     val reqId = System.identityHashCode(thisObj)
+                    val isQuotaCand = isReplayableQuotaEndpoint(urlStr, "GET")
+                    if (isQuotaCand) {
+                        recordLearnedQuotaEndpoint(urlStr, "GET", rpcHint = "Cronet-Learned")
+                    }
                     pruneRequestMapsIfNeeded()
                     requestContextMap.putIfAbsent(
                         reqId,
                         BoundRequestContext(
                             urlOrMethod = urlStr,
+                            httpMethod = null,
                             sessionTag = activeSessionTag.get(),
-                            isQueryCandidate = isGeminiQueryEndpoint(urlStr)
+                            isQueryCandidate = isGeminiQueryEndpoint(urlStr),
+                            isQuotaEndpointCandidate = isQuotaCand
                         )
                     )
                 }
@@ -1347,13 +1614,61 @@ object QuotaCoreEngine {
         if (urlOrMethod.isNullOrBlank()) return false
         val u = urlOrMethod.lowercase()
         return u.contains("streamgenerate") ||
-            u.contains("bardchatui") ||
             u.contains("assistant.lamda") ||
             u.contains("aratea") ||
-            u.contains("robin") ||
-            u.contains("batchexecute") ||
-            u.contains("generativelanguage") ||
-            u.contains("quota")
+            u.contains("generativelanguage")
+    }
+
+    private fun isReplayableQuotaEndpoint(url: String?, method: String?): Boolean {
+        if (url.isNullOrBlank() || isNonQuotaTelemetryUrl(url)) return false
+        val u = url.lowercase()
+        if (!u.contains("google.com")) return false
+        if (u.contains("streamgenerate") || u.contains("generatecontent") ||
+            u.contains("create") || u.contains("delete") || u.contains("feedback")
+        ) {
+            return false
+        }
+        val isGet = method.isNullOrBlank() || method.equals("GET", ignoreCase = true)
+        if (u.contains("quota") || u.contains("usage") || u.contains("allowance") ||
+            u.contains("eligibility") || u.contains("ratelimit") || u.contains("rate_limit")
+        ) {
+            return isGet || u.contains("batchexecute")
+        }
+        if (u.contains("batchexecute") && (u.contains("hooq4d") || u.contains("o4g7id") || u.contains("maziqc"))) {
+            return true
+        }
+        return false
+    }
+
+    private fun isNonQuotaTelemetryUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val u = url.lowercase()
+        if (isStaticAssetUrl(u)) return true
+        return u.contains("play.googleapis.com/log") ||
+            u.contains("clearcut") ||
+            u.contains("phenotype") ||
+            u.contains("crashlytics") ||
+            u.contains("firebaselogging") ||
+            u.contains("app-measurement") ||
+            u.contains("doubleclick") ||
+            u.contains("googlesyndication") ||
+            u.contains("clientservices.googleapis.com") ||
+            u.contains("update.googleapis.com") ||
+            u.contains("safebrowsing") ||
+            u.contains("gvt1.com") ||
+            u.contains("gvt2.com")
+    }
+
+    private fun recordLearnedQuotaEndpoint(url: String, method: String, rpcHint: String? = null) {
+        if (!isReplayableQuotaEndpoint(url, method)) return
+        synchronized(learnedEndpointsLock) {
+            learnedQuotaEndpoints[url] = LearnedEndpoint(
+                url = url,
+                method = method.uppercase(),
+                rpcHint = rpcHint,
+                updatedAtMs = System.currentTimeMillis()
+            )
+        }
     }
 
     private fun isStaticAssetUrl(url: String): Boolean {
@@ -1407,14 +1722,19 @@ object QuotaCoreEngine {
             }
             val combined = holder.appendAndSnapshot(chunk, chunk.size) ?: return@submitForegroundWork
             val baseSnap = getBaseSnapshotForSession(holder.sessionTag)
+            val resolvedUrl = urlHint ?: holder.urlHint
             val snap = QuotaTextParser.scanProtoBufBytes(
                 rawBytes = combined,
                 length = combined.size,
                 prev = baseSnap,
                 source = "Cronet-PB",
-                rpcMethodHint = urlHint ?: holder.urlHint
+                rpcMethodHint = resolvedUrl
             )
             if (snap != null) {
+                val boundCtx = requestContextMap[reqId]
+                if (resolvedUrl != null && isReplayableQuotaEndpoint(resolvedUrl, boundCtx?.httpMethod)) {
+                    recordLearnedQuotaEndpoint(resolvedUrl, boundCtx?.httpMethod ?: "GET", rpcHint = "Cronet-PB")
+                }
                 publishSnapshotForSession(snap, holder.sessionTag)
             }
         }
@@ -1565,8 +1885,10 @@ object QuotaCoreEngine {
                         pruneRequestMapsIfNeeded()
                         requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
                             urlOrMethod = fullMethod,
+                            httpMethod = "gRPC",
                             sessionTag = activeSessionTag.get(),
-                            isQueryCandidate = isGeminiQueryEndpoint(fullMethod)
+                            isQueryCandidate = isGeminiQueryEndpoint(fullMethod),
+                            isQuotaEndpointCandidate = false
                         )
                     }
                     hookConcreteGrpcClientCallClass(result.javaClass, bridge)
@@ -1587,8 +1909,10 @@ object QuotaCoreEngine {
                         pruneRequestMapsIfNeeded()
                         requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
                             urlOrMethod = fullMethod,
+                            httpMethod = "gRPC",
                             sessionTag = activeSessionTag.get(),
-                            isQueryCandidate = isGeminiQueryEndpoint(fullMethod)
+                            isQueryCandidate = isGeminiQueryEndpoint(fullMethod),
+                            isQuotaEndpointCandidate = false
                         )
                     }
                     hookConcreteGrpcClientCallClass(result.javaClass, bridge)
@@ -1616,8 +1940,10 @@ object QuotaCoreEngine {
                     val rpcName = existingCtx?.urlOrMethod
                     val updatedCtx = BoundRequestContext(
                         urlOrMethod = rpcName,
+                        httpMethod = "gRPC",
                         sessionTag = dynamicSess,
-                        isQueryCandidate = isGeminiQueryEndpoint(rpcName)
+                        isQueryCandidate = isGeminiQueryEndpoint(rpcName),
+                        isQuotaEndpointCandidate = false
                     )
                     if (callId != 0) {
                         requestContextMap[callId] = updatedCtx
@@ -1761,6 +2087,22 @@ object QuotaCoreEngine {
     private fun installOkHttpSessionAndBodyHooks(cl: ClassLoader, bridge: HookBridge) {
         val reqBuilderCls = findClassSafe("okhttp3.Request\$Builder", cl)
         if (reqBuilderCls != null && markDynamicHookOnce("okhttp_req_builder", reqBuilderCls)) {
+            bridge.hookAllMethodsByName(
+                clazz = reqBuilderCls,
+                methodName = "url",
+                before = cb@{ thisObj, args ->
+                    if (!isForegroundActive.get() || thisObj == null || args.isEmpty()) return@cb
+                    val uStr = args[0]?.toString() ?: return@cb
+                    if (uStr.startsWith("http")) {
+                        synchronized(builderHeaderMap) {
+                            builderHeaderMap.getOrPut(thisObj) { EphemeralSessionHeaders() }.url = uStr
+                        }
+                        if (isReplayableQuotaEndpoint(uStr, "GET")) {
+                            recordLearnedQuotaEndpoint(uStr, "GET", rpcHint = "OkHttp-Learned")
+                        }
+                    }
+                }
+            )
             val headerMethods = arrayOf("header", "addHeader")
             for (mName in headerMethods) {
                 bridge.hookAllMethodsByName(
@@ -1770,7 +2112,7 @@ object QuotaCoreEngine {
                         if (!isForegroundActive.get() || thisObj == null || args.size < 2) return@cb
                         val k = args[0] as? String ?: return@cb
                         val v = args[1] as? String ?: return@cb
-                        recordOutgoingBuilderHeader(thisObj, k, v)
+                        recordOutgoingBuilderHeader(thisObj, k, v, transport = "OkHttp")
                     }
                 )
             }
@@ -2570,12 +2912,151 @@ object QuotaCoreEngine {
         return null
     }
 
+    private fun installWebViewQuotaHooks(bridge: HookBridge) {
+        try {
+            hookMethodSafe(
+                bridge = bridge,
+                clazz = WebView::class.java,
+                name = "setWebViewClient",
+                paramTypes = arrayOf(WebViewClient::class.java),
+                before = cb@{ _, args ->
+                    val client = args.firstOrNull() as? WebViewClient ?: return@cb
+                    hookConcreteWebViewClientClass(client.javaClass, bridge)
+                }
+            )
+            hookMethodSafe(
+                bridge = bridge,
+                clazz = WebView::class.java,
+                name = "loadUrl",
+                paramTypes = arrayOf(String::class.java),
+                after = cb@{ thisObj, args, _ ->
+                    val wv = thisObj as? WebView ?: return@cb
+                    val url = args.firstOrNull() as? String ?: return@cb
+                    onWebViewPageEvent(wv, url, delayEvaluateMs = 1_200L)
+                }
+            )
+            hookMethodSafe(
+                bridge = bridge,
+                clazz = WebView::class.java,
+                name = "loadUrl",
+                paramTypes = arrayOf(String::class.java, Map::class.java),
+                after = cb@{ thisObj, args, _ ->
+                    val wv = thisObj as? WebView ?: return@cb
+                    val url = args.firstOrNull() as? String ?: return@cb
+                    onWebViewPageEvent(wv, url, delayEvaluateMs = 1_200L)
+                }
+            )
+            hookConcreteWebViewClientClass(WebViewClient::class.java, bridge)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun hookConcreteWebViewClientClass(clientCls: Class<*>, bridge: HookBridge) {
+        if (!markDynamicHookOnce("webview_client", clientCls)) return
+        bridge.hookAllMethodsByName(
+            clazz = clientCls,
+            methodName = "onPageFinished",
+            after = cb@{ _, args, _ ->
+                val wv = args.getOrNull(0) as? WebView ?: return@cb
+                val url = args.getOrNull(1) as? String ?: return@cb
+                onWebViewPageEvent(wv, url, delayEvaluateMs = 350L)
+            }
+        )
+    }
+
+    private fun onWebViewPageEvent(webView: WebView, rawUrl: String, delayEvaluateMs: Long) {
+        if (!isForegroundActive.get()) return
+        val lower = rawUrl.lowercase()
+        if (!lower.contains("google.com") || isNonQuotaTelemetryUrl(rawUrl)) return
+
+        try {
+            val wvCookie = CookieManager.getInstance().getCookie(rawUrl)
+            if (!wvCookie.isNullOrBlank()) {
+                onDynamicHeadersIntercepted(
+                    EphemeralSessionHeaders(url = rawUrl, cookie = wvCookie),
+                    transport = "WebView"
+                )
+            }
+        } catch (_: Throwable) {
+        }
+
+        if (isReplayableQuotaEndpoint(rawUrl, "GET")) {
+            recordLearnedQuotaEndpoint(rawUrl, "GET", rpcHint = "WebView-Learned")
+        }
+
+        val isQuotaSurface = lower.contains("gemini.google.com") ||
+            lower.contains("bard.google.com") ||
+            lower.contains("one.google.com") ||
+            lower.contains("myaccount.google.com") ||
+            lower.contains("quota") ||
+            lower.contains("usage")
+        if (!isQuotaSurface) return
+
+        val sess = activeSessionTag.get()
+        postToMain(delayMs = delayEvaluateMs, requireForeground = true) {
+            if (!isForegroundActive.get()) return@postToMain
+            val js = """
+                (function(){
+                  try{
+                    var t=(document.body&&document.body.innerText)?document.body.innerText:'';
+                    var s='';
+                    var sc=document.scripts||[];
+                    for(var i=0;i<sc.length&&s.length<160000;i++){
+                      var tx=sc[i].textContent||'';
+                      if(tx.indexOf('AF_initDataCallback')>=0||tx.indexOf('WIZ_global_data')>=0||tx.indexOf('SNlM0e')>=0){
+                        s+=tx+'\n';
+                      }
+                    }
+                    return JSON.stringify({t:t.slice(0,16000),s:s});
+                  }catch(e){return '';}
+                })();
+            """.trimIndent()
+            try {
+                webView.evaluateJavascript(js) { rawResult ->
+                    if (!isForegroundActive.get() || rawResult.isNullOrBlank() || rawResult == "null") return@evaluateJavascript
+                    submitForegroundWork {
+                        try {
+                            val decoded = JSONTokener(rawResult).nextValue() as? String ?: return@submitForegroundWork
+                            if (decoded.isBlank() || decoded[0] != '{') return@submitForegroundWork
+                            val obj = JSONObject(decoded)
+                            val domText = obj.optString("t", "")
+                            val scriptText = obj.optString("s", "")
+                            if (scriptText.isNotBlank()) {
+                                extractWizTokensFromHtml(scriptText)
+                                val parsedScript = QuotaTextParser.parseHtmlOrJsonPayload(
+                                    payload = scriptText,
+                                    prev = getBaseSnapshotForSession(sess),
+                                    source = "WebView-Script"
+                                )
+                                if (parsedScript != null && parsedScript.hasLiveData) {
+                                    publishSnapshotForSession(parsedScript, sess)
+                                }
+                            }
+                            if (domText.isNotBlank() && QuotaTextParser.fastHasQuotaKeyword(domText)) {
+                                val parsedDom = QuotaTextParser.parseScreenQuotaTexts(
+                                    text = domText,
+                                    prev = getBaseSnapshotForSession(sess),
+                                    source = "WebView-DOM"
+                                )
+                                if (parsedDom != null && parsedDom.hasLiveData) {
+                                    publishSnapshotForSession(parsedDom, sess)
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     private fun scanForExhaustedBannerOnly(sessionTag: String) {
         if (!isForegroundActive.get()) return
         val activity = activeActivityRef.get().get() ?: return
         if (activity.isFinishing || activity.isDestroyed) return
         val decor = activity.window?.decorView ?: return
-        val sb = StringBuilder()
+        val sb = StringBuilder(2048)
         collectViewTexts(decor, sb, 0)
         if (sb.isNotEmpty()) {
             val text = sb.toString()
@@ -2592,27 +3073,118 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun mergeCookieStrings(existing: String?, incoming: String?): String? {
+        if (existing.isNullOrBlank()) return incoming?.trim()?.takeIf { it.isNotEmpty() }
+        if (incoming.isNullOrBlank()) return existing.trim().takeIf { it.isNotEmpty() }
+        val merged = LinkedHashMap<String, String>(24)
+        for (src in arrayOf(existing, incoming)) {
+            for (seg in src.split(';')) {
+                val eq = seg.indexOf('=')
+                if (eq <= 0) continue
+                val k = seg.substring(0, eq).trim()
+                val v = seg.substring(eq + 1).trim()
+                if (k.isNotEmpty() && v.isNotEmpty()) {
+                    merged[k] = v
+                }
+            }
+        }
+        if (merged.isEmpty()) return null
+        val sb = StringBuilder(256)
+        for ((k, v) in merged) {
+            if (sb.isNotEmpty()) sb.append("; ")
+            sb.append(k).append('=').append(v)
+        }
+        return sb.toString()
+    }
+
+    private fun collectCookiesForGoogle(existingCookie: String?): String? {
+        var combined = existingCookie
+        try {
+            val cm = CookieManager.getInstance()
+            val urls = arrayOf(
+                "https://gemini.google.com/app",
+                "https://gemini.google.com",
+                "https://bard.google.com",
+                "https://www.google.com",
+                ".google.com"
+            )
+            for (u in urls) {
+                val c = cm.getCookie(u)
+                if (!c.isNullOrBlank()) {
+                    combined = mergeCookieStrings(combined, c)
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return combined
+    }
+
+    private fun extractWizTokensFromHtml(html: String) {
+        try {
+            if (html.isEmpty()) return
+            val snMatch = Regex(""""SNlM0e"\s*:\s*"([^"]+)"""").find(html)
+            if (snMatch != null) {
+                val tok = snMatch.groupValues.getOrNull(1)
+                if (!tok.isNullOrBlank()) cachedXsrfToken = tok
+            }
+            val fsidMatch = Regex(""""FdrFJe"\s*:\s*"([^"]+)"""").find(html)
+            if (fsidMatch != null) {
+                val fsid = fsidMatch.groupValues.getOrNull(1)
+                if (!fsid.isNullOrBlank()) cachedFsidToken = fsid
+            }
+            val blMatch = Regex(""""cfb2h"\s*:\s*"([^"]+)"""").find(html)
+            if (blMatch != null) {
+                val bl = blMatch.groupValues.getOrNull(1)
+                if (!bl.isNullOrBlank()) cachedBuildLabel = bl
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun readBoundedHttpResponse(conn: HttpURLConnection, maxChars: Int): String? {
+        return try {
+            val code = conn.responseCode
+            if (code !in 200..299) return null
+            val stream = conn.inputStream ?: return null
+            InputStreamReader(stream, StandardCharsets.UTF_8).use { reader ->
+                val sb = StringBuilder(minOf(65_536, maxChars))
+                val buf = CharArray(4096)
+                var r: Int
+                while (reader.read(buf).also { r = it } != -1 && sb.length < maxChars) {
+                    val allow = minOf(r, maxChars - sb.length)
+                    sb.append(buf, 0, allow)
+                }
+                sb.toString()
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun fetchActiveQuotaOverHttp(sessionTag: String, reason: RefreshReason) {
         if (!isForegroundActive.get()) return
         val now = System.currentTimeMillis()
         val isManual = reason == RefreshReason.MANUAL_TAP || reason == RefreshReason.ACCOUNT_SWITCH
-        val minInterval = if (isManual) 2_500L else 12_000L
+        val minInterval = if (isManual) 2_000L else 10_000L
         if (now - lastHttpFetchMs.get() < minInterval) return
         lastHttpFetchMs.set(now)
 
         val dynState = activeDynamicSession.get()
         val authHeader = dynState.authorizationHeader
-        var cookieHeader = dynState.cookieHeader
-        val authUser = dynState.authUserHeader ?: "0"
+        val authUser = dynState.authUserHeader?.takeIf { it.isNotBlank() } ?: "0"
+        val cookieHeader = collectCookiesForGoogle(dynState.cookieHeader)
 
-        // Fallback: If cookie was not intercepted from Cronet yet, retrieve from Android CookieManager
-        if (cookieHeader.isNullOrBlank()) {
-            cookieHeader = try {
-                CookieManager.getInstance().getCookie("https://gemini.google.com")
-                    ?: CookieManager.getInstance().getCookie(".google.com")
-            } catch (_: Throwable) {
-                null
-            }
+        // If cookie gained via CookieManager confirms or upgrades session identity, sync it seamlessly
+        if (!cookieHeader.isNullOrBlank() && dynState.cookieHeader.isNullOrBlank()) {
+            onDynamicHeadersIntercepted(
+                EphemeralSessionHeaders(
+                    url = "https://gemini.google.com/app",
+                    authorization = authHeader,
+                    cookie = cookieHeader,
+                    authUser = authUser
+                ),
+                transport = "CookieMgr"
+            )
         }
 
         // If neither cookie nor OAuth Bearer token is available yet, apply rolling estimation if queries exist
@@ -2622,105 +3194,139 @@ object QuotaCoreEngine {
         }
 
         var fetchedSnapshot: QuotaHudView.Snapshot? = null
+        val mobileUa = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
-        // 1. Fetch Gemini Web app landing page: contains AF_initDataCallback blobs with user quota & tier
-        try {
-            val url = URL("https://gemini.google.com/app?hl=zh-CN")
-            val conn = (url.openConnection() as? HttpURLConnection)
-            if (conn != null) {
+        // 0. Replay learned GET quota endpoints captured from Gemini's own UI traffic
+        val learnedCopy: List<LearnedEndpoint> = synchronized(learnedEndpointsLock) {
+            ArrayList(learnedQuotaEndpoints.values)
+        }
+        for (ep in learnedCopy.asReversed()) {
+            if (!isForegroundActive.get() || fetchedSnapshot != null) break
+            if (!ep.method.equals("GET", ignoreCase = true)) continue
+            try {
+                val conn = (URL(ep.url).openConnection() as? HttpURLConnection) ?: continue
                 conn.instanceFollowRedirects = true
-                conn.connectTimeout = 7_000
-                conn.readTimeout = 7_000
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36")
-                conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
-                conn.setRequestProperty("Cache-Control", "no-cache")
+                conn.connectTimeout = 5_000
+                conn.readTimeout = 5_000
+                conn.setRequestProperty("User-Agent", mobileUa)
+                conn.setRequestProperty("Accept", "application/json, text/plain, */*")
                 conn.setRequestProperty("X-Goog-AuthUser", authUser)
-                if (!cookieHeader.isNullOrBlank()) {
-                    conn.setRequestProperty("Cookie", cookieHeader)
-                }
-                if (!authHeader.isNullOrBlank()) {
-                    conn.setRequestProperty("Authorization", authHeader)
-                }
+                if (!cookieHeader.isNullOrBlank()) conn.setRequestProperty("Cookie", cookieHeader)
+                if (!authHeader.isNullOrBlank()) conn.setRequestProperty("Authorization", authHeader)
 
-                val code = conn.responseCode
-                if (code in 200..299) {
-                    val stream = conn.inputStream
-                    val reader = InputStreamReader(stream, StandardCharsets.UTF_8)
-                    val sb = StringBuilder(32_768)
-                    val buf = CharArray(4096)
-                    var r: Int
-                    while (reader.read(buf).also { r = it } != -1 && sb.length < 262_144) {
-                        sb.append(buf, 0, r)
-                    }
-                    reader.close()
-                    stream.close()
-
-                    val html = sb.toString()
+                val body = readBoundedHttpResponse(conn, 262_144)
+                conn.disconnect()
+                if (!body.isNullOrBlank()) {
+                    extractWizTokensFromHtml(body)
                     val parsed = QuotaTextParser.parseHtmlOrJsonPayload(
-                        payload = html,
+                        payload = body,
                         prev = getBaseSnapshotForSession(sessionTag),
-                        source = "Active-Web"
+                        source = ep.rpcHint ?: "Learned-HTTP"
                     )
                     if (parsed != null && parsed.hasLiveData) {
                         fetchedSnapshot = parsed
                     }
                 }
-                conn.disconnect()
+            } catch (_: Throwable) {
             }
-        } catch (t: Throwable) {
-            safeLog(activeBridgeRef.get(), "Active Web fetch attempt: ${t.javaClass.simpleName} (${t.message})")
         }
 
-        // 2. If not fetched from web, try batchexecute RPC (hOoQ4d)
-        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank()) {
-            try {
-                val rpcUrl = URL("https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=hOoQ4d&source-path=%2Fapp")
-                val conn = (rpcUrl.openConnection() as? HttpURLConnection)
-                if (conn != null) {
+        // 1. Fetch Gemini Web app landing page up to 1.5 MB: captures SNlM0e/FdrFJe/cfb2h & full AF_initDataCallback blobs
+        if (fetchedSnapshot == null && isForegroundActive.get()) {
+            val primaryPath = if (authUser != "0") "https://gemini.google.com/u/$authUser/app?hl=zh-CN" else "https://gemini.google.com/app?hl=zh-CN"
+            val landingCandidates = arrayOf(primaryPath, "https://gemini.google.com/app?hl=en")
+            for (pageUrl in landingCandidates) {
+                if (fetchedSnapshot != null || !isForegroundActive.get()) break
+                try {
+                    val conn = (URL(pageUrl).openConnection() as? HttpURLConnection) ?: continue
+                    conn.instanceFollowRedirects = true
+                    conn.connectTimeout = 7_000
+                    conn.readTimeout = 8_000
+                    conn.setRequestProperty("User-Agent", mobileUa)
+                    conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+                    conn.setRequestProperty("Cache-Control", "no-cache")
+                    conn.setRequestProperty("X-Goog-AuthUser", authUser)
+                    if (!cookieHeader.isNullOrBlank()) conn.setRequestProperty("Cookie", cookieHeader)
+                    if (!authHeader.isNullOrBlank()) conn.setRequestProperty("Authorization", authHeader)
+
+                    val html = readBoundedHttpResponse(conn, 1_572_864)
+                    conn.disconnect()
+                    if (!html.isNullOrBlank()) {
+                        extractWizTokensFromHtml(html)
+                        val parsed = QuotaTextParser.parseHtmlOrJsonPayload(
+                            payload = html,
+                            prev = getBaseSnapshotForSession(sessionTag),
+                            source = "Active-Web"
+                        )
+                        if (parsed != null && parsed.hasLiveData) {
+                            fetchedSnapshot = parsed
+                        }
+                        if (cachedXsrfToken != null) break
+                    }
+                } catch (t: Throwable) {
+                    safeLog(activeBridgeRef.get(), "Active Web fetch attempt: ${t.javaClass.simpleName} (${t.message})")
+                }
+            }
+        }
+
+        // 2. If not fetched from landing HTML, invoke BardChatUi batchexecute RPCs with extracted SNlM0e XSRF token
+        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank() && isForegroundActive.get()) {
+            val rpcGroups = arrayOf("hOoQ4d", "o4g7id", "MaZiqc")
+            for (rpcId in rpcGroups) {
+                if (fetchedSnapshot != null || !isForegroundActive.get()) break
+                try {
+                    val urlBuilder = StringBuilder("https://gemini.google.com")
+                    if (authUser != "0") {
+                        urlBuilder.append("/u/").append(URLEncoder.encode(authUser, "UTF-8"))
+                    }
+                    urlBuilder.append("/_/BardChatUi/data/batchexecute?rpcids=").append(rpcId)
+                    cachedFsidToken?.let { urlBuilder.append("&f.sid=").append(URLEncoder.encode(it, "UTF-8")) }
+                    cachedBuildLabel?.let { urlBuilder.append("&bl=").append(URLEncoder.encode(it, "UTF-8")) }
+                    urlBuilder.append("&hl=zh-CN&source-path=%2Fapp&rt=c")
+
+                    val conn = (URL(urlBuilder.toString()).openConnection() as? HttpURLConnection) ?: continue
                     conn.requestMethod = "POST"
                     conn.doOutput = true
                     conn.connectTimeout = 6_000
                     conn.readTimeout = 6_000
                     conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
-                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36")
+                    conn.setRequestProperty("User-Agent", mobileUa)
+                    conn.setRequestProperty("Origin", "https://gemini.google.com")
+                    conn.setRequestProperty("Referer", "https://gemini.google.com/app")
+                    conn.setRequestProperty("X-Same-Domain", "1")
                     conn.setRequestProperty("X-Goog-AuthUser", authUser)
                     conn.setRequestProperty("Cookie", cookieHeader)
-                    if (!authHeader.isNullOrBlank()) {
-                        conn.setRequestProperty("Authorization", authHeader)
+                    if (!authHeader.isNullOrBlank()) conn.setRequestProperty("Authorization", authHeader)
+
+                    val reqJson = "[[[\"$rpcId\",\"[]\",null,\"generic\"]]]"
+                    val formBody = StringBuilder("f.req=").append(URLEncoder.encode(reqJson, "UTF-8"))
+                    val xsrf = cachedXsrfToken
+                    if (!xsrf.isNullOrBlank()) {
+                        formBody.append("&at=").append(URLEncoder.encode(xsrf, "UTF-8"))
+                    }
+                    formBody.append('&')
+
+                    OutputStreamWriter(conn.outputStream, StandardCharsets.UTF_8).use { out ->
+                        out.write(formBody.toString())
+                        out.flush()
                     }
 
-                    val postData = "f.req=" + java.net.URLEncoder.encode("[[[\"hOoQ4d\",\"[]\",null,\"generic\"]]]", "UTF-8")
-                    val out = OutputStreamWriter(conn.outputStream, StandardCharsets.UTF_8)
-                    out.write(postData)
-                    out.flush()
-                    out.close()
-
-                    if (conn.responseCode in 200..299) {
-                        val stream = conn.inputStream
-                        val reader = InputStreamReader(stream, StandardCharsets.UTF_8)
-                        val sb = StringBuilder(16_384)
-                        val buf = CharArray(2048)
-                        var r: Int
-                        while (reader.read(buf).also { r = it } != -1 && sb.length < 131_072) {
-                            sb.append(buf, 0, r)
-                        }
-                        reader.close()
-                        stream.close()
-
+                    val body = readBoundedHttpResponse(conn, 262_144)
+                    conn.disconnect()
+                    if (!body.isNullOrBlank()) {
                         val parsed = QuotaTextParser.parseHtmlOrJsonPayload(
-                            payload = sb.toString(),
+                            payload = body,
                             prev = getBaseSnapshotForSession(sessionTag),
-                            source = "Active-RPC"
+                            source = "Active-RPC-$rpcId"
                         )
                         if (parsed != null && parsed.hasLiveData) {
                             fetchedSnapshot = parsed
                         }
                     }
-                    conn.disconnect()
+                } catch (t: Throwable) {
+                    safeLog(activeBridgeRef.get(), "Active RPC ($rpcId) attempt: ${t.javaClass.simpleName} (${t.message})")
                 }
-            } catch (t: Throwable) {
-                safeLog(activeBridgeRef.get(), "Active RPC fetch attempt: ${t.javaClass.simpleName} (${t.message})")
             }
         }
 
@@ -2737,7 +3343,7 @@ object QuotaCoreEngine {
 
     private fun applySessionQueryEstimationIfNeeded(sessionTag: String) {
         val cur = getBaseSnapshotForSession(sessionTag)
-        if (cur.fiveHourQuota != "--" && cur.source != "SessionEstimate") return
+        if (cur.hasLiveData && cur.source != "SessionEstimate") return
 
         val now = System.currentTimeMillis()
         val queryTimes: List<Long>
@@ -2772,23 +3378,84 @@ object QuotaCoreEngine {
     }
 
     private fun collectViewTexts(v: View, out: StringBuilder, depth: Int) {
-        if (depth > 16 || out.length > 6144) return
+        if (depth > 20 || out.length > 12_288) return
         if (v.tag == QuotaHudView.HUD_VIEW_TAG) return
         if (v.visibility != View.VISIBLE) return
+        val viewTagStr = v.tag as? String
+        if (viewTagStr != null && viewTagStr.startsWith("bard_quota_hud")) return
 
         if (v is TextView) {
-            val tagStr = v.tag as? String
-            if (tagStr == null || !tagStr.startsWith("bard_quota_hud")) {
-                val t = v.text
-                if (!t.isNullOrBlank() && t.length <= 200) {
-                    out.append(t).append('\n')
-                }
+            val t = v.text
+            if (!t.isNullOrBlank() && t.length <= 240) {
+                out.append(t).append('\n')
             }
+        } else if (v.javaClass.name.contains("ComposeView", ignoreCase = true) ||
+            v.javaClass.name.contains("AndroidComposeView", ignoreCase = true)
+        ) {
+            collectComposeAccessibilityTexts(v, out)
         }
         if (v is ViewGroup) {
             for (i in 0 until v.childCount) {
                 val child = v.getChildAt(i) ?: continue
                 collectViewTexts(child, out, depth + 1)
+            }
+        }
+    }
+
+    private fun collectComposeAccessibilityTexts(rootView: View, out: StringBuilder) {
+        try {
+            val rootNode = rootView.createAccessibilityNodeInfo() ?: return
+            val count = intArrayOf(0)
+            walkAccessibilityNodeSafe(rootNode, out, 0, count)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun walkAccessibilityNodeSafe(
+        node: AccessibilityNodeInfo,
+        out: StringBuilder,
+        depth: Int,
+        visitedCount: IntArray
+    ) {
+        try {
+            if (depth > 18 || visitedCount[0] > 160 || out.length > 12_288) return
+            visitedCount[0]++
+
+            val resId = try {
+                node.viewIdResourceName ?: ""
+            } catch (_: Throwable) {
+                ""
+            }
+            if (resId.contains("bard_quota_hud")) return
+
+            val txt = node.text?.toString()?.trim()
+            if (!txt.isNullOrEmpty() && txt.length <= 240) {
+                if (!txt.contains("bard_quota_hud")) {
+                    out.append(txt).append('\n')
+                }
+            }
+            val desc = node.contentDescription?.toString()?.trim()
+            if (!desc.isNullOrEmpty() && desc != txt && desc.length <= 240) {
+                out.append(desc).append('\n')
+            }
+
+            val childTotal = minOf(node.childCount, 32)
+            for (i in 0 until childTotal) {
+                val child = try {
+                    node.getChild(i)
+                } catch (_: Throwable) {
+                    null
+                } ?: continue
+                walkAccessibilityNodeSafe(child, out, depth + 1, visitedCount)
+            }
+        } catch (_: Throwable) {
+        } finally {
+            @Suppress("DEPRECATION")
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                try {
+                    node.recycle()
+                } catch (_: Throwable) {
+                }
             }
         }
     }
@@ -2817,6 +3484,13 @@ object QuotaCoreEngine {
             } else {
                 perSessionSnapshots[sessionTag]?.sanitized() ?: QuotaHudView.Snapshot()
             }
+            // Never let synthetic SessionEstimate overwrite resolved real quota metrics
+            if (clean.source == "SessionEstimate" &&
+                prevForSession.hasLiveData &&
+                prevForSession.source != "SessionEstimate"
+            ) {
+                return
+            }
             if (clean == prevForSession) return
 
             if (sessionTag != DEFAULT_SESSION_TAG) {
@@ -2830,7 +3504,13 @@ object QuotaCoreEngine {
 
         if (!shouldUpdateActiveHud) return
 
-        saveSanitizedHostMirror(clean, currentLang.get(), currentTheme.get(), sessionTag)
+        saveSanitizedHostMirror(
+            clean,
+            currentLang.get(),
+            currentTheme.get(),
+            sessionTag,
+            isStrongCookieTag = confirmedIdentityStrength >= IdentityStrength.COOKIE_SID
+        )
         if (isForegroundActive.get()) {
             refreshHudOnUiThread()
             val ctx = appContext
@@ -2855,9 +3535,13 @@ object QuotaCoreEngine {
             val langCode = prefs.getString("ui_lang", null)
             val themeCode = prefs.getString("ui_theme", null)
             val savedSession = prefs.getString("session_id", null)
+            val savedStrong = prefs.getBoolean("session_strong", false)
             if (langCode != null) currentLang.set(QuotaHudView.Lang.fromCode(langCode))
             if (themeCode != null) currentTheme.set(QuotaHudView.ThemeMode.fromCode(themeCode))
-            if (!savedSession.isNullOrBlank()) activeSessionTag.set(savedSession)
+            if (!savedSession.isNullOrBlank()) {
+                activeSessionTag.set(savedSession)
+                persistedSessionWasStrong = savedStrong
+            }
 
             val clean = QuotaHudView.Snapshot(
                 fiveHourQuota = prefs.getString("five", "--") ?: "--",
@@ -2884,7 +3568,8 @@ object QuotaCoreEngine {
         snapshot: QuotaHudView.Snapshot,
         lang: QuotaHudView.Lang,
         theme: QuotaHudView.ThemeMode,
-        sessionTag: String
+        sessionTag: String,
+        isStrongCookieTag: Boolean = persistedSessionWasStrong
     ) {
         val ctx = appContext ?: return
         val clean = snapshot.sanitized()
@@ -2897,6 +3582,7 @@ object QuotaCoreEngine {
                 .putString("week_reset", clean.weeklyReset)
                 .putString("src", clean.source)
                 .putString("session_id", sessionTag)
+                .putBoolean("session_strong", isStrongCookieTag)
                 .putString("ui_lang", lang.code)
                 .putString("ui_theme", theme.code)
                 .apply()
@@ -2961,7 +3647,11 @@ object QuotaCoreEngine {
 
         if (sameOrDefaultSession) {
             val cleanSnap = state.snapshot.sanitized()
-            if (cleanSnap.hasLiveData && latestSnapshot.get() != cleanSnap && !latestSnapshot.get().hasLiveData) {
+            val curSnap = latestSnapshot.get().sanitized()
+            val canUpgradeFromProvider = cleanSnap.hasLiveData &&
+                curSnap != cleanSnap &&
+                (!curSnap.hasLiveData || (curSnap.source == "SessionEstimate" && cleanSnap.source != "SessionEstimate"))
+            if (canUpgradeFromProvider) {
                 latestSnapshot.set(cleanSnap)
                 uiChanged = true
             }
@@ -3006,8 +3696,10 @@ object QuotaCoreEngine {
             val hud = activeHudRef.get().get()
             if (hud != null && hud.isAttachedToWindow) {
                 hud.visibility = View.VISIBLE
+                hud.alpha = 1f
                 hud.applyPreferences(currentLang.get(), currentTheme.get())
                 hud.updateSnapshot(latestSnapshot.get().sanitized())
+                hud.bringToFront()
             } else {
                 val act = activeActivityRef.get().get()
                 if (act != null && !act.isFinishing && !act.isDestroyed) {

@@ -1391,6 +1391,30 @@ export default function App() {
                       : 'Zero polling timers: lightweight quota refresh runs strictly on APP_OPEN, outgoing query dispatch (Cronet UrlRequest.start / gRPC ClientCall.sendMessage -> QUERY_SENT), ACCOUNT_SWITCH, or manual refresh tap.'}
                   </p>
                 </div>
+
+                <div className="p-5">
+                  <div className="text-sm font-semibold text-slate-900 flex items-center justify-between">
+                    <span>
+                      {isZh
+                        ? '04. 持久化应用签名保护（保留原始应用签名 · 解决安装覆盖不兼容）'
+                        : '04. Persistent App Signature (Keep App Signature & Seamless Overwrite Updates)'}
+                    </span>
+                    <span className="text-[11px] font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                      v1 + v2 Signing
+                    </span>
+                  </div>
+                  <p className="mt-1.5 text-sm text-slate-600 leading-relaxed">
+                    {isZh
+                      ? '模块仓库内置并固化持久化 release 签名库，并在 GitHub Actions 中支持自动继承仓库密钥。杜绝 CI 每次运行重新生成随机密钥导致签名不一致（解决 INSTALL_FAILED_UPDATE_INCOMPATIBLE 签名冲突错误）。如需使用您手机上原有安装包的专属签名，只需在 GitHub 仓库 Settings -> Secrets 中添加 RELEASE_KEYSTORE_BASE64，CI 即可无缝沿用您原本的签名证书。'
+                      : 'Includes persistent repository signing keystore and supports GitHub Repository Secret RELEASE_KEYSTORE_BASE64 to guarantee that every CI and local build produces APKs with the exact same cryptographic signature, eliminating signature mismatch (INSTALL_FAILED_UPDATE_INCOMPATIBLE) errors on APK updates.'}
+                  </p>
+                  <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3 font-mono text-xs text-slate-700 space-y-1">
+                    <div><span className="text-slate-400"># GitHub Secrets (Optional Custom Keystore):</span></div>
+                    <div><span className="text-indigo-600">RELEASE_KEYSTORE_BASE64</span>: &lt;base64-encoded-keystore&gt;</div>
+                    <div><span className="text-indigo-600">RELEASE_KEYSTORE_PASSWORD</span>: android <span className="text-slate-400">(default)</span></div>
+                    <div><span className="text-indigo-600">RELEASE_KEY_ALIAS</span>: release <span className="text-slate-400">(default)</span></div>
+                  </div>
+                </div>
               </div>
             </div>
           )}

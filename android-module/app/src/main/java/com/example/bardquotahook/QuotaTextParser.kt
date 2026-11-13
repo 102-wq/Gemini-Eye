@@ -764,12 +764,44 @@ object QuotaTextParser {
             .trim()
         if (cleaned.length < 4) return null
 
-        val firstBracket = cleaned.indexOfFirst { it == '{' || it == '[' }
-        if (firstBracket !in 0..48) return null
+        // Handle Google batchexecute multi-chunk envelopes:
+        // <len>\n[["wrb.fr","<rpcId>","<embedded_json>",...]]
+        var best = sanitizeSnapshot(prev)
+        var changed = false
 
-        val candidate = cleaned.substring(firstBracket)
+        val lines = cleaned.lineSequence().iterator()
+        var processedLineChunks = false
+        while (lines.hasNext()) {
+            val line = lines.next().trim()
+            if (line.length < 4) continue
+            if (line[0] == '[' || line[0] == '{') {
+                processedLineChunks = true
+                val parsed = parseSingleJsonNode(line, best, source)
+                if (parsed != null && parsed.hasLiveData) {
+                    best = parsed
+                    changed = true
+                }
+            }
+        }
+        if (changed) return best
+
+        if (!processedLineChunks || cleaned.firstOrNull { it == '{' || it == '[' } != null) {
+            val firstBracket = cleaned.indexOfFirst { it == '{' || it == '[' }
+            if (firstBracket !in 0..64) return null
+            val candidate = cleaned.substring(firstBracket)
+            val parsed = parseSingleJsonNode(candidate, best, source)
+            if (parsed != null && parsed.hasLiveData) return parsed
+        }
+        return null
+    }
+
+    private fun parseSingleJsonNode(
+        jsonStr: String,
+        prev: QuotaHudView.Snapshot,
+        source: String
+    ): QuotaHudView.Snapshot? {
         return try {
-            when (val node = JSONTokener(candidate).nextValue()) {
+            when (val node = JSONTokener(jsonStr).nextValue()) {
                 is JSONObject -> inspectJsonObject(node, prev, source)
                 is JSONArray -> inspectJsonArray(node, prev, source)
                 else -> null
@@ -843,6 +875,17 @@ object QuotaTextParser {
             val elem = arr.opt(i) ?: continue
             when (elem) {
                 is JSONArray -> scanJspbArrayRecursive(elem, depth + 1, nowMs, out)
+                is String -> {
+                    val s = elem.trim()
+                    if (depth < 4 && s.length >= 4 && (s[0] == '[' || s[0] == '{')) {
+                        try {
+                            when (val inner = JSONTokener(s).nextValue()) {
+                                is JSONArray -> scanJspbArrayRecursive(inner, depth + 1, nowMs, out)
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
                 is Number -> {
                     val lv = elem.toLong()
                     val ts = classifyFutureEpochTimestamp(lv, nowMs)
@@ -890,8 +933,8 @@ object QuotaTextParser {
     }
 
     /**
-     * Parses either raw JSON, JSPB array, or full Gemini landing HTML containing
-     * `AF_initDataCallback` data blobs and `window.WIZ_global_data`.
+     * Parses either raw JSON, JSPB array, batchexecute response, or full Gemini HTML containing
+     * balanced `AF_initDataCallback({ ... data: [...], sideChannel: {} })` blocks & `window.WIZ_global_data`.
      */
     fun parseHtmlOrJsonPayload(
         payload: String,
@@ -901,18 +944,18 @@ object QuotaTextParser {
         val trimmed = payload.trim()
         if (trimmed.isEmpty()) return null
 
-        // 1. Direct JSON / JSPB payload
-        val direct = parseInAppStructuredPayload(trimmed, prev, source)
-        if (direct != null && direct.hasLiveData) return direct
+        // 1. Direct JSON / JSPB / batchexecute payload
+        if (trimmed[0] == '{' || trimmed[0] == '[' || trimmed.startsWith(")]}'")) {
+            val direct = parseInAppStructuredPayload(trimmed, prev, source)
+            if (direct != null && direct.hasLiveData) return direct
+        }
 
-        // 2. Extract embedded AF_initDataCallback blobs: AF_initDataCallback({ ... data: [...] })
-        val callbackRegex = Regex("""AF_initDataCallback\s*\(\s*\{.*?data\s*:\s*(\[[^;]+\]|\{[^;]+\})\s*\}\s*\)""", RegexOption.DOT_MATCHES_ALL)
-        var bestSnap = prev
+        // 2. Balanced extraction of AF_initDataCallback({ ..., data: [...], sideChannel: {} })
+        var bestSnap = sanitizeSnapshot(prev)
         var foundAny = false
 
-        for (match in callbackRegex.findAll(trimmed)) {
-            val dataStr = match.groupValues.getOrNull(1)?.trim() ?: continue
-            val parsed = parseInAppStructuredPayload(dataStr, bestSnap, "$source-AF")
+        for (dataBlock in extractCallbackDataBlocks(trimmed)) {
+            val parsed = parseInAppStructuredPayload(dataBlock, bestSnap, "$source-AF")
             if (parsed != null && parsed.hasLiveData) {
                 bestSnap = parsed
                 foundAny = true
@@ -920,21 +963,24 @@ object QuotaTextParser {
         }
 
         // 3. Extract window.WIZ_global_data = { ... };
-        val wizMatch = Regex("""window\.WIZ_global_data\s*=\s*(\{.+?\});""", RegexOption.DOT_MATCHES_ALL).find(trimmed)
-        if (wizMatch != null) {
-            val wizJsonStr = wizMatch.groupValues.getOrNull(1)?.trim()
-            if (wizJsonStr != null) {
-                val parsed = parseInAppStructuredPayload(wizJsonStr, bestSnap, "$source-WIZ")
-                if (parsed != null && parsed.hasLiveData) {
-                    bestSnap = parsed
-                    foundAny = true
+        val wizIdx = trimmed.indexOf("window.WIZ_global_data")
+        if (wizIdx >= 0) {
+            val braceStart = trimmed.indexOf('{', wizIdx)
+            if (braceStart >= 0) {
+                val wizJsonStr = extractBalancedJsonSlice(trimmed, braceStart)
+                if (wizJsonStr != null) {
+                    val parsed = parseInAppStructuredPayload(wizJsonStr, bestSnap, "$source-WIZ")
+                    if (parsed != null && parsed.hasLiveData) {
+                        bestSnap = parsed
+                        foundAny = true
+                    }
                 }
             }
         }
 
-        // 4. Regex scan for quota JSON properties in minified script text
+        // 4. Regex scan for explicit quota JSON properties in minified script text
         if (!foundAny) {
-            val keyValMatches = Regex(""""([a-zA-Z0-9_]{3,30})"\s*:\s*([0-9.]+|"[^"]+")""").findAll(trimmed)
+            val keyValMatches = Regex(""""([a-zA-Z0-9_]{3,36})"\s*:\s*([0-9.]+|"[^"]+")""").findAll(trimmed)
             val extracted = mutableMapOf<String, String>()
             for (m in keyValMatches) {
                 val k = m.groupValues[1].lowercase()
@@ -949,12 +995,80 @@ object QuotaTextParser {
             }
         }
 
-        return if (foundAny && bestSnap != prev && bestSnap.hasLiveData) bestSnap else null
+        return if (foundAny && bestSnap != sanitizeSnapshot(prev) && bestSnap.hasLiveData) bestSnap else null
     }
 
     /**
-     * Checks screen views for both explicit rate-limit exhaustion banners and active
-     * quota indicators in dialogs, bottom sheets, or model switcher views.
+     * Extracts Google `AF_initDataCallback({ ... data: [...] })` JSON payloads using
+     * quote-aware bracket matching so trailing fields like `, sideChannel: {}` never break parsing.
+     */
+    private fun extractCallbackDataBlocks(html: String): List<String> {
+        val results = ArrayList<String>(8)
+        var cursor = 0
+        val marker = "AF_initDataCallback"
+        while (results.size < 24) {
+            val hit = html.indexOf(marker, cursor)
+            if (hit < 0) break
+            val searchLimit = minOf(html.length, hit + 240)
+            val dataKeyIdx = html.indexOf("data:", hit)
+            if (dataKeyIdx in hit..searchLimit) {
+                var valIdx = dataKeyIdx + 5
+                while (valIdx < html.length && html[valIdx].isWhitespace()) valIdx++
+                if (valIdx < html.length && (html[valIdx] == '[' || html[valIdx] == '{')) {
+                    val block = extractBalancedJsonSlice(html, valIdx)
+                    if (block != null && block.length >= 4) {
+                        results.add(block)
+                        cursor = valIdx + block.length
+                        continue
+                    }
+                }
+            }
+            cursor = hit + marker.length
+        }
+        return results
+    }
+
+    private fun extractBalancedJsonSlice(src: String, startIdx: Int, maxChars: Int = 262_144): String? {
+        if (startIdx !in src.indices) return null
+        val openCh = src[startIdx]
+        if (openCh != '[' && openCh != '{') return null
+
+        var depth = 0
+        var inString = false
+        var escapeNext = false
+        val limit = minOf(src.length, startIdx + maxChars)
+
+        for (i in startIdx until limit) {
+            val ch = src[i]
+            if (escapeNext) {
+                escapeNext = false
+                continue
+            }
+            if (inString) {
+                when (ch) {
+                    '\\' -> escapeNext = true
+                    '"' -> inString = false
+                }
+                continue
+            }
+            when (ch) {
+                '"' -> inString = true
+                '[', '{' -> depth++
+                ']', '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        return src.substring(startIdx, i + 1)
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Checks screen views / Accessibility / Compose nodes / WebView DOM text for quota metrics.
+     * Uses a multi-line sliding context window so separate label & value rows ("5小时限额" followed
+     * on the next line by "15%" and "1小时52分后重置") associate accurately to 5h vs Weekly pools.
      */
     fun parseScreenQuotaTexts(
         text: String,
@@ -968,13 +1082,16 @@ object QuotaTextParser {
         var weekReset = base.weeklyReset
         var hit = false
 
+        var activeSection: MetricKind? = null
+        var sectionAge = 0
+
         for (rawLine in text.lineSequence()) {
             val line = rawLine.trim()
-            if (line.length !in 3..250) continue
+            if (line.length !in 2..250) continue
 
-            // 1. Check for exhaustion banners
+            // 1. Check for rate-limit exhaustion banners
             if (exhaustedBannerRegex.matches(line)) {
-                if (fiveHour == "--") {
+                if (fiveHour == "--" || fiveHour != "100%") {
                     fiveHour = "100%"
                     hit = true
                 }
@@ -983,35 +1100,89 @@ object QuotaTextParser {
                     fiveReset = bannerReset
                     hit = true
                 }
+                activeSection = MetricKind.FIVE_HOUR
+                sectionAge = 0
                 continue
             }
 
-            // 2. Check for explicit 5h / weekly quota usage or remaining count in dialogs
             val lower = line.lowercase()
-            val is5hContext = lower.contains("5h") || lower.contains("5-hour") || lower.contains("5小时") || lower.contains("short") || lower.contains("五小时")
-            val isWeekContext = lower.contains("week") || lower.contains("周") || lower.contains("7d")
+            val explicit5h = lower.contains("5h") ||
+                lower.contains("5-hour") ||
+                lower.contains("5 hour") ||
+                lower.contains("5小时") ||
+                lower.contains("五小时") ||
+                lower.contains("short-term") ||
+                lower.contains("short term") ||
+                lower.contains("短期")
+            val explicitWeek = lower.contains("weekly") ||
+                lower.contains("week") ||
+                lower.contains("每周") ||
+                lower.contains("本周") ||
+                lower.contains("7d") ||
+                lower.contains("7-day") ||
+                lower.contains("7天")
 
-            if (is5hContext || (!isWeekContext && (lower.contains("quota") || lower.contains("限额") || lower.contains("使用") || lower.contains("limit")))) {
-                val pct = extractMetricToken(line, MetricKind.FIVE_HOUR)
-                if (pct != null && pct != "--") {
-                    fiveHour = pct
-                    hit = true
+            if (explicit5h && !explicitWeek) {
+                activeSection = MetricKind.FIVE_HOUR
+                sectionAge = 0
+            } else if (explicitWeek && !explicit5h) {
+                activeSection = MetricKind.WEEKLY
+                sectionAge = 0
+            } else if (lower.contains("quota") || lower.contains("usage") || lower.contains("limit") ||
+                lower.contains("限额") || lower.contains("用量") || lower.contains("使用") || lower.contains("额度")
+            ) {
+                if (activeSection == null) {
+                    activeSection = MetricKind.FIVE_HOUR
+                    sectionAge = 0
                 }
-                val reset = extractMetricToken(line, MetricKind.RESET)
-                if (reset != null && reset != "--") {
-                    fiveReset = reset
-                    hit = true
+            } else {
+                sectionAge++
+                if (sectionAge > 4) {
+                    activeSection = null
                 }
-            } else if (isWeekContext) {
-                val pct = extractMetricToken(line, MetricKind.WEEKLY)
-                if (pct != null && pct != "--") {
-                    weekly = pct
-                    hit = true
+            }
+
+            val targetKind = when {
+                explicit5h && !explicitWeek -> MetricKind.FIVE_HOUR
+                explicitWeek && !explicit5h -> MetricKind.WEEKLY
+                else -> activeSection
+            } ?: continue
+
+            // Skip generic OS clock strings like "09:41" unless reset context is on the line
+            val hasResetContext = lower.contains("reset") ||
+                lower.contains("refresh") ||
+                lower.contains("renew") ||
+                lower.contains("available") ||
+                lower.contains("until") ||
+                lower.contains("重置") ||
+                lower.contains("恢复") ||
+                lower.contains("刷新") ||
+                lower.contains("后") ||
+                lower.contains("明天") ||
+                lower.contains("周") ||
+                Regex("""\d+\s*[d天h小时时m分]""", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+
+            val metricTok = extractUsedOrConvertedRemainingMetric(line, targetKind)
+            if (metricTok != null && metricTok != "--") {
+                if (targetKind == MetricKind.FIVE_HOUR) {
+                    fiveHour = metricTok
+                } else {
+                    weekly = metricTok
                 }
-                val reset = extractMetricToken(line, MetricKind.RESET)
-                if (reset != null && reset != "--") {
-                    weekReset = reset
+                hit = true
+                sectionAge = 0
+            }
+
+            if (hasResetContext) {
+                val resetTok = extractMetricToken(line, MetricKind.RESET)
+                if (resetTok != null && resetTok != "--") {
+                    if (targetKind == MetricKind.FIVE_HOUR) {
+                        fiveReset = resetTok
+                    } else {
+                        weekReset = resetTok
+                    }
                     hit = true
+                    sectionAge = 0
                 }
             }
         }
@@ -1025,6 +1196,41 @@ object QuotaTextParser {
             source = source
         ).sanitized()
         return if (next != base && next.hasLiveData) next else null
+    }
+
+    private fun extractUsedOrConvertedRemainingMetric(line: String, kind: MetricKind): String? {
+        val rawTok = extractMetricToken(line, kind) ?: return null
+        val lower = line.lowercase()
+        val isRemainingOnly = (lower.contains("remaining") ||
+            lower.contains("available") ||
+            lower.contains("left") ||
+            lower.contains("剩余") ||
+            lower.contains("可用") ||
+            lower.contains("还剩")) &&
+            !lower.contains("used") &&
+            !lower.contains("已用") &&
+            !lower.contains("已使用")
+
+        if (isRemainingOnly) {
+            val pctM = pctNumRegex.matchEntire(rawTok)
+            if (pctM != null) {
+                val remPct = pctM.groupValues.getOrNull(1)?.toFloatOrNull()
+                if (remPct != null && remPct in 0f..100f) {
+                    val used = (100f - remPct).roundToInt().coerceIn(0, 100)
+                    return sanitizeQuotaMetric("$used%")
+                }
+            }
+            val ratioM = ratioNumRegex.matchEntire(rawTok)
+            if (ratioM != null) {
+                val rem = ratioM.groupValues.getOrNull(1)?.toIntOrNull()
+                val lim = ratioM.groupValues.getOrNull(2)?.toIntOrNull()
+                if (rem != null && lim != null && lim > 0 && rem in 0..lim) {
+                    val usedPct = (((lim - rem).toDouble() / lim.toDouble()) * 100.0).roundToInt()
+                    return sanitizeQuotaMetric("$usedPct%")
+                }
+            }
+        }
+        return rawTok
     }
 
     /**
@@ -1117,7 +1323,7 @@ object QuotaTextParser {
     }
 
     private fun collectFromJson(node: Any?, out: MutableMap<String, String>, depth: Int) {
-        if (depth > 5 || node == null) return
+        if (depth > 6 || node == null) return
         when (node) {
             is JSONObject -> {
                 val keys = node.keys()
@@ -1132,15 +1338,31 @@ object QuotaTextParser {
                         out[key.lowercase()] = value.toString()
                     } else if (value is JSONObject || value is JSONArray) {
                         collectFromJson(value, out, depth + 1)
+                    } else if (value is String && depth < 5) {
+                        val trimmed = value.trim()
+                        if (trimmed.length >= 4 && (trimmed[0] == '{' || trimmed[0] == '[')) {
+                            try {
+                                collectFromJson(JSONTokener(trimmed).nextValue(), out, depth + 1)
+                            } catch (_: Throwable) {
+                            }
+                        }
                     }
                 }
             }
             is JSONArray -> {
-                val limit = minOf(node.length(), 25)
+                val limit = minOf(node.length(), 30)
                 for (i in 0 until limit) {
                     val elem = node.opt(i)
                     if (elem is JSONObject || elem is JSONArray) {
                         collectFromJson(elem, out, depth + 1)
+                    } else if (elem is String && depth < 5) {
+                        val trimmed = elem.trim()
+                        if (trimmed.length >= 4 && (trimmed[0] == '{' || trimmed[0] == '[')) {
+                            try {
+                                collectFromJson(JSONTokener(trimmed).nextValue(), out, depth + 1)
+                            } catch (_: Throwable) {
+                            }
+                        }
                     }
                 }
             }
