@@ -74,7 +74,8 @@ class QuotaHudView(
         val fiveHourReset: String = "--",
         val weeklyLimit: String = "--",
         val weeklyReset: String = "--",
-        val source: String = "init"
+        val source: String = "init",
+        val isStaleOffline: Boolean = false
     ) {
         fun sanitized(): Snapshot = QuotaTextParser.sanitizeSnapshot(this)
 
@@ -114,6 +115,7 @@ class QuotaHudView(
     private data class LocalizedHudLabels(
         val fiveHour: String,
         val weekly: String,
+        val offlineTag: String,
         val refreshDesc: String,
         val openUsageDesc: String
     )
@@ -125,6 +127,10 @@ class QuotaHudView(
         val cornerPx: Float,
         val primaryText: Int,
         val labelText: Int,
+        val staleText: Int,
+        val staleBg: Int,
+        val staleBorder: Int,
+        val staleBar: Int,
         val divider: Int,
         val trackColor: Int,
         val barNormal: Int,
@@ -148,6 +154,7 @@ class QuotaHudView(
     private val weeklyLabelView: TextView
     private val weeklyBarView: MiniProgressBarView
     private val weeklyValueView: TextView
+    private val offlineTagView: TextView
     private val dividerTwoView: View
     private val refreshIconBtn: HudActionIconView
     private val externalLinkBtn: HudActionIconView
@@ -233,6 +240,21 @@ class QuotaHudView(
             tabular = true
         )
 
+        offlineTagView = createSingleLineText(
+            tagSuffix = "offline",
+            textSp = 9f,
+            tf = labelTypeface,
+            tabular = false
+        ).apply {
+            val badgeH = dp(context, 4.5f)
+            val badgeV = dp(context, 1.5f)
+            setPadding(badgeH, badgeV, badgeH, badgeV)
+            layoutParams = LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(context, 5f)
+            }
+            visibility = View.GONE
+        }
+
         dividerTwoView = View(context).apply {
             tag = "bard_quota_hud_div2"
             layoutParams = LayoutParams(maxOf(1, dp(context, 1f)), dp(context, 12f)).apply {
@@ -275,6 +297,7 @@ class QuotaHudView(
         addView(weeklyLabelView)
         addView(weeklyBarView)
         addView(weeklyValueView)
+        addView(offlineTagView)
         addView(dividerTwoView)
         addView(refreshIconBtn)
         addView(externalLinkBtn)
@@ -326,6 +349,7 @@ class QuotaHudView(
         val palette = resolvePalette(context, currentTheme)
         val labels = resolveLocalizedHudLabels(context, currentLang)
         val safeSnap = currentSnapshot.sanitized()
+        val stale = safeSnap.isStaleOffline
 
         background = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
@@ -333,7 +357,7 @@ class QuotaHudView(
         ).apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = palette.cornerPx
-            setStroke(maxOf(1, dp(context, 0.9f)), palette.border)
+            setStroke(maxOf(1, dp(context, 0.9f)), if (stale) palette.staleBorder else palette.border)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -341,17 +365,34 @@ class QuotaHudView(
             outlineAmbientShadowColor = palette.shadowSpot
         }
 
+        val activeLabelColor = if (stale) palette.staleText else palette.labelText
+        val activeValueColor = if (stale) palette.staleText else palette.primaryText
+
         fiveHourLabelView.text = labels.fiveHour
-        fiveHourLabelView.setTextColor(palette.labelText)
+        fiveHourLabelView.setTextColor(activeLabelColor)
 
         weeklyLabelView.text = labels.weekly
-        weeklyLabelView.setTextColor(palette.labelText)
+        weeklyLabelView.setTextColor(activeLabelColor)
 
         fiveHourValueView.text = safeSnap.formatFiveHourDisplay()
-        fiveHourValueView.setTextColor(palette.primaryText)
+        fiveHourValueView.setTextColor(activeValueColor)
 
         weeklyValueView.text = safeSnap.formatWeeklyDisplay(currentLang)
-        weeklyValueView.setTextColor(palette.primaryText)
+        weeklyValueView.setTextColor(activeValueColor)
+
+        if (stale) {
+            offlineTagView.text = labels.offlineTag
+            offlineTagView.setTextColor(palette.staleText)
+            offlineTagView.background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpF(context, 4f)
+                setColor(palette.staleBg)
+                setStroke(maxOf(1, dp(context, 0.7f)), palette.staleBorder)
+            }
+            offlineTagView.visibility = View.VISIBLE
+        } else {
+            offlineTagView.visibility = View.GONE
+        }
 
         val p5 = safeSnap.fiveHourProgress
         val pW = safeSnap.weeklyProgress
@@ -359,12 +400,12 @@ class QuotaHudView(
         fiveHourBarView.update(
             fraction = p5,
             trackColor = palette.trackColor,
-            fillColor = pickBarColor(p5, palette)
+            fillColor = if (stale) palette.staleBar else pickBarColor(p5, palette)
         )
         weeklyBarView.update(
             fraction = pW,
             trackColor = palette.trackColor,
-            fillColor = pickBarColor(pW, palette)
+            fillColor = if (stale) palette.staleBar else pickBarColor(pW, palette)
         )
 
         dividerOneView.setBackgroundColor(palette.divider)
@@ -372,8 +413,8 @@ class QuotaHudView(
 
         refreshIconBtn.contentDescription = labels.refreshDesc
         externalLinkBtn.contentDescription = labels.openUsageDesc
-        refreshIconBtn.updateColors(palette.iconColor, palette.iconPressedBg)
-        externalLinkBtn.updateColors(palette.iconColor, palette.iconPressedBg)
+        refreshIconBtn.updateColors(if (stale) palette.staleText else palette.iconColor, palette.iconPressedBg)
+        externalLinkBtn.updateColors(if (stale) palette.staleText else palette.iconColor, palette.iconPressedBg)
     }
 
     private fun pickBarColor(fraction: Float, palette: Palette): Int {
@@ -652,6 +693,7 @@ class QuotaHudView(
             return LocalizedHudLabels(
                 fiveHour = "5h",
                 weekly = if (isZh) "每周" else "Weekly",
+                offlineTag = if (isZh) "离线" else "Offline",
                 refreshDesc = if (isZh) "刷新当前前台额度" else "Refresh foreground quota",
                 openUsageDesc = if (isZh) "打开模块设置" else "Open HUD settings"
             )
@@ -715,6 +757,10 @@ class QuotaHudView(
                     cornerPx = pillRadius,
                     primaryText = Color.parseColor("#F8FAFC"),
                     labelText = Color.parseColor("#94A3B8"),
+                    staleText = Color.parseColor("#94A3B8"),
+                    staleBg = Color.parseColor("#2494A3B8"),
+                    staleBorder = Color.parseColor("#4494A3B8"),
+                    staleBar = Color.parseColor("#64748B"),
                     divider = Color.parseColor("#28FFFFFF"),
                     trackColor = Color.parseColor("#2EFFFFFF"),
                     barNormal = Color.parseColor("#0D84FF"),
@@ -732,6 +778,10 @@ class QuotaHudView(
                     cornerPx = pillRadius,
                     primaryText = Color.parseColor("#0F172A"),
                     labelText = Color.parseColor("#64748B"),
+                    staleText = Color.parseColor("#64748B"),
+                    staleBg = Color.parseColor("#1A64748B"),
+                    staleBorder = Color.parseColor("#3864748B"),
+                    staleBar = Color.parseColor("#94A3B8"),
                     divider = Color.parseColor("#1A0F172A"),
                     trackColor = Color.parseColor("#1F0F172A"),
                     barNormal = Color.parseColor("#007AFF"),
@@ -763,6 +813,10 @@ class QuotaHudView(
                             cornerPx = md3Radius,
                             primaryText = onSurf,
                             labelText = onSurfVar,
+                            staleText = Color.parseColor("#9CA3AF"),
+                            staleBg = Color.parseColor("#249CA3AF"),
+                            staleBorder = Color.parseColor("#449CA3AF"),
+                            staleBar = Color.parseColor("#6B7280"),
                             divider = withAlpha(outline, 0x55),
                             trackColor = withAlpha(track, 0x99),
                             barNormal = primary,
@@ -787,6 +841,10 @@ class QuotaHudView(
                             cornerPx = md3Radius,
                             primaryText = onSurf,
                             labelText = onSurfVar,
+                            staleText = Color.parseColor("#6B7280"),
+                            staleBg = Color.parseColor("#1A6B7280"),
+                            staleBorder = Color.parseColor("#386B7280"),
+                            staleBar = Color.parseColor("#9CA3AF"),
                             divider = withAlpha(outline, 0x66),
                             trackColor = withAlpha(track, 0xDD),
                             barNormal = primary,
@@ -810,6 +868,10 @@ class QuotaHudView(
                     cornerPx = md3Radius,
                     primaryText = Color.parseColor("#E6E1E5"),
                     labelText = Color.parseColor("#CAC4D0"),
+                    staleText = Color.parseColor("#9CA3AF"),
+                    staleBg = Color.parseColor("#249CA3AF"),
+                    staleBorder = Color.parseColor("#449CA3AF"),
+                    staleBar = Color.parseColor("#6B7280"),
                     divider = Color.parseColor("#44938F99"),
                     trackColor = Color.parseColor("#884A4458"),
                     barNormal = Color.parseColor("#D0BCFF"),
@@ -827,6 +889,10 @@ class QuotaHudView(
                     cornerPx = md3Radius,
                     primaryText = Color.parseColor("#1D1B20"),
                     labelText = Color.parseColor("#49454F"),
+                    staleText = Color.parseColor("#6B7280"),
+                    staleBg = Color.parseColor("#1A6B7280"),
+                    staleBorder = Color.parseColor("#386B7280"),
+                    staleBar = Color.parseColor("#9CA3AF"),
                     divider = Color.parseColor("#55CAC4D0"),
                     trackColor = Color.parseColor("#DDE8DEF8"),
                     barNormal = Color.parseColor("#6750A4"),

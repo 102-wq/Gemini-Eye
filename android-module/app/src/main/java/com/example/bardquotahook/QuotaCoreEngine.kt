@@ -40,7 +40,9 @@ import java.lang.reflect.Modifier
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
 import java.util.Collections
+import java.util.Date
 import java.util.Enumeration
 import java.util.IdentityHashMap
 import java.util.LinkedHashMap
@@ -227,6 +229,15 @@ object QuotaCoreEngine {
             return size > MAX_TRACKED_ACCOUNTS
         }
     }
+    // In-memory cache of last verified non-zero quota per session for Protobuf zero-debounce fallback
+    private val cachedNonZeroSnapshots = object : LinkedHashMap<String, QuotaHudView.Snapshot>(MAX_TRACKED_ACCOUNTS, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, QuotaHudView.Snapshot>?): Boolean {
+            return size > MAX_TRACKED_ACCOUNTS
+        }
+    }
+    private val cachedNonZeroTimestamps = HashMap<String, Long>()
+    private val pbZeroDebounceHits = HashMap<String, Int>()
+    private val lastPbZeroWarnAtMs = HashMap<String, Long>()
 
     // Bounded in-memory learned quota endpoints discovered during foreground inspection
     private val learnedEndpointsLock = Any()
@@ -425,6 +436,25 @@ object QuotaCoreEngine {
         try {
             Log.i(LOG_TAG, msg)
         } catch (_: Throwable) {
+        }
+    }
+
+    private fun warnLog(bridge: HookBridge?, msg: String) {
+        try {
+            bridge?.log("[BardQuota][WARN] $msg")
+        } catch (_: Throwable) {
+        }
+        try {
+            Log.w(LOG_TAG, msg)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun formatTimestampMs(ms: Long): String {
+        return try {
+            SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date(ms))
+        } catch (_: Throwable) {
+            ms.toString()
         }
     }
 
@@ -1190,6 +1220,10 @@ object QuotaCoreEngine {
             val prevSnap = latestSnapshot.get().sanitized()
             if (curPrev != DEFAULT_SESSION_TAG && prevSnap.hasLiveData) {
                 perSessionSnapshots[curPrev] = prevSnap
+                if (hasNonZeroQuotaData(prevSnap)) {
+                    cachedNonZeroSnapshots[curPrev] = prevSnap.copy(isStaleOffline = false)
+                    cachedNonZeroTimestamps[curPrev] = System.currentTimeMillis()
+                }
             }
 
             activeSessionTag.set(newTag)
@@ -1202,6 +1236,10 @@ object QuotaCoreEngine {
                 cachedForNew != null -> cachedForNew
                 (curPrev == DEFAULT_SESSION_TAG || preserveUnconfirmedSnapshot) && prevSnap.hasLiveData -> {
                     perSessionSnapshots[newTag] = prevSnap
+                    if (hasNonZeroQuotaData(prevSnap)) {
+                        cachedNonZeroSnapshots[newTag] = prevSnap.copy(isStaleOffline = false)
+                        cachedNonZeroTimestamps[newTag] = System.currentTimeMillis()
+                    }
                     prevSnap
                 }
                 else -> {
@@ -3491,6 +3529,25 @@ object QuotaCoreEngine {
         return metric == "0%" || metric.startsWith("0/")
     }
 
+    private fun isNonZeroMetric(metric: String): Boolean {
+        return metric != "--" && !isZeroMetric(metric)
+    }
+
+    private fun hasNonZeroQuotaData(snap: QuotaHudView.Snapshot): Boolean {
+        return isNonZeroMetric(snap.fiveHourQuota) || isNonZeroMetric(snap.weeklyLimit)
+    }
+
+    private fun snapshotHasZeroRatio(snap: QuotaHudView.Snapshot): Boolean {
+        return isZeroMetric(snap.fiveHourQuota) || isZeroMetric(snap.weeklyLimit)
+    }
+
+    private fun isProtobufSource(source: String): Boolean {
+        return source == "Cronet-PB" ||
+            source == "gRPC-PB" ||
+            source == "OkHttp-PB" ||
+            source.endsWith("-PB")
+    }
+
     private fun isDirectQuotaSurfaceSource(source: String): Boolean {
         return source == "WebView-DOM" ||
             source == "InApp-Dialog" ||
@@ -3504,6 +3561,10 @@ object QuotaCoreEngine {
 
         var cleanToApply = rawClean
         var shouldUpdateActiveHud = false
+        var warningToEmit: String? = null
+        var recoveryToLog: String? = null
+        var zeroGuardDevEvent: (() -> Unit)? = null
+
         synchronized(sessionSnapshotsLock) {
             val prevForSession = if (sessionTag == activeSessionTag.get()) {
                 latestSnapshot.get().sanitized()
@@ -3518,54 +3579,194 @@ object QuotaCoreEngine {
                 return
             }
 
-            // Anti-zeroing monotonicity guard: never let unverified memory/protobuf/AF scans
-            // overwrite an active non-zero window with "0%", and on direct quota surfaces only
-            // accept "0%" if there was no prior non-zero metric or the reset window actually rolled over.
-            val directSource = isDirectQuotaSurfaceSource(rawClean.source)
-            val fivePrevNonZero = prevForSession.fiveHourQuota != "--" && !isZeroMetric(prevForSession.fiveHourQuota)
-            val weekPrevNonZero = prevForSession.weeklyLimit != "--" && !isZeroMetric(prevForSession.weeklyLimit)
+            // In-memory Protobuf zero-debounce guard:
+            // When Protobuf returns a 0% / 0 ratio while a valid non-zero quota snapshot was
+            // previously cached in memory, emit a warning log + Dev Console "归零防护已触发" event
+            // and temporarily hold the last cached non-zero numbers in HUD offline/gray mode.
+            if (isProtobufSource(rawClean.source) && snapshotHasZeroRatio(rawClean)) {
+                val cachedFromSession = cachedNonZeroSnapshots[sessionTag]?.takeIf { hasNonZeroQuotaData(it) }
+                val cachedFromDefault = cachedNonZeroSnapshots[DEFAULT_SESSION_TAG]?.takeIf { hasNonZeroQuotaData(it) }
+                val cachedNonZero = cachedFromSession
+                    ?: cachedFromDefault
+                    ?: prevForSession.takeIf { hasNonZeroQuotaData(it) }?.copy(isStaleOffline = false)
 
-            val fiveResetUnchanged = prevForSession.fiveHourReset != "--" &&
-                (rawClean.fiveHourReset == "--" || rawClean.fiveHourReset == prevForSession.fiveHourReset)
-            val weekResetUnchanged = prevForSession.weeklyReset != "--" &&
-                (rawClean.weeklyReset == "--" || rawClean.weeklyReset == prevForSession.weeklyReset)
+                val cachedAtMs = when {
+                    cachedFromSession != null -> cachedNonZeroTimestamps[sessionTag] ?: System.currentTimeMillis()
+                    cachedFromDefault != null -> cachedNonZeroTimestamps[DEFAULT_SESSION_TAG] ?: System.currentTimeMillis()
+                    else -> System.currentTimeMillis()
+                }
+                val cachedTimeStr = formatTimestampMs(cachedAtMs)
 
-            val safeFive = if (isZeroMetric(rawClean.fiveHourQuota) &&
-                (!directSource || (fivePrevNonZero && fiveResetUnchanged))
-            ) {
-                if (fivePrevNonZero) prevForSession.fiveHourQuota else "--"
+                val zeroedFiveWithCache = isZeroMetric(rawClean.fiveHourQuota) &&
+                    cachedNonZero != null && isNonZeroMetric(cachedNonZero.fiveHourQuota)
+                val zeroedWeekWithCache = isZeroMetric(rawClean.weeklyLimit) &&
+                    cachedNonZero != null && isNonZeroMetric(cachedNonZero.weeklyLimit)
+
+                if (cachedNonZero != null && (zeroedFiveWithCache || zeroedWeekWithCache)) {
+                    val now = System.currentTimeMillis()
+                    val lastWarn = lastPbZeroWarnAtMs[sessionTag] ?: 0L
+                    val isBurstChunk = (now - lastWarn) < 350L
+                    val hits = if (isBurstChunk) {
+                        maxOf(1, pbZeroDebounceHits[sessionTag] ?: 1)
+                    } else {
+                        ((pbZeroDebounceHits[sessionTag] ?: 0) + 1).also {
+                            pbZeroDebounceHits[sessionTag] = it
+                            lastPbZeroWarnAtMs[sessionTag] = now
+                        }
+                    }
+
+                    val retainedFive = if (isZeroMetric(rawClean.fiveHourQuota) && isNonZeroMetric(cachedNonZero.fiveHourQuota)) {
+                        cachedNonZero.fiveHourQuota
+                    } else if (rawClean.fiveHourQuota != "--" && !isZeroMetric(rawClean.fiveHourQuota)) {
+                        rawClean.fiveHourQuota
+                    } else {
+                        cachedNonZero.fiveHourQuota
+                    }
+
+                    val retainedWeek = if (isZeroMetric(rawClean.weeklyLimit) && isNonZeroMetric(cachedNonZero.weeklyLimit)) {
+                        cachedNonZero.weeklyLimit
+                    } else if (rawClean.weeklyLimit != "--" && !isZeroMetric(rawClean.weeklyLimit)) {
+                        rawClean.weeklyLimit
+                    } else {
+                        cachedNonZero.weeklyLimit
+                    }
+
+                    val heldOfflineSnap = cachedNonZero.copy(
+                        fiveHourQuota = retainedFive,
+                        fiveHourReset = if (rawClean.fiveHourReset != "--") rawClean.fiveHourReset else cachedNonZero.fiveHourReset,
+                        weeklyLimit = retainedWeek,
+                        weeklyReset = if (rawClean.weeklyReset != "--") rawClean.weeklyReset else cachedNonZero.weeklyReset,
+                        source = cachedNonZero.source,
+                        isStaleOffline = true
+                    ).sanitized()
+
+                    val wkResetZh = QuotaTextParser.formatWeeklyResetForDisplay(heldOfflineSnap.weeklyReset, true)
+                    val wkResetEn = QuotaTextParser.formatWeeklyResetForDisplay(heldOfflineSnap.weeklyReset, false)
+                    val restoredSummaryZh = "5h=$retainedFive (${heldOfflineSnap.fiveHourReset}), 每周=$retainedWeek ($wkResetZh)"
+                    val restoredSummaryEn = "5h=$retainedFive (${heldOfflineSnap.fiveHourReset}), Weekly=$retainedWeek ($wkResetEn)"
+
+                    if (!isBurstChunk) {
+                        warningToEmit = "[归零防护已触发] source=${rawClean.source} | 触发次数=#$hits | " +
+                            "缓存快照时间戳=$cachedTimeStr | 已恢复的数值: $restoredSummaryZh (session=$sessionTag)"
+                        val ctxCopy = appContext
+                        if (ctxCopy != null) {
+                            val srcCopy = rawClean.source
+                            val detailZhCopy = "归零防护已触发 (第 $hits 次)：${srcCopy} 返回 0 [5h=${rawClean.fiveHourQuota}, 每周=${rawClean.weeklyLimit}]，" +
+                                "已调用缓存补偿 | 缓存快照时间戳: $cachedTimeStr | 已恢复的数值: $restoredSummaryZh"
+                            val detailEnCopy = "Zero-Guard Triggered (#$hits): $srcCopy returned 0 [5h=${rawClean.fiveHourQuota}, Weekly=${rawClean.weeklyLimit}], " +
+                                "cache compensation applied | Cached Snapshot Timestamp: $cachedTimeStr | Restored Values: $restoredSummaryEn"
+                            zeroGuardDevEvent = {
+                                submitForegroundWork {
+                                    QuotaSyncProvider.recordZeroGuardTriggeredEvent(
+                                        context = ctxCopy,
+                                        sessionId = sessionTag,
+                                        source = srcCopy,
+                                        cachedAtMs = cachedAtMs,
+                                        restoredQuota = restoredSummaryZh,
+                                        detailZh = detailZhCopy,
+                                        detailEn = detailEnCopy,
+                                        triggerCount = hits
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    val changed = heldOfflineSnap != prevForSession
+                    if (sessionTag != DEFAULT_SESSION_TAG) {
+                        perSessionSnapshots[sessionTag] = heldOfflineSnap
+                    }
+                    if (sessionTag == activeSessionTag.get()) {
+                        latestSnapshot.set(heldOfflineSnap)
+                        shouldUpdateActiveHud = changed || !prevForSession.isStaleOffline
+                    }
+                    cleanToApply = heldOfflineSnap
+                } else {
+                    // Reject uncached transient Protobuf 0% noise if no cached non-zero snapshot exists
+                    return
+                }
             } else {
-                rawClean.fiveHourQuota
-            }
+                // Anti-zeroing monotonicity guard: never let unverified memory/protobuf/AF scans
+                // overwrite an active non-zero window with "0%", and on direct quota surfaces only
+                // accept "0%" if there was no prior non-zero metric or the reset window actually rolled over.
+                val directSource = isDirectQuotaSurfaceSource(rawClean.source)
+                val fivePrevNonZero = prevForSession.fiveHourQuota != "--" && !isZeroMetric(prevForSession.fiveHourQuota)
+                val weekPrevNonZero = prevForSession.weeklyLimit != "--" && !isZeroMetric(prevForSession.weeklyLimit)
 
-            val safeWeek = if (isZeroMetric(rawClean.weeklyLimit) &&
-                (!directSource || (weekPrevNonZero && weekResetUnchanged))
-            ) {
-                if (weekPrevNonZero) prevForSession.weeklyLimit else "--"
-            } else {
-                rawClean.weeklyLimit
-            }
+                val fiveResetUnchanged = prevForSession.fiveHourReset != "--" &&
+                    (rawClean.fiveHourReset == "--" || rawClean.fiveHourReset == prevForSession.fiveHourReset)
+                val weekResetUnchanged = prevForSession.weeklyReset != "--" &&
+                    (rawClean.weeklyReset == "--" || rawClean.weeklyReset == prevForSession.weeklyReset)
 
-            cleanToApply = rawClean.copy(
-                fiveHourQuota = safeFive,
-                weeklyLimit = safeWeek
-            ).sanitized()
+                val safeFive = if (isZeroMetric(rawClean.fiveHourQuota) &&
+                    (!directSource || (fivePrevNonZero && fiveResetUnchanged))
+                ) {
+                    if (fivePrevNonZero) prevForSession.fiveHourQuota else "--"
+                } else {
+                    rawClean.fiveHourQuota
+                }
 
-            if (!cleanToApply.hasLiveData || cleanToApply == prevForSession) return
+                val safeWeek = if (isZeroMetric(rawClean.weeklyLimit) &&
+                    (!directSource || (weekPrevNonZero && weekResetUnchanged))
+                ) {
+                    if (weekPrevNonZero) prevForSession.weeklyLimit else "--"
+                } else {
+                    rawClean.weeklyLimit
+                }
 
-            if (sessionTag != DEFAULT_SESSION_TAG) {
-                perSessionSnapshots[sessionTag] = cleanToApply
+                val candidateClean = rawClean.copy(
+                    fiveHourQuota = safeFive,
+                    weeklyLimit = safeWeek,
+                    isStaleOffline = false
+                ).sanitized()
+
+                if (!candidateClean.hasLiveData) return
+
+                // Preserve existing stale-offline state if incoming non-direct update didn't actually
+                // supply any live non-zero metric improvement; clear stale-offline once live non-zero data arrives.
+                val clearOffline = hasNonZeroQuotaData(candidateClean) || directSource
+                cleanToApply = candidateClean.copy(
+                    isStaleOffline = if (clearOffline) false else prevForSession.isStaleOffline
+                )
+
+                if (cleanToApply == prevForSession) return
+
+                if (hasNonZeroQuotaData(cleanToApply) && !cleanToApply.isStaleOffline) {
+                    val cacheNow = System.currentTimeMillis()
+                    cachedNonZeroSnapshots[sessionTag] = cleanToApply
+                    cachedNonZeroTimestamps[sessionTag] = cacheNow
+                    if (sessionTag != DEFAULT_SESSION_TAG) {
+                        cachedNonZeroSnapshots[DEFAULT_SESSION_TAG] = cleanToApply
+                        cachedNonZeroTimestamps[DEFAULT_SESSION_TAG] = cacheNow
+                    }
+                    if (prevForSession.isStaleOffline) {
+                        recoveryToLog = "Recovered live non-zero quota [5h=${cleanToApply.fiveHourQuota}, wk=${cleanToApply.weeklyLimit}]; cleared HUD offline state (session=$sessionTag)"
+                    }
+                }
+
+                if (sessionTag != DEFAULT_SESSION_TAG) {
+                    perSessionSnapshots[sessionTag] = cleanToApply
+                }
+                if (sessionTag == activeSessionTag.get()) {
+                    latestSnapshot.set(cleanToApply)
+                    shouldUpdateActiveHud = true
+                }
             }
-            if (sessionTag == activeSessionTag.get()) {
-                latestSnapshot.set(cleanToApply)
-                shouldUpdateActiveHud = true
-            }
+        }
+
+        if (warningToEmit != null) {
+            warnLog(activeBridgeRef.get(), warningToEmit!!)
+        }
+        zeroGuardDevEvent?.invoke()
+        if (recoveryToLog != null) {
+            safeLog(activeBridgeRef.get(), recoveryToLog!!)
         }
 
         if (!shouldUpdateActiveHud) return
 
+        // Persist last verified live numbers cleanly (keep cached metrics, never lock disk mirror offline)
         saveSanitizedHostMirror(
-            cleanToApply,
+            cleanToApply.copy(isStaleOffline = false),
             currentLang.get(),
             currentTheme.get(),
             sessionTag,
@@ -3612,7 +3813,8 @@ object QuotaCoreEngine {
                 fiveHourReset = prefs.getString("five_reset", "--") ?: "--",
                 weeklyLimit = prefs.getString("week", "--") ?: "--",
                 weeklyReset = prefs.getString("week_reset", "--") ?: "--",
-                source = prefs.getString("src", "InAppCache") ?: "InAppCache"
+                source = prefs.getString("src", "InAppCache") ?: "InAppCache",
+                isStaleOffline = false
             ).sanitized()
 
             if (clean.hasLiveData) {
@@ -3621,6 +3823,13 @@ object QuotaCoreEngine {
                     val s = activeSessionTag.get()
                     if (s != DEFAULT_SESSION_TAG) {
                         perSessionSnapshots[s] = clean
+                    }
+                    if (hasNonZeroQuotaData(clean)) {
+                        val now = System.currentTimeMillis()
+                        cachedNonZeroSnapshots[s] = clean
+                        cachedNonZeroTimestamps[s] = now
+                        cachedNonZeroSnapshots[DEFAULT_SESSION_TAG] = clean
+                        cachedNonZeroTimestamps[DEFAULT_SESSION_TAG] = now
                     }
                 }
             }
@@ -3717,7 +3926,18 @@ object QuotaCoreEngine {
                 curSnap != cleanSnap &&
                 (!curSnap.hasLiveData || (curSnap.source == "SessionEstimate" && cleanSnap.source != "SessionEstimate"))
             if (canUpgradeFromProvider) {
-                latestSnapshot.set(cleanSnap)
+                synchronized(sessionSnapshotsLock) {
+                    latestSnapshot.set(cleanSnap)
+                    if (hasNonZeroQuotaData(cleanSnap) && !cleanSnap.isStaleOffline) {
+                        val now = System.currentTimeMillis()
+                        cachedNonZeroSnapshots[curSess] = cleanSnap
+                        cachedNonZeroTimestamps[curSess] = now
+                        if (curSess != DEFAULT_SESSION_TAG) {
+                            cachedNonZeroSnapshots[DEFAULT_SESSION_TAG] = cleanSnap
+                            cachedNonZeroTimestamps[DEFAULT_SESSION_TAG] = now
+                        }
+                    }
+                }
                 uiChanged = true
             }
         }

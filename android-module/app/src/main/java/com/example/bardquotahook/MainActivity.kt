@@ -19,6 +19,8 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
@@ -37,11 +39,24 @@ class MainActivity : Activity() {
     private var hookStatusView: TextView? = null
     private var quotaPreviewView: TextView? = null
     private var engineDescView: TextView? = null
+    private var devConsoleTitleView: TextView? = null
+    private var devConsoleCountView: TextView? = null
+    private var devConsoleClearBtn: Button? = null
+    private var devConsoleLogsView: TextView? = null
     private var launchGeminiBtn: Button? = null
 
     private var stateObserver: ContentObserver? = null
     private var bardInstalled = false
     private var gsaInstalled = false
+
+    private fun formatLogTime(ms: Long): String {
+        if (ms <= 0L) return "--"
+        return try {
+            SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date(ms))
+        } catch (_: Throwable) {
+            ms.toString()
+        }
+    }
 
     private fun dp(v: Float): Int = QuotaHudView.dp(this, v)
 
@@ -181,6 +196,35 @@ class MainActivity : Activity() {
             "$label5h: ${snap.formatFiveHourDisplay()}   |   $labelWk: ${snap.formatWeeklyDisplay(state.lang)}   [${snap.source}]"
 
         engineDescView?.text = loc.getString(R.string.settings_sync_desc)
+
+        val entries = QuotaSyncProvider.parseDevConsoleLogs(state.devLogsJson)
+        val zeroCount = maxOf(state.zeroGuardCount, entries.count { it.eventType == "ZERO_GUARD" })
+        devConsoleTitleView?.text = if (zh) "开发者控制台 (Dev Console)" else "Developer Console"
+        devConsoleCountView?.text = if (zh) {
+            "归零防护已触发: $zeroCount 次"
+        } else {
+            "Zero-Guard Triggered: $zeroCount"
+        }
+        devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
+        devConsoleLogsView?.text = if (entries.isEmpty()) {
+            if (zh) {
+                "暂无「归零防护已触发」事件记录。\n当 Protobuf 返回 0 且存在历史非零缓存时，此处将打印缓存快照时间戳与已恢复的数值。"
+            } else {
+                "No ZERO_GUARD_TRIGGERED events recorded yet.\nWhen Protobuf returns 0 while valid cached quota exists, the cache timestamp & restored values appear here."
+            }
+        } else {
+            entries.joinToString("\n\n") { entry ->
+                val evtTag = if (zh) "[归零防护已触发 #${entry.triggerCount}]" else "[ZERO_GUARD_TRIGGERED #${entry.triggerCount}]"
+                val evtTs = formatLogTime(entry.eventTimeMs)
+                val cachedTs = formatLogTime(entry.cachedAtMs)
+                if (zh) {
+                    "$evtTs $evtTag [${entry.source}]\n缓存快照时间戳: $cachedTs\n已恢复的数值: ${entry.restoredQuota}"
+                } else {
+                    "$evtTs $evtTag [${entry.source}]\nCached Snapshot Timestamp: $cachedTs\nRestored Values: ${entry.restoredQuota}"
+                }
+            }
+        }
+
         launchGeminiBtn?.text = loc.getString(R.string.settings_launch_gemini)
     }
 
@@ -393,6 +437,72 @@ class MainActivity : Activity() {
         diagCard.addView(quotaTv)
         diagCard.addView(descTv)
 
+        // 2.5 On-Device Developer Console Card (Zero-Guard Frequency & Restored Snapshot Telemetry)
+        val devCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = makeCardDrawable("#0F172A", "#334155")
+            val p = dp(14f)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(12f)
+            }
+        }
+
+        val devHeaderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val devTitle = TextView(this).apply {
+            setTextColor(Color.parseColor("#F1F5F9"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        devConsoleTitleView = devTitle
+
+        val devCount = TextView(this).apply {
+            setTextColor(Color.parseColor("#FBBF24"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, dp(8f), 0)
+        }
+        devConsoleCountView = devCount
+
+        val devClear = Button(this).apply {
+            isAllCaps = false
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            background = makeBtnDrawable("#1E293B", "#475569")
+            setPadding(dp(10f), dp(4f), dp(10f), dp(4f))
+            minimumHeight = 0
+            minHeight = dp(28f)
+            setOnClickListener {
+                QuotaSyncProvider.clearDevConsoleLogs(this@MainActivity)
+                refreshAllUi()
+            }
+        }
+        devConsoleClearBtn = devClear
+
+        devHeaderRow.addView(devTitle)
+        devHeaderRow.addView(devCount)
+        devHeaderRow.addView(devClear)
+
+        val devLogsTv = TextView(this).apply {
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            typeface = Typeface.MONOSPACE
+            setLineSpacing(dp(2f).toFloat(), 1.15f)
+            setPadding(0, dp(10f), 0, 0)
+        }
+        devConsoleLogsView = devLogsTv
+
+        devCard.addView(devHeaderRow)
+        devCard.addView(devLogsTv)
+
         // 3. Launch Gemini App Button
         val launchBtn = Button(this).apply {
             isAllCaps = false
@@ -416,6 +526,7 @@ class MainActivity : Activity() {
         container.addView(previewCard)
         container.addView(prefCard)
         container.addView(diagCard)
+        container.addView(devCard)
         container.addView(launchBtn)
         scroll.addView(container)
         setContentView(scroll)

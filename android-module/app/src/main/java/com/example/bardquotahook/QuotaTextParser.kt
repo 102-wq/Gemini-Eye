@@ -700,6 +700,17 @@ object QuotaTextParser {
             if (pctStr != "--") return pctStr to 1
         }
 
+        // 5. Hinted 0.0 float/double ratio so QuotaCoreEngine Protobuf zero-debounce can detect transient zeros
+        if (allowZeroWithHint) {
+            for (sc in scalars) {
+                if (sc.fieldNumber == excludeFieldNum) continue
+                val d = sc.doubleVal ?: continue
+                if ((sc.wireType == 1 || sc.wireType == 5) && d >= 0.0 && d < 0.005) {
+                    return "0%" to 1
+                }
+            }
+        }
+
         return null
     }
 

@@ -25,6 +25,31 @@ import { buildZipBlob } from './zipBuilder';
 type UiLang = 'zh' | 'en';
 type HudTheme = 'MIUIX' | 'MD3';
 type ActiveView = 'simulator' | 'files' | 'spec';
+type DevEventType =
+  | 'APP_OPEN'
+  | 'QUERY_SENT'
+  | 'ACCOUNT_SWITCH'
+  | 'MANUAL_TAP'
+  | 'BACKGROUND_SLEEP'
+  | 'PROTO_SCAN'
+  | 'ZERO_GUARD';
+
+interface CachedSnapshotEntry {
+  cachedAtStr: string;
+  fiveHourQuota: string;
+  fiveHourReset: string;
+  weeklyLimit: string;
+  weeklyReset: string;
+  source: string;
+}
+
+function formatFullTimestampMs(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const padMs = (n: number) => String(n).padStart(3, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours()
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${padMs(date.getMilliseconds())}`;
+}
 
 interface HudSnapshot {
   fiveHourPct: number;
@@ -150,11 +175,41 @@ export default function App() {
   const [usageSheetOpen, setUsageSheetOpen] = useState<boolean>(false);
   const [lastSyncNote, setLastSyncNote] = useState<string>('');
   const [devConsoleOpen, setDevConsoleOpen] = useState<boolean>(false);
+  const [isStaleOffline, setIsStaleOffline] = useState<boolean>(false);
+  const [zeroGuardCount, setZeroGuardCount] = useState<number>(0);
+  const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD'>('ALL');
+  const cachedSnapshotsRef = useRef<Record<string, CachedSnapshotEntry>>({
+    sess_8f3a91c04b12: {
+      cachedAtStr: formatFullTimestampMs(new Date(Date.now() - 18_500)),
+      fiveHourQuota: '15%',
+      fiveHourReset: '1h52m',
+      weeklyLimit: '29%',
+      weeklyReset: '23h52m',
+      source: 'Cronet-PB',
+    },
+    sess_2d7e44b910ca: {
+      cachedAtStr: formatFullTimestampMs(new Date(Date.now() - 42_000)),
+      fiveHourQuota: '42%',
+      fiveHourReset: '3h18m',
+      weeklyLimit: '64%',
+      weeklyReset: '4d12h',
+      source: 'gRPC-PB',
+    },
+    sess_c91b05e781f4: {
+      cachedAtStr: formatFullTimestampMs(new Date(Date.now() - 65_000)),
+      fiveHourQuota: '84%',
+      fiveHourReset: '28m',
+      weeklyLimit: '92%',
+      weeklyReset: '11h05m',
+      source: 'StateFlow',
+    },
+  });
+
   const [devLogs, setDevLogs] = useState<Array<{
     id: string;
     timestamp: string;
     timeMs: string;
-    eventType: 'APP_OPEN' | 'QUERY_SENT' | 'ACCOUNT_SWITCH' | 'MANUAL_TAP' | 'BACKGROUND_SLEEP' | 'PROTO_SCAN';
+    eventType: DevEventType;
     sessionTag: string;
     detailZh: string;
     detailEn: string;
@@ -183,7 +238,7 @@ export default function App() {
   ]);
 
   const logDevEvent = (
-    eventType: 'APP_OPEN' | 'QUERY_SENT' | 'ACCOUNT_SWITCH' | 'MANUAL_TAP' | 'BACKGROUND_SLEEP' | 'PROTO_SCAN',
+    eventType: DevEventType,
     sessionTag: string,
     detailZh: string,
     detailEn: string,
@@ -245,6 +300,13 @@ export default function App() {
     [selectedAccountId]
   );
 
+  const visibleDevLogs = useMemo(() => {
+    if (consoleFilter === 'ZERO_GUARD') {
+      return devLogs.filter((l) => l.eventType === 'ZERO_GUARD');
+    }
+    return devLogs;
+  }, [devLogs, consoleFilter]);
+
   // Update mini progress bar fill widths via DOM refs (no inline style props)
   useEffect(() => {
     const w5 = `${Math.max(8, Math.min(100, activeSession.parsed.fiveHourPct))}%`;
@@ -253,7 +315,7 @@ export default function App() {
     if (barWeeklyRef.current) barWeeklyRef.current.style.width = wWk;
     if (settingsBar5hRef.current) settingsBar5hRef.current.style.width = w5;
     if (settingsBarWeeklyRef.current) settingsBarWeeklyRef.current.style.width = wWk;
-  }, [activeSession, activeView, isGeminiForeground]);
+  }, [activeSession, activeView, isGeminiForeground, isStaleOffline]);
 
   const handleDownloadZip = () => {
     const blob = buildZipBlob(
@@ -280,8 +342,53 @@ export default function App() {
     setTimeout(() => setCopiedPath(null), 1800);
   };
 
+  const recordCachedNonZeroSnapshot = (acct: SimulatedAccountSession) => {
+    cachedSnapshotsRef.current[acct.sessionTag] = {
+      cachedAtStr: formatFullTimestampMs(new Date()),
+      fiveHourQuota: acct.parsed.fiveHourQuota,
+      fiveHourReset: acct.parsed.fiveHourReset,
+      weeklyLimit: acct.parsed.weeklyLimit,
+      weeklyReset: acct.parsed.weeklyReset,
+      source: acct.parsed.source,
+    };
+  };
+
+  const handleSimulateProtobufZeroGuard = () => {
+    const cached = cachedSnapshotsRef.current[activeSession.sessionTag] ?? {
+      cachedAtStr: formatFullTimestampMs(new Date(Date.now() - 12_000)),
+      fiveHourQuota: activeSession.parsed.fiveHourQuota,
+      fiveHourReset: activeSession.parsed.fiveHourReset,
+      weeklyLimit: activeSession.parsed.weeklyLimit,
+      weeklyReset: activeSession.parsed.weeklyReset,
+      source: activeSession.parsed.source,
+    };
+    const nextHit = zeroGuardCount + 1;
+    setZeroGuardCount(nextHit);
+    setIsStaleOffline(true);
+
+    const wkZh = formatWeeklyResetLabel(cached.weeklyReset, 'zh');
+    const wkEn = formatWeeklyResetLabel(cached.weeklyReset, 'en');
+    const restoredZh = `5h=${cached.fiveHourQuota} (${cached.fiveHourReset}), 每周=${cached.weeklyLimit} (${wkZh})`;
+    const restoredEn = `5h=${cached.fiveHourQuota} (${cached.fiveHourReset}), Weekly=${cached.weeklyLimit} (${wkEn})`;
+
+    setLastSyncNote(
+      isZh
+        ? `归零防护已触发 (第 ${nextHit} 次 · ${activeSession.sessionTag})：Protobuf 返回 0%，已从缓存 (${cached.cachedAtStr}) 恢复非零数值，HUD 切换为灰色「离线」提示`
+        : `Zero-Guard Triggered (#${nextHit} · ${activeSession.sessionTag}): Protobuf returned 0%, restored cached non-zero snapshot from ${cached.cachedAtStr} in HUD Offline/Gray mode`
+    );
+
+    logDevEvent(
+      'ZERO_GUARD',
+      activeSession.sessionTag,
+      `归零防护已触发 (第 ${nextHit} 次)：Cronet-PB 返回 0 [5h=0%, 每周=0%]，成功调用缓存补偿 | 缓存快照时间戳: ${cached.cachedAtStr} | 已恢复的数值: ${restoredZh}`,
+      `Zero-Guard Triggered (#${nextHit}): Cronet-PB returned 0 [5h=0%, Weekly=0%], cache compensation applied | Cached Snapshot Timestamp: ${cached.cachedAtStr} | Restored Values: ${restoredEn}`,
+      'warn'
+    );
+  };
+
   const handleSwitchAccount = (acct: SimulatedAccountSession) => {
     setSelectedAccountId(acct.id);
+    setIsStaleOffline(false);
     setIsRefreshingHud(true);
     setLastSyncNote(
       isZh
@@ -297,6 +404,7 @@ export default function App() {
     );
     setTimeout(() => {
       setIsRefreshingHud(false);
+      recordCachedNonZeroSnapshot(acct);
       logDevEvent(
         'PROTO_SCAN',
         acct.sessionTag,
@@ -355,6 +463,8 @@ export default function App() {
     );
     setTimeout(() => {
       setIsRefreshingHud(false);
+      setIsStaleOffline(false);
+      recordCachedNonZeroSnapshot(activeSession);
       logDevEvent(
         'PROTO_SCAN',
         activeSession.sessionTag,
@@ -383,6 +493,8 @@ export default function App() {
     );
     setTimeout(() => {
       setIsRefreshingHud(false);
+      setIsStaleOffline(false);
+      recordCachedNonZeroSnapshot(activeSession);
       logDevEvent(
         'PROTO_SCAN',
         activeSession.sessionTag,
@@ -436,6 +548,7 @@ export default function App() {
   };
 
   const pickBarColorClass = (pct: number) => {
+    if (isStaleOffline) return simDarkTheme ? 'bg-slate-500' : 'bg-slate-400';
     if (pct >= 90) return simDarkTheme ? 'bg-red-400' : 'bg-red-500';
     if (pct >= 75) return simDarkTheme ? 'bg-amber-400' : 'bg-amber-500';
     if (hudTheme === 'MD3') {
@@ -445,6 +558,16 @@ export default function App() {
   };
 
   const capsuleContainerClass = useMemo(() => {
+    if (isStaleOffline) {
+      if (hudTheme === 'MIUIX') {
+        return simDarkTheme
+          ? 'bg-zinc-900/80 backdrop-blur-xl border-slate-500/40 text-slate-400 shadow-lg shadow-black/40'
+          : 'bg-white/85 backdrop-blur-xl border-slate-400/40 text-slate-500 shadow-lg shadow-slate-900/10';
+      }
+      return simDarkTheme
+        ? 'bg-[#292533]/95 border-gray-500/45 text-gray-400 shadow-md shadow-black/40'
+        : 'bg-[#F5EFFB]/95 border-gray-400/50 text-gray-500 shadow-md shadow-indigo-950/10';
+    }
     if (hudTheme === 'MIUIX') {
       return simDarkTheme
         ? 'bg-zinc-900/80 backdrop-blur-xl border-white/20 text-slate-50 shadow-lg shadow-black/40'
@@ -453,14 +576,17 @@ export default function App() {
     return simDarkTheme
       ? 'bg-[#292533]/95 border-[#938F99]/40 text-[#E6E1E5] shadow-md shadow-black/40'
       : 'bg-[#F5EFFB]/95 border-[#CAC4D0]/70 text-[#1D1B20] shadow-md shadow-indigo-950/10';
-  }, [hudTheme, simDarkTheme]);
+  }, [hudTheme, simDarkTheme, isStaleOffline]);
 
   const capsuleLabelClass = useMemo(() => {
+    if (isStaleOffline) {
+      return simDarkTheme ? 'text-slate-400' : 'text-slate-500';
+    }
     if (hudTheme === 'MIUIX') {
       return simDarkTheme ? 'text-slate-400' : 'text-slate-500';
     }
     return simDarkTheme ? 'text-[#CAC4D0]' : 'text-[#49454F]';
-  }, [hudTheme, simDarkTheme]);
+  }, [hudTheme, simDarkTheme, isStaleOffline]);
 
   const capsuleTrackClass = useMemo(() => {
     if (hudTheme === 'MIUIX') {
@@ -470,6 +596,11 @@ export default function App() {
   }, [hudTheme, simDarkTheme]);
 
   const capsuleIconClass = useMemo(() => {
+    if (isStaleOffline) {
+      return simDarkTheme
+        ? 'text-slate-400 hover:bg-white/10 active:bg-white/20'
+        : 'text-slate-500 hover:bg-slate-900/10 active:bg-slate-900/15';
+    }
     if (hudTheme === 'MIUIX') {
       return simDarkTheme
         ? 'text-slate-300 hover:bg-white/15 active:bg-white/25'
@@ -478,7 +609,7 @@ export default function App() {
     return simDarkTheme
       ? 'text-violet-300 hover:bg-violet-300/15 active:bg-violet-300/25'
       : 'text-violet-700 hover:bg-violet-700/10 active:bg-violet-700/20';
-  }, [hudTheme, simDarkTheme]);
+  }, [hudTheme, simDarkTheme, isStaleOffline]);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col lg:flex-row">
@@ -1124,6 +1255,18 @@ export default function App() {
                         {activeSession.parsed.weeklyLimit} ({formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})
                       </span>
 
+                      {isStaleOffline && (
+                        <span
+                          className={`ml-1.5 px-1.5 py-0.5 rounded text-[9px] font-semibold border shrink-0 ${
+                            simDarkTheme
+                              ? 'bg-slate-500/15 text-slate-400 border-slate-500/35'
+                              : 'bg-slate-500/10 text-slate-500 border-slate-400/40'
+                          }`}
+                        >
+                          {hudLang === 'zh' ? '离线' : 'Offline'}
+                        </span>
+                      )}
+
                       <span
                         className={`w-px h-3 ml-2 mr-1 shrink-0 ${
                           simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
@@ -1173,11 +1316,14 @@ export default function App() {
                       <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
                         {devLogs.length} {isZh ? '条事件' : 'events'}
                       </span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-300 border border-orange-500/30">
+                        {isZh ? `归零防护: ${zeroGuardCount} 次` : `Zero-Guard: ${zeroGuardCount}`}
+                      </span>
                     </span>
                     <span className="text-[11px] text-slate-400 block mt-0.5">
                       {isZh
-                        ? '记录出站头拦截、APP_OPEN 前台激活、QUERY_SENT 提问流、ACCOUNT_SWITCH 切号等事件与毫秒时间戳'
-                        : 'Logs APP_OPEN, QUERY_SENT, ACCOUNT_SWITCH, and ProtoBuf scans with millisecond timestamps'}
+                        ? '记录出站头拦截、APP_OPEN 前台激活、QUERY_SENT 提问流、归零防护已触发（含缓存时间戳与恢复值）与毫秒时间戳'
+                        : 'Logs APP_OPEN, QUERY_SENT, ACCOUNT_SWITCH, ZERO_GUARD_TRIGGERED (with cache timestamp & restored values), and ProtoBuf scans'}
                     </span>
                   </div>
                 </div>
@@ -1200,7 +1346,7 @@ export default function App() {
                 <div className="p-4 space-y-3">
                   {/* Console Header Bar */}
                   <div className="flex flex-wrap items-center justify-between gap-2 px-1 text-xs">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-slate-400">
                         <Activity className="w-3.5 h-3.5 text-emerald-400" />
                         <span>Active Session:</span>
@@ -1210,9 +1356,42 @@ export default function App() {
                       <span className="text-[11px] text-slate-400 font-mono">
                         Foreground: <strong className={isGeminiForeground ? 'text-emerald-400' : 'text-amber-400'}>{isGeminiForeground ? 'true' : 'false (0 threads)'}</strong>
                       </span>
+                      <span className="text-slate-700">|</span>
+                      <div className="inline-flex items-center gap-1 bg-slate-950 p-0.5 rounded border border-slate-800">
+                        <button
+                          type="button"
+                          onClick={() => setConsoleFilter('ALL')}
+                          className={`px-2 py-0.5 text-[10px] rounded transition-colors cursor-pointer ${
+                            consoleFilter === 'ALL'
+                              ? 'bg-slate-800 text-slate-100 font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {isZh ? '全部日志' : 'All'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConsoleFilter('ZERO_GUARD')}
+                          className={`px-2 py-0.5 text-[10px] rounded transition-colors cursor-pointer ${
+                            consoleFilter === 'ZERO_GUARD'
+                              ? 'bg-orange-500/20 text-orange-300 font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {isZh ? `仅归零防护 (${zeroGuardCount})` : `Zero-Guard (${zeroGuardCount})`}
+                        </button>
+                      </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleSimulateProtobufZeroGuard}
+                        className="px-2.5 py-1 text-[11px] rounded bg-orange-950/60 hover:bg-orange-900/60 text-orange-200 border border-orange-700/60 transition-colors cursor-pointer"
+                      >
+                        {isZh ? '模拟 Protobuf 归零防护' : 'Simulate Protobuf 0% Guard'}
+                      </button>
+
                       <button
                         type="button"
                         onClick={() =>
@@ -1231,7 +1410,11 @@ export default function App() {
 
                       <button
                         type="button"
-                        onClick={() => setDevLogs([])}
+                        onClick={() => {
+                          setDevLogs([]);
+                          setZeroGuardCount(0);
+                          setIsStaleOffline(false);
+                        }}
                         className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-slate-800 hover:bg-red-950/40 text-slate-300 hover:text-red-300 border border-slate-700 hover:border-red-800 transition-colors cursor-pointer"
                         title={isZh ? '清空控制台日志' : 'Clear console logs'}
                       >
@@ -1243,16 +1426,22 @@ export default function App() {
 
                   {/* Terminal Log Stream Area */}
                   <div className="bg-slate-950 border border-slate-800/80 rounded-xl p-3 max-h-72 overflow-y-auto font-mono text-xs space-y-1.5 shadow-inner">
-                    {devLogs.length === 0 ? (
+                    {visibleDevLogs.length === 0 ? (
                       <div className="text-center py-8 text-slate-500 text-xs">
-                        {isZh
-                          ? '控制台暂无事件记录。在上方切换账号、发送提问或切换前后台状态以产生事件。'
-                          : 'No events logged. Switch accounts, send queries, or toggle foreground state to capture events.'}
+                        {consoleFilter === 'ZERO_GUARD'
+                          ? isZh
+                            ? '暂无「归零防护已触发」事件记录。点击右上角「模拟 Protobuf 归零防护」即可验证缓存快照时间戳与数值恢复。'
+                            : 'No ZERO_GUARD_TRIGGERED events yet. Click "Simulate Protobuf 0% Guard" to inspect cache timestamp & value recovery.'
+                          : isZh
+                          ? '控制台暂无事件记录。在上方切换账号、发送提问或触发归零防护模拟以产生事件。'
+                          : 'No events logged. Switch accounts, send queries, or simulate Zero-Guard to capture events.'}
                       </div>
                     ) : (
-                      devLogs.map((log) => {
+                      visibleDevLogs.map((log) => {
                         const badgeColor =
-                          log.eventType === 'APP_OPEN'
+                          log.eventType === 'ZERO_GUARD'
+                            ? 'bg-orange-500/20 text-orange-300 border-orange-500/40'
+                            : log.eventType === 'APP_OPEN'
                             ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                             : log.eventType === 'QUERY_SENT'
                             ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
@@ -1264,19 +1453,30 @@ export default function App() {
                             ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
                             : 'bg-zinc-700/40 text-zinc-300 border-zinc-600/40';
 
+                        const eventLabel =
+                          log.eventType === 'ZERO_GUARD'
+                            ? isZh
+                              ? '归零防护已触发'
+                              : 'ZERO_GUARD_TRIGGERED'
+                            : log.eventType;
+
                         return (
                           <div
                             key={log.id}
-                            className="flex items-start gap-2.5 py-1 px-1.5 rounded hover:bg-slate-900/60 transition-colors"
+                            className={`flex items-start gap-2.5 py-1 px-1.5 rounded transition-colors ${
+                              log.eventType === 'ZERO_GUARD'
+                                ? 'bg-orange-950/20 hover:bg-orange-950/35'
+                                : 'hover:bg-slate-900/60'
+                            }`}
                           >
                             <span className="text-[11px] text-slate-500 shrink-0 select-none">
                               {log.timeMs}
                             </span>
 
                             <span
-                              className={`text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded border shrink-0 ${badgeColor}`}
+                              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${badgeColor}`}
                             >
-                              {log.eventType}
+                              {eventLabel}
                             </span>
 
                             <span className="text-[11px] text-slate-400 shrink-0 font-mono">

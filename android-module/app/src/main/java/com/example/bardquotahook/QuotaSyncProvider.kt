@@ -10,6 +10,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicReference
 
@@ -25,6 +27,18 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class QuotaSyncProvider : ContentProvider() {
 
+    data class DevConsoleLogEntry(
+        val eventType: String = "ZERO_GUARD",
+        val eventTimeMs: Long = 0L,
+        val cachedAtMs: Long = 0L,
+        val sessionId: String = "",
+        val source: String = "",
+        val restoredQuota: String = "",
+        val triggerCount: Int = 0,
+        val detailZh: String = "",
+        val detailEn: String = ""
+    )
+
     data class UnifiedState(
         val snapshot: QuotaHudView.Snapshot = QuotaHudView.Snapshot(),
         val sessionId: String = "",
@@ -37,7 +51,9 @@ class QuotaSyncProvider : ContentProvider() {
         val lastPkg: String = "",
         val lastProc: String = "",
         val lastBridge: String = "",
-        val overlayEnabled: Boolean = false
+        val overlayEnabled: Boolean = false,
+        val zeroGuardCount: Int = 0,
+        val devLogsJson: String = "[]"
     ) {
         val isActivelyBound: Boolean
             get() = xposedBound &&
@@ -52,6 +68,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putString(KEY_WEEK, clean.weeklyLimit)
                 putString(KEY_WEEK_RESET, clean.weeklyReset)
                 putString(KEY_SRC, clean.source)
+                putBoolean(KEY_STALE_OFFLINE, clean.isStaleOffline)
                 putString(KEY_SESSION_ID, sessionId)
                 putString(KEY_LANG, lang.code)
                 putString(KEY_THEME, theme.code)
@@ -63,6 +80,8 @@ class QuotaSyncProvider : ContentProvider() {
                 putString(KEY_LAST_PROC, lastProc)
                 putString(KEY_LAST_BRIDGE, lastBridge)
                 putBoolean(KEY_OVERLAY_ENABLED, false)
+                putInt(KEY_ZERO_GUARD_COUNT, zeroGuardCount)
+                putString(KEY_DEV_LOGS_JSON, devLogsJson)
             }
         }
 
@@ -74,7 +93,8 @@ class QuotaSyncProvider : ContentProvider() {
                     fiveHourReset = bundle.getString(KEY_FIVE_RESET, "--") ?: "--",
                     weeklyLimit = bundle.getString(KEY_WEEK, "--") ?: "--",
                     weeklyReset = bundle.getString(KEY_WEEK_RESET, "--") ?: "--",
-                    source = bundle.getString(KEY_SRC, "UnifiedStore") ?: "UnifiedStore"
+                    source = bundle.getString(KEY_SRC, "UnifiedStore") ?: "UnifiedStore",
+                    isStaleOffline = bundle.getBoolean(KEY_STALE_OFFLINE, false)
                 ).sanitized()
                 return UnifiedState(
                     snapshot = snap,
@@ -88,7 +108,9 @@ class QuotaSyncProvider : ContentProvider() {
                     lastPkg = bundle.getString(KEY_LAST_PKG, "") ?: "",
                     lastProc = bundle.getString(KEY_LAST_PROC, "") ?: "",
                     lastBridge = bundle.getString(KEY_LAST_BRIDGE, "") ?: "",
-                    overlayEnabled = false
+                    overlayEnabled = false,
+                    zeroGuardCount = bundle.getInt(KEY_ZERO_GUARD_COUNT, 0),
+                    devLogsJson = bundle.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
                 )
             }
         }
@@ -112,7 +134,8 @@ class QuotaSyncProvider : ContentProvider() {
                         fiveHourReset = extras?.getString(KEY_FIVE_RESET, "--") ?: "--",
                         weeklyLimit = extras?.getString(KEY_WEEK, "--") ?: "--",
                         weeklyReset = extras?.getString(KEY_WEEK_RESET, "--") ?: "--",
-                        source = extras?.getString(KEY_SRC, "InAppHook") ?: "InAppHook"
+                        source = extras?.getString(KEY_SRC, "InAppHook") ?: "InAppHook",
+                        isStaleOffline = extras?.getBoolean(KEY_STALE_OFFLINE, false) ?: false
                     ).sanitized()
                     val incomingSession = extras?.getString(KEY_SESSION_ID)
                     val replaceSession = extras?.getBoolean(KEY_REPLACE_SESSION, false) ?: false
@@ -150,7 +173,8 @@ class QuotaSyncProvider : ContentProvider() {
                         fiveHourReset = extras?.getString(KEY_FIVE_RESET, "--") ?: "--",
                         weeklyLimit = extras?.getString(KEY_WEEK, "--") ?: "--",
                         weeklyReset = extras?.getString(KEY_WEEK_RESET, "--") ?: "--",
-                        source = extras?.getString(KEY_SRC, "InAppHook") ?: "InAppHook"
+                        source = extras?.getString(KEY_SRC, "InAppHook") ?: "InAppHook",
+                        isStaleOffline = extras?.getBoolean(KEY_STALE_OFFLINE, false) ?: false
                     ).sanitized()
 
                     val updated = mutateLocalStore(
@@ -166,6 +190,20 @@ class QuotaSyncProvider : ContentProvider() {
 
                     OverlayHudController.enforceSingleHudExclusivity(appCtx)
                     dispatchForegroundNotifications(appCtx, updated)
+                    updated.toBundle()
+                }
+
+                METHOD_APPEND_DEV_EVENT -> {
+                    val eventJson = extras?.getString(KEY_DEV_EVENT_JSON)
+                    val incrementZeroGuard = extras?.getBoolean(KEY_INCREMENT_ZERO_GUARD, false) ?: false
+                    val updated = appendDevEventLocal(appCtx, eventJson, incrementZeroGuard)
+                    HookTelemetryReceiver.notifyUiListeners()
+                    updated.toBundle()
+                }
+
+                METHOD_CLEAR_DEV_EVENTS -> {
+                    val updated = clearDevEventsLocal(appCtx)
+                    HookTelemetryReceiver.notifyUiListeners()
                     updated.toBundle()
                 }
 
@@ -246,12 +284,15 @@ class QuotaSyncProvider : ContentProvider() {
         const val METHOD_PUT_QUOTA = "put_quota"
         const val METHOD_PUT_PREFS = "put_prefs"
         const val METHOD_HEARTBEAT = "heartbeat"
+        const val METHOD_APPEND_DEV_EVENT = "append_dev_event"
+        const val METHOD_CLEAR_DEV_EVENTS = "clear_dev_events"
 
         const val KEY_FIVE = "five"
         const val KEY_FIVE_RESET = "five_reset"
         const val KEY_WEEK = "week"
         const val KEY_WEEK_RESET = "week_reset"
         const val KEY_SRC = "src"
+        const val KEY_STALE_OFFLINE = "stale_offline"
         const val KEY_SESSION_ID = "session_id"
         const val KEY_REPLACE_SESSION = "replace_session"
         const val KEY_LANG = "ui_lang"
@@ -264,8 +305,13 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_LAST_PROC = "last_proc"
         const val KEY_LAST_BRIDGE = "last_bridge"
         const val KEY_OVERLAY_ENABLED = "overlay_enabled"
+        const val KEY_ZERO_GUARD_COUNT = "zero_guard_count"
+        const val KEY_DEV_LOGS_JSON = "dev_logs_json"
+        const val KEY_DEV_EVENT_JSON = "dev_event_json"
+        const val KEY_INCREMENT_ZERO_GUARD = "increment_zero_guard"
 
         private const val ACTIVE_HOOK_WINDOW_MS = 12 * 60 * 60 * 1000L
+        private const val MAX_DEV_CONSOLE_LOGS = 30
 
         private val stateLock = Any()
         private val cachedState = AtomicReference<UnifiedState?>(null)
@@ -318,7 +364,9 @@ class QuotaSyncProvider : ContentProvider() {
                     lastPkg = prefs.getString(KEY_LAST_PKG, "") ?: "",
                     lastProc = prefs.getString(KEY_LAST_PROC, "") ?: "",
                     lastBridge = prefs.getString(KEY_LAST_BRIDGE, "") ?: "",
-                    overlayEnabled = false
+                    overlayEnabled = false,
+                    zeroGuardCount = prefs.getInt(KEY_ZERO_GUARD_COUNT, 0),
+                    devLogsJson = prefs.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
                 )
                 cachedState.set(loaded)
                 return loaded
@@ -364,7 +412,8 @@ class QuotaSyncProvider : ContentProvider() {
                         fiveHourReset = if (cleanIncoming.fiveHourReset != "--") cleanIncoming.fiveHourReset else prev.snapshot.fiveHourReset,
                         weeklyLimit = if (cleanIncoming.weeklyLimit != "--") cleanIncoming.weeklyLimit else prev.snapshot.weeklyLimit,
                         weeklyReset = if (cleanIncoming.weeklyReset != "--") cleanIncoming.weeklyReset else prev.snapshot.weeklyReset,
-                        source = cleanIncoming.source
+                        source = cleanIncoming.source,
+                        isStaleOffline = cleanIncoming.isStaleOffline
                     ).sanitized()
                 }
                 else -> prev.snapshot
@@ -469,6 +518,7 @@ class QuotaSyncProvider : ContentProvider() {
                         putString(KEY_WEEK, clean.weeklyLimit)
                         putString(KEY_WEEK_RESET, clean.weeklyReset)
                         putString(KEY_SRC, clean.source)
+                        putBoolean(KEY_STALE_OFFLINE, clean.isStaleOffline)
                     }
                 }
                 val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_HEARTBEAT, pkg, extras)
@@ -504,6 +554,7 @@ class QuotaSyncProvider : ContentProvider() {
                         putString(KEY_WEEK, clean.weeklyLimit)
                         putString(KEY_WEEK_RESET, clean.weeklyReset)
                         putString(KEY_SRC, clean.source)
+                        putBoolean(KEY_STALE_OFFLINE, clean.isStaleOffline)
                         putString(KEY_SESSION_ID, sessionId)
                         putBoolean(KEY_REPLACE_SESSION, replaceSession)
                     }
@@ -575,6 +626,155 @@ class QuotaSyncProvider : ContentProvider() {
             if (observer == null) return
             try {
                 context.contentResolver.unregisterContentObserver(observer)
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun parseDevConsoleLogs(rawJson: String?): List<DevConsoleLogEntry> {
+            if (rawJson.isNullOrBlank()) return emptyList()
+            return try {
+                val arr = JSONArray(rawJson)
+                val out = ArrayList<DevConsoleLogEntry>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    out.add(
+                        DevConsoleLogEntry(
+                            eventType = obj.optString("eventType", "ZERO_GUARD"),
+                            eventTimeMs = obj.optLong("eventTimeMs", 0L),
+                            cachedAtMs = obj.optLong("cachedAtMs", 0L),
+                            sessionId = obj.optString("sessionId", ""),
+                            source = obj.optString("source", ""),
+                            restoredQuota = obj.optString("restoredQuota", ""),
+                            triggerCount = obj.optInt("triggerCount", 0),
+                            detailZh = obj.optString("detailZh", ""),
+                            detailEn = obj.optString("detailEn", "")
+                        )
+                    )
+                }
+                out
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        }
+
+        @Synchronized
+        internal fun appendDevEventLocal(
+            appCtx: Context,
+            eventJson: String?,
+            incrementZeroGuard: Boolean
+        ): UnifiedState {
+            val prev = ensureLoaded(appCtx)
+            if (eventJson.isNullOrBlank()) return prev
+
+            val nextCount = if (incrementZeroGuard) prev.zeroGuardCount + 1 else prev.zeroGuardCount
+            val nextArr = JSONArray()
+            try {
+                val incoming = JSONObject(eventJson)
+                if (incrementZeroGuard && !incoming.has("triggerCount")) {
+                    incoming.put("triggerCount", nextCount)
+                }
+                nextArr.put(incoming)
+                val prevArr = JSONArray(prev.devLogsJson.ifBlank { "[]" })
+                val limit = minOf(prevArr.length(), MAX_DEV_CONSOLE_LOGS - 1)
+                for (i in 0 until limit) {
+                    prevArr.optJSONObject(i)?.let { nextArr.put(it) }
+                }
+            } catch (_: Throwable) {
+                return prev
+            }
+
+            val nextJson = nextArr.toString()
+            val next = prev.copy(
+                zeroGuardCount = nextCount,
+                devLogsJson = nextJson
+            )
+            cachedState.set(next)
+
+            try {
+                appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putInt(KEY_ZERO_GUARD_COUNT, nextCount)
+                    .putString(KEY_DEV_LOGS_JSON, nextJson)
+                    .apply()
+            } catch (_: Throwable) {
+            }
+
+            try {
+                appCtx.contentResolver.notifyChange(STATE_URI, null)
+            } catch (_: Throwable) {
+            }
+            return next
+        }
+
+        @Synchronized
+        internal fun clearDevEventsLocal(appCtx: Context): UnifiedState {
+            val prev = ensureLoaded(appCtx)
+            val next = prev.copy(
+                zeroGuardCount = 0,
+                devLogsJson = "[]"
+            )
+            cachedState.set(next)
+
+            try {
+                appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putInt(KEY_ZERO_GUARD_COUNT, 0)
+                    .putString(KEY_DEV_LOGS_JSON, "[]")
+                    .apply()
+            } catch (_: Throwable) {
+            }
+
+            try {
+                appCtx.contentResolver.notifyChange(STATE_URI, null)
+            } catch (_: Throwable) {
+            }
+            return next
+        }
+
+        fun recordZeroGuardTriggeredEvent(
+            context: Context,
+            sessionId: String,
+            source: String,
+            cachedAtMs: Long,
+            restoredQuota: String,
+            detailZh: String,
+            detailEn: String,
+            triggerCount: Int
+        ) {
+            try {
+                val obj = JSONObject().apply {
+                    put("eventType", "ZERO_GUARD")
+                    put("eventTimeMs", System.currentTimeMillis())
+                    put("cachedAtMs", cachedAtMs)
+                    put("sessionId", sessionId)
+                    put("source", source)
+                    put("restoredQuota", restoredQuota)
+                    put("triggerCount", triggerCount)
+                    put("detailZh", detailZh)
+                    put("detailEn", detailEn)
+                }
+                if (isInModuleProcess(context)) {
+                    appendDevEventLocal(context.applicationContext ?: context, obj.toString(), true)
+                    HookTelemetryReceiver.notifyUiListeners()
+                } else {
+                    val extras = Bundle().apply {
+                        putString(KEY_DEV_EVENT_JSON, obj.toString())
+                        putBoolean(KEY_INCREMENT_ZERO_GUARD, true)
+                    }
+                    context.contentResolver.call(AUTHORITY_URI, METHOD_APPEND_DEV_EVENT, null, extras)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun clearDevConsoleLogs(context: Context) {
+            try {
+                if (isInModuleProcess(context)) {
+                    clearDevEventsLocal(context.applicationContext ?: context)
+                    HookTelemetryReceiver.notifyUiListeners()
+                } else {
+                    context.contentResolver.call(AUTHORITY_URI, METHOD_CLEAR_DEV_EVENTS, null, null)
+                }
             } catch (_: Throwable) {
             }
         }
