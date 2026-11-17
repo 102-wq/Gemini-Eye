@@ -577,7 +577,7 @@ object QuotaTextParser {
             if (detectedTs != null) {
                 val windowKind = explicitKindOverride ?: detectedTs.first
                 val resetTok = detectedTs.second
-                val metricPair = extractMetricFromScalars(scalars, tsFieldNum)
+                val metricPair = extractMetricFromScalars(scalars, tsFieldNum, allowZeroWithHint = localHint)
                 if (metricPair != null) {
                     var conf = metricPair.second
                     if (nestedTimestamp != null) conf += 1
@@ -636,19 +636,21 @@ object QuotaTextParser {
 
     private fun extractMetricFromScalars(
         scalars: List<ScalarEntry>,
-        excludeFieldNum: Int
+        excludeFieldNum: Int,
+        allowZeroWithHint: Boolean = false
     ): Pair<String, Int>? {
-        // 1. Float / Double fraction in [0.0, 1.0] (wireType 1 or 5)
+        // 1. Float / Double fraction in [0.005, 1.0] (wireType 1 or 5); avoid <0.5% rounding to false 0%
         for (sc in scalars) {
             if (sc.fieldNumber == excludeFieldNum) continue
             val d = sc.doubleVal ?: continue
-            if ((sc.wireType == 1 || sc.wireType == 5) && d in 0.001..1.0) {
+            if ((sc.wireType == 1 || sc.wireType == 5) && d in 0.005..1.0) {
                 val pct = formatFractionAsPercent(d)
                 if (pct != "--") return pct to 2
             }
         }
 
-        // 2. Integer (used, limit) pair where 0 <= used <= limit and limit is a plausible quota cap
+        // 2. Integer (used, limit) pair: prioritize non-zero `used` so unrelated [0, pageSize] fields
+        //    never trigger false "0%" quota resets.
         val nonTsInts = scalars.mapNotNull { sc ->
             if (sc.fieldNumber == excludeFieldNum || sc.wireType != 0) null
             else sc.intVal?.takeIf { it in 0L..10_000L }?.toInt()
@@ -660,10 +662,22 @@ object QuotaTextParser {
                     if (i == j) continue
                     val a = nonTsInts[i]
                     val b = nonTsInts[j]
-                    if (a in 0..b && b in plausibleLimitCaps && b >= 5) {
-                        val pctInt = ((a.toDouble() / b.toDouble()) * 100.0).roundToInt().coerceIn(0, 100)
+                    if (a in 1..b && b in plausibleLimitCaps && b >= 5) {
+                        val pctInt = ((a.toDouble() / b.toDouble()) * 100.0).roundToInt().coerceIn(1, 100)
                         val pctStr = sanitizeQuotaMetric("$pctInt%")
                         if (pctStr != "--") return pctStr to 3
+                    }
+                }
+            }
+            if (allowZeroWithHint) {
+                for (i in nonTsInts.indices) {
+                    for (j in nonTsInts.indices) {
+                        if (i == j) continue
+                        val a = nonTsInts[i]
+                        val b = nonTsInts[j]
+                        if (a == 0 && b in plausibleLimitCaps && b >= 5) {
+                            return "0%" to 1
+                        }
                     }
                 }
             }
@@ -679,8 +693,8 @@ object QuotaTextParser {
             }
         }
 
-        // 4. Direct integer percentage 0..100
-        val singlePct = nonTsInts.firstOrNull { it in 0..100 }
+        // 4. Direct integer percentage 1..100 (bare `0` varints in random messages are never treated as 0%)
+        val singlePct = nonTsInts.firstOrNull { it in 1..100 }
         if (singlePct != null) {
             val pctStr = sanitizeQuotaMetric("$singlePct%")
             if (pctStr != "--") return pctStr to 1
@@ -956,13 +970,13 @@ object QuotaTextParser {
         if (detectedTs != null && nums.isNotEmpty() && len <= 10) {
             var metric = "--"
             var conf = 1
-            // Check (used, limit) pair first
+            // Check non-zero (used, limit) pair first to avoid [0, pageSize, futureEpoch] false 0%
             val ints = nums.filter { it == it.toLong().toDouble() && it in 0.0..10_000.0 }.map { it.toInt() }
             if (ints.size >= 2) {
                 for (i in ints.indices) {
                     for (j in ints.indices) {
-                        if (i != j && ints[i] in 0..ints[j] && ints[j] in plausibleLimitCaps) {
-                            val pct = ((ints[i].toDouble() / ints[j].toDouble()) * 100.0).roundToInt()
+                        if (i != j && ints[i] in 1..ints[j] && ints[j] in plausibleLimitCaps) {
+                            val pct = ((ints[i].toDouble() / ints[j].toDouble()) * 100.0).roundToInt().coerceIn(1, 100)
                             metric = sanitizeQuotaMetric("$pct%")
                             conf = 3
                             break
@@ -972,11 +986,11 @@ object QuotaTextParser {
                 }
             }
             if (metric == "--") {
-                val frac = nums.firstOrNull { it in 0.001..1.0 && it != it.toLong().toDouble() }
+                val frac = nums.firstOrNull { it in 0.005..1.0 && it != it.toLong().toDouble() }
                 if (frac != null) {
                     metric = formatFractionAsPercent(frac)
                     conf = 2
-                } else if (ints.size == 1 && ints[0] in 0..100) {
+                } else if (ints.size == 1 && ints[0] in 1..100) {
                     metric = sanitizeQuotaMetric("${ints[0]}%")
                     conf = 2
                 }
@@ -1289,13 +1303,30 @@ object QuotaTextParser {
     }
 
     /**
-     * Backward-compatible alias for banner-only scanning. Accepts rawText or block.
+     * Strictly matches rate-limit exhaustion banners on normal chat/UI screens so regular chat
+     * messages mentioning "limit" or "0%" cannot hijack or zero out the live quota HUD.
      */
     fun parseExhaustedBannerOnly(
         rawText: String,
         prev: QuotaHudView.Snapshot,
         source: String
-    ): QuotaHudView.Snapshot? = parseScreenQuotaTexts(rawText, prev, source)
+    ): QuotaHudView.Snapshot? {
+        val base = sanitizeSnapshot(prev)
+        for (rawLine in rawText.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.length !in 6..220) continue
+            if (exhaustedBannerRegex.matches(line)) {
+                val resetTok = extractMetricToken(line, MetricKind.RESET) ?: base.fiveHourReset
+                val next = base.copy(
+                    fiveHourQuota = "100%",
+                    fiveHourReset = resetTok,
+                    source = source
+                ).sanitized()
+                if (next != base && next.hasLiveData) return next
+            }
+        }
+        return null
+    }
 
     fun normalizeFieldCandidate(raw: String, kind: MetricKind): String {
         val singleLine = raw.replace(Regex("\\s+"), " ").trim()

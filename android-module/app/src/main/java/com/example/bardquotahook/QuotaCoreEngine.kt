@@ -730,7 +730,7 @@ object QuotaCoreEngine {
             app.registerComponentCallbacks(object : ComponentCallbacks2 {
                 override fun onConfigurationChanged(newConfig: Configuration) {}
                 override fun onLowMemory() {
-                    clearTransientBuffers()
+                    clearTransientBuffers(wipeCredentials = true)
                 }
                 override fun onTrimMemory(level: Int) {
                     if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && activeStartedActivities.isEmpty()) {
@@ -847,30 +847,32 @@ object QuotaCoreEngine {
         activeStartedActivities.clear()
         startedActivityCount.set(0)
         enterBackgroundSleep(activeActivityRef.get().get())
+        clearTransientBuffers(wipeCredentials = true)
     }
 
-    private fun clearTransientBuffers() {
+    private fun clearTransientBuffers(wipeCredentials: Boolean = false) {
         try {
             cronetRollingStreams.clear()
             requestContextMap.clear()
             synchronized(builderHeaderMap) {
                 builderHeaderMap.clear()
             }
-            cachedXsrfToken = null
-            cachedFsidToken = null
-            cachedBuildLabel = null
-            // Wipe raw in-memory header values while keeping only the non-reversible session tag
-            val cur = activeDynamicSession.get()
-            activeDynamicSession.set(
-                ActiveDynamicSessionState(
-                    sessionTag = cur.sessionTag,
-                    authorizationHeader = null,
-                    cookieHeader = null,
-                    authUserHeader = null,
-                    transport = cur.transport,
-                    updatedAtMs = cur.updatedAtMs
+            if (wipeCredentials) {
+                cachedXsrfToken = null
+                cachedFsidToken = null
+                cachedBuildLabel = null
+                val cur = activeDynamicSession.get()
+                activeDynamicSession.set(
+                    ActiveDynamicSessionState(
+                        sessionTag = cur.sessionTag,
+                        authorizationHeader = null,
+                        cookieHeader = null,
+                        authUserHeader = null,
+                        transport = cur.transport,
+                        updatedAtMs = cur.updatedAtMs
+                    )
                 )
-            )
+            }
             onDemandExecutor.queue.clear()
             onDemandExecutor.purge()
         } catch (_: Throwable) {
@@ -935,23 +937,22 @@ object QuotaCoreEngine {
         authorization: String?,
         cookie: String?,
         authUser: String?,
-        pageId: String?
+        @Suppress("UNUSED_PARAMETER") pageId: String?
     ): ComputedIdentity? {
+        // Anchor ONLY on the single highest-priority stable cookie token (`__Secure-1PSID` > etc.)
+        // and omit optional per-endpoint `X-Goog-PageId` so different Google subdomains on the
+        // same account never produce different session hashes and falsely wipe quota to "--".
         val stableCookieToken = extractStableGoogleSessionCookie(cookie)
         val cleanAuthUser = authUser?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanPageId = pageId?.trim()?.takeIf { it.isNotEmpty() && it != "0" }
         val cleanBearer = authorization?.trim()?.takeIf { it.isNotEmpty() }
 
         return when {
             stableCookieToken != null -> {
-                val key = buildString {
-                    append("cookie:").append(stableCookieToken)
-                    if (cleanPageId != null) append("|p:").append(cleanPageId)
-                }
+                val key = "cookie:$stableCookieToken"
                 ComputedIdentity(sha256SessionTag(key), IdentityStrength.COOKIE_SID, key)
             }
             cleanAuthUser != null -> {
-                val key = "authuser:$cleanAuthUser|p:${cleanPageId ?: "0"}"
+                val key = "authuser:$cleanAuthUser"
                 ComputedIdentity(sha256SessionTag(key), IdentityStrength.AUTH_USER, key)
             }
             cleanBearer != null -> {
@@ -962,6 +963,12 @@ object QuotaCoreEngine {
             }
             else -> null
         }
+    }
+
+    private fun extractAnchorCookieName(canonicalKey: String?): String? {
+        if (canonicalKey == null || !canonicalKey.startsWith("cookie:")) return null
+        val eq = canonicalKey.indexOf('=', 7)
+        return if (eq > 7) canonicalKey.substring(7, eq) else null
     }
 
     private fun onDynamicHeadersIntercepted(
@@ -985,11 +992,17 @@ object QuotaCoreEngine {
         val prevStrongKey = confirmedIdentityKey
         val prevStrongStrength = confirmedIdentityStrength
 
-        // Determine if this genuinely represents a different Google account
+        // Only treat as a genuine Google account switch when the SAME anchor key type changes value
+        // (e.g., two different `__Secure-1PSID` values or two different `X-Goog-AuthUser` indices).
+        val prevAnchor = extractAnchorCookieName(prevStrongKey)
+        val nextAnchor = extractAnchorCookieName(computed.canonicalKey)
+        val sameCookieAnchorType = prevAnchor != null && prevAnchor == nextAnchor
+
         val isGenuineAccountSwitch = when {
             computed.strength == IdentityStrength.COOKIE_SID &&
                 prevStrongStrength == IdentityStrength.COOKIE_SID &&
                 prevStrongKey != null &&
+                sameCookieAnchorType &&
                 prevStrongKey != computed.canonicalKey -> true
             computed.strength == IdentityStrength.AUTH_USER &&
                 prevStrongStrength == IdentityStrength.AUTH_USER &&
@@ -1077,15 +1090,15 @@ object QuotaCoreEngine {
                 cookiePairs[k] = v
             }
         }
-        val sb = StringBuilder()
+        // Return the single highest-priority stable session key so requests carrying subsets
+        // of Google cookies never hash into different accounts.
         for (stableKey in STABLE_COOKIE_KEYS) {
             val v = cookiePairs[stableKey]
             if (!v.isNullOrEmpty()) {
-                if (sb.isNotEmpty()) sb.append('&')
-                sb.append(stableKey).append('=').append(v)
+                return "$stableKey=$v"
             }
         }
-        return if (sb.isNotEmpty()) sb.toString() else null
+        return null
     }
 
     private fun sha256SessionTag(material: String): String {
@@ -2757,8 +2770,8 @@ object QuotaCoreEngine {
                         if (i == j) continue
                         val a = objInts[i]
                         val b = objInts[j]
-                        if (a in 0..b && b in setOf(5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 250, 500, 1000, 2000)) {
-                            val pct = ((a.toDouble() / b.toDouble()) * 100.0).roundToInt()
+                        if (a in 1..b && b in setOf(5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 250, 500, 1000, 2000)) {
+                            val pct = ((a.toDouble() / b.toDouble()) * 100.0).roundToInt().coerceIn(1, 100)
                             metric = QuotaTextParser.sanitizeQuotaMetric("$pct%")
                             conf += 2
                             break
@@ -2769,11 +2782,11 @@ object QuotaCoreEngine {
             }
 
             if (metric == "--") {
-                val frac = objDoubles.firstOrNull { it in 0.001..1.0 }
+                val frac = objDoubles.firstOrNull { it in 0.005..1.0 }
                 if (frac != null) {
                     metric = QuotaTextParser.formatFractionAsPercent(frac)
                     conf += 1
-                } else if (objInts.size == 1 && objInts[0] in 0..100) {
+                } else if (objInts.size == 1 && objInts[0] in 1..100) {
                     metric = QuotaTextParser.sanitizeQuotaMetric("${objInts[0]}%")
                     conf += 1
                 }
@@ -3063,8 +3076,8 @@ object QuotaCoreEngine {
             val text = sb.toString()
             if (QuotaTextParser.fastHasQuotaKeyword(text)) {
                 withReentrancyGuard {
-                    val snap = QuotaTextParser.parseScreenQuotaTexts(
-                        text = text,
+                    val snap = QuotaTextParser.parseExhaustedBannerOnly(
+                        rawText = text,
                         prev = getBaseSnapshotForSession(sessionTag),
                         source = "InApp-Screen"
                     )
@@ -3474,10 +3487,22 @@ object QuotaCoreEngine {
         }
     }
 
-    private fun publishSnapshotForSession(snapshot: QuotaHudView.Snapshot, sessionTag: String) {
-        val clean = snapshot.sanitized()
-        if (!clean.hasLiveData) return
+    private fun isZeroMetric(metric: String): Boolean {
+        return metric == "0%" || metric.startsWith("0/")
+    }
 
+    private fun isDirectQuotaSurfaceSource(source: String): Boolean {
+        return source == "WebView-DOM" ||
+            source == "InApp-Dialog" ||
+            source == "Learned-HTTP" ||
+            source.startsWith("Active-RPC-")
+    }
+
+    private fun publishSnapshotForSession(snapshot: QuotaHudView.Snapshot, sessionTag: String) {
+        val rawClean = snapshot.sanitized()
+        if (!rawClean.hasLiveData) return
+
+        var cleanToApply = rawClean
         var shouldUpdateActiveHud = false
         synchronized(sessionSnapshotsLock) {
             val prevForSession = if (sessionTag == activeSessionTag.get()) {
@@ -3486,19 +3511,53 @@ object QuotaCoreEngine {
                 perSessionSnapshots[sessionTag]?.sanitized() ?: QuotaHudView.Snapshot()
             }
             // Never let synthetic SessionEstimate overwrite resolved real quota metrics
-            if (clean.source == "SessionEstimate" &&
+            if (rawClean.source == "SessionEstimate" &&
                 prevForSession.hasLiveData &&
                 prevForSession.source != "SessionEstimate"
             ) {
                 return
             }
-            if (clean == prevForSession) return
+
+            // Anti-zeroing monotonicity guard: never let unverified memory/protobuf/AF scans
+            // overwrite an active non-zero window with "0%", and on direct quota surfaces only
+            // accept "0%" if there was no prior non-zero metric or the reset window actually rolled over.
+            val directSource = isDirectQuotaSurfaceSource(rawClean.source)
+            val fivePrevNonZero = prevForSession.fiveHourQuota != "--" && !isZeroMetric(prevForSession.fiveHourQuota)
+            val weekPrevNonZero = prevForSession.weeklyLimit != "--" && !isZeroMetric(prevForSession.weeklyLimit)
+
+            val fiveResetUnchanged = prevForSession.fiveHourReset != "--" &&
+                (rawClean.fiveHourReset == "--" || rawClean.fiveHourReset == prevForSession.fiveHourReset)
+            val weekResetUnchanged = prevForSession.weeklyReset != "--" &&
+                (rawClean.weeklyReset == "--" || rawClean.weeklyReset == prevForSession.weeklyReset)
+
+            val safeFive = if (isZeroMetric(rawClean.fiveHourQuota) &&
+                (!directSource || (fivePrevNonZero && fiveResetUnchanged))
+            ) {
+                if (fivePrevNonZero) prevForSession.fiveHourQuota else "--"
+            } else {
+                rawClean.fiveHourQuota
+            }
+
+            val safeWeek = if (isZeroMetric(rawClean.weeklyLimit) &&
+                (!directSource || (weekPrevNonZero && weekResetUnchanged))
+            ) {
+                if (weekPrevNonZero) prevForSession.weeklyLimit else "--"
+            } else {
+                rawClean.weeklyLimit
+            }
+
+            cleanToApply = rawClean.copy(
+                fiveHourQuota = safeFive,
+                weeklyLimit = safeWeek
+            ).sanitized()
+
+            if (!cleanToApply.hasLiveData || cleanToApply == prevForSession) return
 
             if (sessionTag != DEFAULT_SESSION_TAG) {
-                perSessionSnapshots[sessionTag] = clean
+                perSessionSnapshots[sessionTag] = cleanToApply
             }
             if (sessionTag == activeSessionTag.get()) {
-                latestSnapshot.set(clean)
+                latestSnapshot.set(cleanToApply)
                 shouldUpdateActiveHud = true
             }
         }
@@ -3506,7 +3565,7 @@ object QuotaCoreEngine {
         if (!shouldUpdateActiveHud) return
 
         saveSanitizedHostMirror(
-            clean,
+            cleanToApply,
             currentLang.get(),
             currentTheme.get(),
             sessionTag,
@@ -3519,7 +3578,7 @@ object QuotaCoreEngine {
                 submitForegroundWork {
                     val merged = QuotaSyncProvider.publishSessionQuota(
                         context = ctx,
-                        snapshot = clean,
+                        snapshot = cleanToApply,
                         sessionId = sessionTag,
                         replaceSession = false
                     )
@@ -3646,13 +3705,14 @@ object QuotaCoreEngine {
         // Only adopt snapshot from QuotaSyncProvider if it belongs to the same active session
         // (prevents overwriting a newly switched Google account with stale cached values).
         val curSess = activeSessionTag.get()
+        val curSnap = latestSnapshot.get().sanitized()
         val sameOrDefaultSession = state.sessionId.isBlank() ||
             curSess == DEFAULT_SESSION_TAG ||
-            state.sessionId == curSess
+            state.sessionId == curSess ||
+            (!curSnap.hasLiveData && confirmedIdentityStrength < IdentityStrength.COOKIE_SID)
 
         if (sameOrDefaultSession) {
             val cleanSnap = state.snapshot.sanitized()
-            val curSnap = latestSnapshot.get().sanitized()
             val canUpgradeFromProvider = cleanSnap.hasLiveData &&
                 curSnap != cleanSnap &&
                 (!curSnap.hasLiveData || (curSnap.source == "SessionEstimate" && cleanSnap.source != "SessionEstimate"))

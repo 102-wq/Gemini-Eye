@@ -348,19 +348,17 @@ class QuotaSyncProvider : ContentProvider() {
                 prev.sessionId
             }
 
-            // Detect Google account switch: never merge old account quota into newly switched account!
-            val sessionSwitched = replaceSession ||
-                (!sessionId.isNullOrBlank() &&
-                    sessionId != "sess_default" &&
-                    prev.sessionId.isNotBlank() &&
-                    sessionId != prev.sessionId)
-
+            // Only wipe/reset snapshot on an explicitly confirmed account switch (`replaceSession == true`),
+            // never on transient heartbeats or session-tag strength upgrades.
             val cleanIncoming = incomingSnapshot?.sanitized()
+            val prevIsReal = prev.snapshot.hasLiveData && prev.snapshot.source != "SessionEstimate"
+            val incomingIsEstimate = cleanIncoming?.source == "SessionEstimate"
+
             val mergedSnap = when {
-                sessionSwitched -> {
+                replaceSession -> {
                     cleanIncoming ?: QuotaHudView.Snapshot(source = "AccountSwitch")
                 }
-                cleanIncoming != null && cleanIncoming.hasLiveData -> {
+                cleanIncoming != null && cleanIncoming.hasLiveData && !(prevIsReal && incomingIsEstimate) -> {
                     QuotaHudView.Snapshot(
                         fiveHourQuota = if (cleanIncoming.fiveHourQuota != "--") cleanIncoming.fiveHourQuota else prev.snapshot.fiveHourQuota,
                         fiveHourReset = if (cleanIncoming.fiveHourReset != "--") cleanIncoming.fiveHourReset else prev.snapshot.fiveHourReset,
