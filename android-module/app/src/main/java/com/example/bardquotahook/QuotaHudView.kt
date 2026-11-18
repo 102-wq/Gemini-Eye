@@ -1,5 +1,7 @@
 package com.example.bardquotahook
 
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
@@ -131,6 +133,7 @@ class QuotaHudView(
         val staleBg: Int,
         val staleBorder: Int,
         val staleBar: Int,
+        val offlineDot: Int,
         val divider: Int,
         val trackColor: Int,
         val barNormal: Int,
@@ -147,6 +150,7 @@ class QuotaHudView(
     var currentTheme: ThemeMode = ThemeMode.MIUIX
         private set
 
+    private val offlineDotView: OfflineDotView
     private val fiveHourLabelView: TextView
     private val fiveHourBarView: MiniProgressBarView
     private val fiveHourValueView: TextView
@@ -183,6 +187,16 @@ class QuotaHudView(
 
         val labelTypeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
         val valueTypeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+
+        // 0. Far-left blinking orange dot shown only when snapshot.isStaleOffline == true
+        offlineDotView = OfflineDotView(context).apply {
+            tag = "bard_quota_hud_offline_dot"
+            val dotSize = dp(context, 6.5f)
+            layoutParams = LayoutParams(dotSize, dotSize).apply {
+                marginEnd = dp(context, 5.5f)
+            }
+            visibility = View.GONE
+        }
 
         // 1. Left Section: "5h" + Mini Bar + "15% (1h52m)"
         fiveHourLabelView = createSingleLineText(
@@ -290,6 +304,7 @@ class QuotaHudView(
             }
         }
 
+        addView(offlineDotView)
         addView(fiveHourLabelView)
         addView(fiveHourBarView)
         addView(fiveHourValueView)
@@ -381,6 +396,10 @@ class QuotaHudView(
         weeklyValueView.setTextColor(activeValueColor)
 
         if (stale) {
+            offlineDotView.contentDescription = labels.offlineTag
+            offlineDotView.updateState(active = true, dotColor = palette.offlineDot)
+            offlineDotView.visibility = View.VISIBLE
+
             offlineTagView.text = labels.offlineTag
             offlineTagView.setTextColor(palette.staleText)
             offlineTagView.background = GradientDrawable().apply {
@@ -391,6 +410,8 @@ class QuotaHudView(
             }
             offlineTagView.visibility = View.VISIBLE
         } else {
+            offlineDotView.updateState(active = false, dotColor = palette.offlineDot)
+            offlineDotView.visibility = View.GONE
             offlineTagView.visibility = View.GONE
         }
 
@@ -521,6 +542,49 @@ class QuotaHudView(
     // =========================================================================
     // Programmatic Subviews: Mini Horizontal Progress Bar & Vector Action Icons
     // =========================================================================
+
+    private class OfflineDotView(context: Context) : View(context) {
+        private val dotDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+        }
+        private var blinkAnimator: ObjectAnimator? = null
+
+        init {
+            background = dotDrawable
+        }
+
+        fun updateState(active: Boolean, dotColor: Int) {
+            dotDrawable.setColor(dotColor)
+            if (active) {
+                if (blinkAnimator == null) {
+                    blinkAnimator = ObjectAnimator.ofFloat(this, View.ALPHA, 1f, 0.22f).apply {
+                        duration = 650L
+                        repeatMode = ValueAnimator.REVERSE
+                        repeatCount = ValueAnimator.INFINITE
+                        start()
+                    }
+                } else if (blinkAnimator?.isStarted != true) {
+                    blinkAnimator?.start()
+                }
+            } else {
+                stopBlinking()
+            }
+        }
+
+        private fun stopBlinking() {
+            try {
+                blinkAnimator?.cancel()
+            } catch (_: Throwable) {
+            }
+            blinkAnimator = null
+            alpha = 1f
+        }
+
+        override fun onDetachedFromWindow() {
+            stopBlinking()
+            super.onDetachedFromWindow()
+        }
+    }
 
     private class MiniProgressBarView(context: Context) : View(context) {
         private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -761,6 +825,7 @@ class QuotaHudView(
                     staleBg = Color.parseColor("#2494A3B8"),
                     staleBorder = Color.parseColor("#4494A3B8"),
                     staleBar = Color.parseColor("#64748B"),
+                    offlineDot = Color.parseColor("#FB923C"),
                     divider = Color.parseColor("#28FFFFFF"),
                     trackColor = Color.parseColor("#2EFFFFFF"),
                     barNormal = Color.parseColor("#0D84FF"),
@@ -782,6 +847,7 @@ class QuotaHudView(
                     staleBg = Color.parseColor("#1A64748B"),
                     staleBorder = Color.parseColor("#3864748B"),
                     staleBar = Color.parseColor("#94A3B8"),
+                    offlineDot = Color.parseColor("#F97316"),
                     divider = Color.parseColor("#1A0F172A"),
                     trackColor = Color.parseColor("#1F0F172A"),
                     barNormal = Color.parseColor("#007AFF"),
@@ -817,6 +883,7 @@ class QuotaHudView(
                             staleBg = Color.parseColor("#249CA3AF"),
                             staleBorder = Color.parseColor("#449CA3AF"),
                             staleBar = Color.parseColor("#6B7280"),
+                            offlineDot = Color.parseColor("#FB923C"),
                             divider = withAlpha(outline, 0x55),
                             trackColor = withAlpha(track, 0x99),
                             barNormal = primary,
@@ -845,6 +912,7 @@ class QuotaHudView(
                             staleBg = Color.parseColor("#1A6B7280"),
                             staleBorder = Color.parseColor("#386B7280"),
                             staleBar = Color.parseColor("#9CA3AF"),
+                            offlineDot = Color.parseColor("#F97316"),
                             divider = withAlpha(outline, 0x66),
                             trackColor = withAlpha(track, 0xDD),
                             barNormal = primary,
@@ -872,6 +940,7 @@ class QuotaHudView(
                     staleBg = Color.parseColor("#249CA3AF"),
                     staleBorder = Color.parseColor("#449CA3AF"),
                     staleBar = Color.parseColor("#6B7280"),
+                    offlineDot = Color.parseColor("#FB923C"),
                     divider = Color.parseColor("#44938F99"),
                     trackColor = Color.parseColor("#884A4458"),
                     barNormal = Color.parseColor("#D0BCFF"),
@@ -893,6 +962,7 @@ class QuotaHudView(
                     staleBg = Color.parseColor("#1A6B7280"),
                     staleBorder = Color.parseColor("#386B7280"),
                     staleBar = Color.parseColor("#9CA3AF"),
+                    offlineDot = Color.parseColor("#F97316"),
                     divider = Color.parseColor("#55CAC4D0"),
                     trackColor = Color.parseColor("#DDE8DEF8"),
                     barNormal = Color.parseColor("#6750A4"),

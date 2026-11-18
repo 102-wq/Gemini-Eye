@@ -207,21 +207,21 @@ object QuotaTextParser {
     }
 
     /**
-     * Formats Weekly quota reset duration strictly in days (`Xd` or `X.Yd`) so the UI renders `天` / `day`.
+     * Formats Weekly quota reset duration in integer days + hours (`XdYh`, e.g. `4d12h` or `0d11h`)
+     * so the UI renders `x天xh` / `xdayxh` instead of decimal days.
      */
     fun formatWeeklyDurationSeconds(deltaSec: Long): String {
         if (deltaSec <= 0L) return "--"
-        val daysFloat = (deltaSec.toDouble() / 86400.0).coerceAtLeast(0.1)
-        val roundedTenths = (daysFloat * 10.0).roundToInt()
-        val whole = roundedTenths / 10
-        val frac = roundedTenths % 10
-        val raw = if (frac == 0) "${whole}d" else "${whole}.${frac}d"
+        val totalHours = maxOf(0L, deltaSec / 3600L)
+        val days = totalHours / 24L
+        val remHours = totalHours % 24L
+        val raw = "${days}d${remHours}h"
         return sanitizeResetToken(raw)
     }
 
     /**
      * Converts any sanitized weekly reset token (`6d`, `4d12h`, `23h52m`, `11h05m`, etc.)
-     * into localized day display (`6天` / `4.5天` / `1天` for ZH, `6day` / `4.5day` / `1day` for EN).
+     * into `x天xh` (ZH) or `xdayxh` (EN), e.g. `4天12h` / `4day12h`, `0天23h` / `0day23h`.
      */
     fun formatWeeklyResetForDisplay(rawToken: String, isZh: Boolean): String {
         val clean = sanitizeResetToken(rawToken)
@@ -229,32 +229,36 @@ object QuotaTextParser {
         val unit = if (isZh) "天" else "day"
 
         val lower = clean.lowercase()
-        val decDayMatch = Regex("""^(\d{1,3}(?:\.\d+)?)d$""").matchEntire(lower)
-        if (decDayMatch != null) {
-            return "${decDayMatch.groupValues[1]}$unit"
-        }
-
         val dhMatch = Regex("""^(\d{1,3})d(\d{1,2})h$""").matchEntire(lower)
         if (dhMatch != null) {
             val d = dhMatch.groupValues[1].toIntOrNull() ?: 0
             val h = dhMatch.groupValues[2].toIntOrNull() ?: 0
-            val totalTenths = (((d * 24 + h).toDouble() / 24.0) * 10.0).roundToInt().coerceAtLeast(1)
-            val whole = totalTenths / 10
-            val frac = totalTenths % 10
-            val numStr = if (frac == 0) "$whole" else "$whole.$frac"
-            return "$numStr$unit"
+            val extraDays = h / 24
+            val remH = h % 24
+            return "${d + extraDays}$unit${remH}h"
+        }
+
+        val intDayMatch = Regex("""^(\d{1,3})d$""").matchEntire(lower)
+        if (intDayMatch != null) {
+            val d = intDayMatch.groupValues[1].toIntOrNull() ?: 0
+            return "${d}${unit}0h"
+        }
+
+        val decDayMatch = Regex("""^(\d{1,3}\.\d+)d$""").matchEntire(lower)
+        if (decDayMatch != null) {
+            val decDays = decDayMatch.groupValues[1].toDoubleOrNull() ?: 0.0
+            val totalHours = maxOf(0, (decDays * 24.0).roundToInt())
+            val d = totalHours / 24
+            val h = totalHours % 24
+            return "${d}$unit${h}h"
         }
 
         val hmMatch = Regex("""^(?:(\d{1,3})h)?(?:(\d{1,2})m)?$""").matchEntire(lower)
         if (hmMatch != null && (hmMatch.groupValues[1].isNotEmpty() || hmMatch.groupValues[2].isNotEmpty())) {
             val h = hmMatch.groupValues[1].toIntOrNull() ?: 0
-            val m = hmMatch.groupValues[2].toIntOrNull() ?: 0
-            val totalHours = h.toDouble() + m.toDouble() / 60.0
-            val totalTenths = ((totalHours / 24.0) * 10.0).roundToInt().coerceAtLeast(1)
-            val whole = totalTenths / 10
-            val frac = totalTenths % 10
-            val numStr = if (frac == 0) "$whole" else "$whole.$frac"
-            return "$numStr$unit"
+            val d = h / 24
+            val remH = h % 24
+            return "${d}$unit${remH}h"
         }
 
         return clean

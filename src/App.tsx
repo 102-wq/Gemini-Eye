@@ -77,30 +77,36 @@ function formatWeeklyResetLabel(rawToken: string, lang: UiLang): string {
   const unit = lang === 'zh' ? '天' : 'day';
   const lower = clean.toLowerCase();
 
-  const decDayMatch = lower.match(/^(\d{1,3}(?:\.\d+)?)d$/);
-  if (decDayMatch) {
-    return `${decDayMatch[1]}${unit}`;
-  }
-
   const dhMatch = lower.match(/^(\d{1,3})d(\d{1,2})h$/);
   if (dhMatch) {
     const d = parseInt(dhMatch[1], 10);
     const h = parseInt(dhMatch[2], 10);
-    const tenths = Math.max(1, Math.round(((d * 24 + h) / 24) * 10));
-    const whole = Math.floor(tenths / 10);
-    const frac = tenths % 10;
-    return `${frac === 0 ? whole : `${whole}.${frac}`}${unit}`;
+    const extraDays = Math.floor(h / 24);
+    const remH = h % 24;
+    return `${d + extraDays}${unit}${remH}h`;
+  }
+
+  const intDayMatch = lower.match(/^(\d{1,3})d$/);
+  if (intDayMatch) {
+    const d = parseInt(intDayMatch[1], 10);
+    return `${d}${unit}0h`;
+  }
+
+  const decDayMatch = lower.match(/^(\d{1,3}\.\d+)d$/);
+  if (decDayMatch) {
+    const decDays = parseFloat(decDayMatch[1]);
+    const totalHours = Math.max(0, Math.round(decDays * 24));
+    const d = Math.floor(totalHours / 24);
+    const h = totalHours % 24;
+    return `${d}${unit}${h}h`;
   }
 
   const hmMatch = lower.match(/^(?:(\d{1,3})h)?(?:(\d{1,2})m)?$/);
   if (hmMatch && (hmMatch[1] || hmMatch[2])) {
     const h = hmMatch[1] ? parseInt(hmMatch[1], 10) : 0;
-    const m = hmMatch[2] ? parseInt(hmMatch[2], 10) : 0;
-    const totalHours = h + m / 60;
-    const tenths = Math.max(1, Math.round((totalHours / 24) * 10));
-    const whole = Math.floor(tenths / 10);
-    const frac = tenths % 10;
-    return `${frac === 0 ? whole : `${whole}.${frac}`}${unit}`;
+    const d = Math.floor(h / 24);
+    const remH = h % 24;
+    return `${d}${unit}${remH}h`;
   }
 
   return clean;
@@ -234,8 +240,8 @@ export default function App() {
       timeMs: '09:41:02.350',
       eventType: 'PROTO_SCAN',
       sessionTag: 'sess_8f3a91c04b12',
-      detailZh: 'Cronet UrlRequest.onReadCompleted 出站头捕获: [__Secure-1PSID, X-Goog-AuthUser:0]。Protobuf 扫描命中双窗口: 5h=15% (1h52m), 每周=29% (1天)',
-      detailEn: 'Cronet UrlRequest.onReadCompleted header captured: [__Secure-1PSID, X-Goog-AuthUser:0]. Protobuf scanned dual windows: 5h=15% (1h52m), Weekly=29% (1day)',
+      detailZh: 'Cronet UrlRequest.onReadCompleted 出站头捕获: [__Secure-1PSID, X-Goog-AuthUser:0]。Protobuf 扫描命中双窗口: 5h=15% (1h52m), 每周=29% (0天23h)',
+      detailEn: 'Cronet UrlRequest.onReadCompleted header captured: [__Secure-1PSID, X-Goog-AuthUser:0]. Protobuf scanned dual windows: 5h=15% (1h52m), Weekly=29% (0day23h)',
       level: 'info',
     },
   ]);
@@ -1454,6 +1460,22 @@ export default function App() {
                       onPointerCancel={onHudPointerUp}
                       className={`absolute top-12 right-2.5 max-w-[96%] inline-flex items-center px-2.5 py-1.5 rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${capsuleContainerClass}`}
                     >
+                      {isStaleOffline && (
+                        <span
+                          title={hudLang === 'zh' ? '当前数据为离线缓存状态' : 'Cached offline state'}
+                          aria-label={hudLang === 'zh' ? '离线缓存状态' : 'Offline cached'}
+                          className="relative flex items-center justify-center w-2 h-2 mr-1.5 shrink-0"
+                        >
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75" />
+                          <span
+                            className={`relative inline-flex rounded-full w-1.5 h-1.5 animate-pulse ${
+                              simDarkTheme
+                                ? 'bg-orange-400 shadow-[0_0_6px_rgba(251,146,60,0.85)]'
+                                : 'bg-orange-500 shadow-[0_0_5px_rgba(249,115,22,0.7)]'
+                            }`}
+                          />
+                        </span>
+                      )}
                       <span className={`font-semibold ${capsuleLabelClass}`}>5h</span>
                       <span
                         className={`relative mx-1.5 rounded-full overflow-hidden shrink-0 transition-all duration-200 ${capsuleTrackClass} ${

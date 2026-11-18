@@ -22,10 +22,13 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.util.Base64
 import dalvik.system.BaseDexClassLoader
+import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
@@ -184,6 +187,8 @@ object QuotaCoreEngine {
     private val callbacksRegistered = AtomicBoolean(false)
     private val observerRegistered = AtomicBoolean(false)
     private val dexRepoScanCompleted = AtomicBoolean(false)
+    private val hasCompletedLiveFetchThisWake = AtomicBoolean(false)
+    private val localStorageScannedThisWake = AtomicBoolean(false)
 
     // Zero-Background Foreground Gate: false until a Gemini Activity enters foreground;
     // immediately returns to false when all Gemini Activities stop or UI is hidden.
@@ -205,6 +210,9 @@ object QuotaCoreEngine {
         val url: String,
         val method: String = "GET",
         val rpcHint: String? = null,
+        val contentType: String? = null,
+        val bodyBase64: String? = null,
+        val extraHeaders: Map<String, String> = emptyMap(),
         val updatedAtMs: Long = System.currentTimeMillis()
     )
 
@@ -239,7 +247,7 @@ object QuotaCoreEngine {
     private val pbZeroDebounceHits = HashMap<String, Int>()
     private val lastPbZeroWarnAtMs = HashMap<String, Long>()
 
-    // Bounded in-memory learned quota endpoints discovered during foreground inspection
+    // Bounded learned quota endpoints discovered during foreground inspection (persisted without credentials)
     private val learnedEndpointsLock = Any()
     private val learnedQuotaEndpoints = object : LinkedHashMap<String, LearnedEndpoint>(8, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, LearnedEndpoint>?): Boolean {
@@ -254,7 +262,10 @@ object QuotaCoreEngine {
         var authorization: String? = null,
         var cookie: String? = null,
         var authUser: String? = null,
-        var pageId: String? = null
+        var pageId: String? = null,
+        var contentType: String? = null,
+        var bodyBytes: ByteArray? = null,
+        val extraHeaders: MutableMap<String, String> = LinkedHashMap()
     ) {
         val hasCredentials: Boolean
             get() = !authorization.isNullOrBlank() || !cookie.isNullOrBlank() || !authUser.isNullOrBlank()
@@ -266,6 +277,9 @@ object QuotaCoreEngine {
         val sessionTag: String,
         val isQueryCandidate: Boolean,
         val isQuotaEndpointCandidate: Boolean,
+        val contentType: String? = null,
+        val bodyBytes: ByteArray? = null,
+        val extraHeaders: Map<String, String> = emptyMap(),
         val createdAtMs: Long = System.currentTimeMillis()
     )
 
@@ -833,10 +847,10 @@ object QuotaCoreEngine {
             )
             syncForegroundStateWithProviderAsync(ctx)
             triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 350L)
-            // Secondary cold-launch check: once cookies / ViewModels settle (~1.8s), verify if still empty
+            // Secondary cold-launch check: once cookies / ViewModels settle (~1.8s), verify live fetch ran
             postToMain(delayMs = 1_850L, requireForeground = true) {
                 val cur = latestSnapshot.get().sanitized()
-                if (!cur.hasLiveData || cur.source == "SessionEstimate") {
+                if (!hasCompletedLiveFetchThisWake.get() || !cur.hasLiveData || cur.source == "SessionEstimate") {
                     lastHttpFetchMs.set(0L)
                     triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 0L)
                 } else {
@@ -855,6 +869,8 @@ object QuotaCoreEngine {
      */
     private fun enterBackgroundSleep(stoppedActivity: Activity?) {
         val wasActive = isForegroundActive.getAndSet(false)
+        hasCompletedLiveFetchThisWake.set(false)
+        localStorageScannedThisWake.set(false)
         if (!wasActive && activeHudRef.get().get() == null) return
 
         try {
@@ -932,6 +948,17 @@ object QuotaCoreEngine {
     // Dynamic Session & Cookie / Authorization Interception (Account-Switch Safe)
     // =========================================================================
 
+    private fun isSafeTechnicalHeader(lowerName: String): Boolean {
+        return lowerName == "content-type" ||
+            lowerName == "accept" ||
+            lowerName == "x-goog-api-key" ||
+            lowerName == "x-android-package" ||
+            lowerName == "x-android-cert" ||
+            lowerName == "x-client-data" ||
+            lowerName == "x-same-domain" ||
+            lowerName == "x-goog-fieldmask"
+    }
+
     private fun recordOutgoingBuilderHeader(
         builderObj: Any,
         rawName: String,
@@ -940,22 +967,26 @@ object QuotaCoreEngine {
     ) {
         if (!isForegroundActive.get()) return
         val lower = rawName.trim().lowercase()
-        val isRelevant = lower == "authorization" ||
+        val isCredentialHeader = lower == "authorization" ||
             lower == "cookie" ||
             lower == "x-goog-authuser" ||
             lower == "x-goog-pageid"
-        if (!isRelevant || rawValue.isBlank()) return
+        val isTechHeader = !isCredentialHeader && isSafeTechnicalHeader(lower)
+        if ((!isCredentialHeader && !isTechHeader) || rawValue.isBlank()) return
 
         val snapshotHeaders = synchronized(builderHeaderMap) {
             val entry = builderHeaderMap.getOrPut(builderObj) { EphemeralSessionHeaders() }
             if (isNonQuotaTelemetryUrl(entry.url)) return
-            when (lower) {
-                "authorization" -> entry.authorization = rawValue.trim()
-                "cookie" -> entry.cookie = rawValue.trim()
-                "x-goog-authuser" -> entry.authUser = rawValue.trim()
-                "x-goog-pageid" -> entry.pageId = rawValue.trim()
+            when {
+                lower == "authorization" -> entry.authorization = rawValue.trim()
+                lower == "cookie" -> entry.cookie = rawValue.trim()
+                lower == "x-goog-authuser" -> entry.authUser = rawValue.trim()
+                lower == "x-goog-pageid" -> entry.pageId = rawValue.trim()
+                lower == "content-type" -> entry.contentType = rawValue.trim()
+                isTechHeader -> entry.extraHeaders[rawName.trim()] = rawValue.trim()
             }
-            entry.copy()
+            if (!isCredentialHeader) return
+            entry.copy(extraHeaders = LinkedHashMap(entry.extraHeaders))
         }
 
         if (isNonQuotaTelemetryUrl(snapshotHeaders.url)) return
@@ -1103,11 +1134,11 @@ object QuotaCoreEngine {
                 preserveUnconfirmedSnapshot = !isGenuineAccountSwitch &&
                     (!persistedSessionWasStrong || prevStrongStrength < IdentityStrength.COOKIE_SID)
             )
-        } else if ((hadNoCredentialsBefore || gainedNewCookie) && isForegroundActive.get()) {
+        } else if ((hadNoCredentialsBefore || gainedNewCookie || !hasCompletedLiveFetchThisWake.get()) && isForegroundActive.get()) {
             val curSnap = latestSnapshot.get().sanitized()
-            if (!curSnap.hasLiveData || curSnap.source == "SessionEstimate") {
+            if (!hasCompletedLiveFetchThisWake.get() || !curSnap.hasLiveData || curSnap.source == "SessionEstimate") {
                 lastHttpFetchMs.set(0L)
-                triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 150L)
+                triggerLightweightQuotaRefresh(RefreshReason.APP_OPEN, delayMs = 180L)
             }
         }
         return targetTag
@@ -1254,12 +1285,11 @@ object QuotaCoreEngine {
             }
 
             if (isGenuineAccountSwap) {
+                hasCompletedLiveFetchThisWake.set(false)
+                localStorageScannedThisWake.set(false)
                 cachedXsrfToken = null
                 cachedFsidToken = null
                 cachedBuildLabel = null
-                synchronized(learnedEndpointsLock) {
-                    learnedQuotaEndpoints.clear()
-                }
             }
 
             latestSnapshot.set(nextSnap)
@@ -1484,6 +1514,21 @@ object QuotaCoreEngine {
 
         bridge.hookAllMethodsByName(
             clazz = builderCls,
+            methodName = "setUploadDataProvider",
+            before = cb@{ thisObj, args ->
+                if (!isForegroundActive.get() || thisObj == null || args.isEmpty()) return@cb
+                val provider = args[0] ?: return@cb
+                val bytes = extractSmallUploadBytesSafe(provider) ?: return@cb
+                synchronized(builderHeaderMap) {
+                    val entry = builderHeaderMap.getOrPut(thisObj) { EphemeralSessionHeaders() }
+                    entry.bodyBytes = bytes
+                    if (entry.method.isNullOrBlank()) entry.method = "POST"
+                }
+            }
+        )
+
+        bridge.hookAllMethodsByName(
+            clazz = builderCls,
             methodName = "build",
             after = cb@{ thisObj, _, result ->
                 if (result == null) return@cb
@@ -1501,10 +1546,17 @@ object QuotaCoreEngine {
                 } else {
                     activeSessionTag.get()
                 }
-                val httpMethod = captured?.method ?: "GET"
+                val httpMethod = captured?.method ?: if (captured?.bodyBytes != null) "POST" else "GET"
                 val isQuotaCand = isReplayableQuotaEndpoint(url, httpMethod)
                 if (url != null && isQuotaCand) {
-                    recordLearnedQuotaEndpoint(url, httpMethod, rpcHint = "Cronet-Learned")
+                    recordLearnedQuotaEndpoint(
+                        url = url,
+                        method = httpMethod,
+                        rpcHint = "Cronet-Learned",
+                        contentType = captured?.contentType,
+                        bodyBytes = captured?.bodyBytes,
+                        extraHeaders = captured?.extraHeaders ?: emptyMap()
+                    )
                 }
                 pruneRequestMapsIfNeeded()
                 requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
@@ -1512,10 +1564,39 @@ object QuotaCoreEngine {
                     httpMethod = httpMethod,
                     sessionTag = sessTag,
                     isQueryCandidate = isGeminiQueryEndpoint(url),
-                    isQuotaEndpointCandidate = isQuotaCand
+                    isQuotaEndpointCandidate = isQuotaCand,
+                    contentType = captured?.contentType,
+                    bodyBytes = captured?.bodyBytes,
+                    extraHeaders = captured?.extraHeaders?.toMap() ?: emptyMap()
                 )
             }
         )
+    }
+
+    private fun extractSmallUploadBytesSafe(provider: Any): ByteArray? {
+        return try {
+            for (f in collectInstanceFieldsSafe(provider.javaClass)) {
+                f.isAccessible = true
+                when (val v = f.get(provider)) {
+                    is ByteArray -> {
+                        if (v.size in 1..16_384) return v.copyOf()
+                    }
+                    is ByteBuffer -> {
+                        val dup = v.duplicate()
+                        if (dup.position() > 0 && dup.remaining() == 0) dup.flip()
+                        val rem = dup.remaining()
+                        if (rem in 1..16_384) {
+                            val out = ByteArray(rem)
+                            dup.get(out)
+                            return out
+                        }
+                    }
+                }
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun hookConcreteCronetRequestInstanceClass(reqCls: Class<*>, bridge: HookBridge) {
@@ -1683,6 +1764,20 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun isGoogleApiHost(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        return try {
+            val host = URL(url).host.lowercase()
+            host == "google.com" ||
+                host.endsWith(".google.com") ||
+                host == "googleapis.com" ||
+                host.endsWith(".googleapis.com")
+        } catch (_: Throwable) {
+            val u = url.lowercase()
+            u.contains(".google.com") || u.contains(".googleapis.com")
+        }
+    }
+
     private fun isGeminiQueryEndpoint(urlOrMethod: String?): Boolean {
         if (urlOrMethod.isNullOrBlank()) return false
         val u = urlOrMethod.lowercase()
@@ -1694,23 +1789,47 @@ object QuotaCoreEngine {
 
     private fun isReplayableQuotaEndpoint(url: String?, method: String?): Boolean {
         if (url.isNullOrBlank() || isNonQuotaTelemetryUrl(url)) return false
+        if (!isGoogleApiHost(url)) return false
         val u = url.lowercase()
-        if (!u.contains("google.com")) return false
         if (u.contains("streamgenerate") || u.contains("generatecontent") ||
-            u.contains("create") || u.contains("delete") || u.contains("feedback")
+            u.contains("create") || u.contains("delete") || u.contains("feedback") ||
+            u.contains("upload") || u.contains("report")
         ) {
             return false
         }
-        val isGet = method.isNullOrBlank() || method.equals("GET", ignoreCase = true)
+        val m = method?.trim()?.uppercase()
+        val isGetOrPost = m.isNullOrEmpty() || m == "GET" || m == "POST"
+        if (!isGetOrPost) return false
+
         if (u.contains("quota") || u.contains("usage") || u.contains("allowance") ||
-            u.contains("eligibility") || u.contains("ratelimit") || u.contains("rate_limit")
+            u.contains("eligibility") || u.contains("ratelimit") || u.contains("rate_limit") ||
+            u.contains("subscription") || u.contains("entitlement")
         ) {
-            return isGet || u.contains("batchexecute")
+            return true
         }
         if (u.contains("batchexecute") && (u.contains("hooq4d") || u.contains("o4g7id") || u.contains("maziqc"))) {
             return true
         }
+        if (u.contains("robinandroid-pa.googleapis.com") &&
+            (u.contains("settings") || u.contains("account") || u.contains("user") ||
+                u.contains("feature") || u.contains("config") || u.contains("limit"))
+        ) {
+            return true
+        }
         return false
+    }
+
+    private fun isSafeAutoLearnUrl(url: String?, method: String?): Boolean {
+        if (url.isNullOrBlank() || isNonQuotaTelemetryUrl(url)) return false
+        if (!isGoogleApiHost(url)) return false
+        val u = url.lowercase()
+        if (u.contains("streamgenerate") || u.contains("generatecontent") ||
+            u.contains("feedback") || u.contains("upload")
+        ) {
+            return false
+        }
+        val m = method?.trim()?.uppercase()
+        return m.isNullOrEmpty() || m == "GET" || m == "POST"
     }
 
     private fun isNonQuotaTelemetryUrl(url: String?): Boolean {
@@ -1732,15 +1851,127 @@ object QuotaCoreEngine {
             u.contains("gvt2.com")
     }
 
-    private fun recordLearnedQuotaEndpoint(url: String, method: String, rpcHint: String? = null) {
-        if (!isReplayableQuotaEndpoint(url, method)) return
+    private fun recordLearnedQuotaEndpoint(
+        url: String,
+        method: String,
+        rpcHint: String? = null,
+        contentType: String? = null,
+        bodyBytes: ByteArray? = null,
+        extraHeaders: Map<String, String> = emptyMap(),
+        forceFromParsedResponse: Boolean = false
+    ) {
+        val allowed = if (forceFromParsedResponse) {
+            isSafeAutoLearnUrl(url, method)
+        } else {
+            isReplayableQuotaEndpoint(url, method)
+        }
+        if (!allowed) return
+
+        val bodyB64 = bodyBytes?.takeIf { it.isNotEmpty() && it.size <= 16_384 }?.let {
+            try {
+                Base64.encodeToString(it, Base64.NO_WRAP)
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        val safeHeaders = LinkedHashMap<String, String>()
+        for ((k, v) in extraHeaders) {
+            if (isSafeTechnicalHeader(k.lowercase()) && v.isNotBlank()) {
+                safeHeaders[k] = v
+            }
+        }
+
+        var changed = false
         synchronized(learnedEndpointsLock) {
-            learnedQuotaEndpoints[url] = LearnedEndpoint(
+            val prev = learnedQuotaEndpoints[url]
+            val normMethod = method.trim().uppercase().ifBlank { "GET" }
+            val next = LearnedEndpoint(
                 url = url,
-                method = method.uppercase(),
-                rpcHint = rpcHint,
+                method = normMethod,
+                rpcHint = rpcHint ?: prev?.rpcHint,
+                contentType = contentType ?: prev?.contentType,
+                bodyBase64 = bodyB64 ?: prev?.bodyBase64,
+                extraHeaders = if (safeHeaders.isNotEmpty()) safeHeaders else (prev?.extraHeaders ?: emptyMap()),
                 updatedAtMs = System.currentTimeMillis()
             )
+            changed = prev == null ||
+                prev.method != next.method ||
+                prev.bodyBase64 != next.bodyBase64 ||
+                prev.contentType != next.contentType ||
+                prev.extraHeaders != next.extraHeaders
+            learnedQuotaEndpoints[url] = next
+            if (changed) {
+                persistLearnedEndpointsLocked()
+            }
+        }
+    }
+
+    private fun persistLearnedEndpointsLocked() {
+        val ctx = appContext ?: return
+        try {
+            val arr = JSONArray()
+            for (ep in learnedQuotaEndpoints.values) {
+                val obj = JSONObject()
+                obj.put("url", ep.url)
+                obj.put("method", ep.method)
+                if (!ep.rpcHint.isNullOrBlank()) obj.put("rpcHint", ep.rpcHint)
+                if (!ep.contentType.isNullOrBlank()) obj.put("contentType", ep.contentType)
+                if (!ep.bodyBase64.isNullOrBlank()) obj.put("bodyBase64", ep.bodyBase64)
+                obj.put("updatedAtMs", ep.updatedAtMs)
+                if (ep.extraHeaders.isNotEmpty()) {
+                    val hObj = JSONObject()
+                    for ((k, v) in ep.extraHeaders) {
+                        if (isSafeTechnicalHeader(k.lowercase())) {
+                            hObj.put(k, v)
+                        }
+                    }
+                    obj.put("extraHeaders", hObj)
+                }
+                arr.put(obj)
+            }
+            ctx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString("learned_endpoints_json", arr.toString())
+                .apply()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun loadLearnedEndpoints(prefs: SharedPreferences) {
+        try {
+            val raw = prefs.getString("learned_endpoints_json", null) ?: return
+            if (raw.isBlank()) return
+            val arr = JSONArray(raw)
+            synchronized(learnedEndpointsLock) {
+                for (i in 0 until minOf(arr.length(), 8)) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val url = obj.optString("url", "")
+                    val method = obj.optString("method", "GET")
+                    if (!isSafeAutoLearnUrl(url, method)) continue
+                    val headersMap = LinkedHashMap<String, String>()
+                    val hObj = obj.optJSONObject("extraHeaders")
+                    if (hObj != null) {
+                        val keys = hObj.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            val v = hObj.optString(k, "")
+                            if (isSafeTechnicalHeader(k.lowercase()) && v.isNotBlank()) {
+                                headersMap[k] = v
+                            }
+                        }
+                    }
+                    learnedQuotaEndpoints[url] = LearnedEndpoint(
+                        url = url,
+                        method = method.uppercase(),
+                        rpcHint = obj.optString("rpcHint", "").takeIf { it.isNotBlank() },
+                        contentType = obj.optString("contentType", "").takeIf { it.isNotBlank() },
+                        bodyBase64 = obj.optString("bodyBase64", "").takeIf { it.isNotBlank() },
+                        extraHeaders = headersMap,
+                        updatedAtMs = obj.optLong("updatedAtMs", System.currentTimeMillis())
+                    )
+                }
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -1817,8 +2048,16 @@ object QuotaCoreEngine {
             }
             if (snap != null) {
                 holder.resolvedQuotaSnapshot = true
-                if (resolvedUrl != null && isReplayableQuotaEndpoint(resolvedUrl, boundCtx?.httpMethod)) {
-                    recordLearnedQuotaEndpoint(resolvedUrl, boundCtx?.httpMethod ?: "GET", rpcHint = "Cronet-PB")
+                if (resolvedUrl != null && isSafeAutoLearnUrl(resolvedUrl, boundCtx?.httpMethod)) {
+                    recordLearnedQuotaEndpoint(
+                        url = resolvedUrl,
+                        method = boundCtx?.httpMethod ?: "GET",
+                        rpcHint = "Cronet-PB",
+                        contentType = boundCtx?.contentType,
+                        bodyBytes = boundCtx?.bodyBytes,
+                        extraHeaders = boundCtx?.extraHeaders ?: emptyMap(),
+                        forceFromParsedResponse = true
+                    )
                 }
                 publishSnapshotForSession(snap, holder.sessionTag)
             }
@@ -2230,9 +2469,6 @@ object QuotaCoreEngine {
                         synchronized(builderHeaderMap) {
                             builderHeaderMap.getOrPut(thisObj) { EphemeralSessionHeaders() }.url = uStr
                         }
-                        if (isReplayableQuotaEndpoint(uStr, "GET")) {
-                            recordLearnedQuotaEndpoint(uStr, "GET", rpcHint = "OkHttp-Learned")
-                        }
                     }
                 }
             )
@@ -2249,6 +2485,73 @@ object QuotaCoreEngine {
                     }
                 )
             }
+            bridge.hookAllMethodsByName(
+                clazz = reqBuilderCls,
+                methodName = "post",
+                before = cb@{ thisObj, args ->
+                    if (!isForegroundActive.get() || thisObj == null || args.isEmpty()) return@cb
+                    val reqBody = args[0] ?: return@cb
+                    val (ct, bytes) = extractOkHttpRequestBodySafe(reqBody)
+                    synchronized(builderHeaderMap) {
+                        val entry = builderHeaderMap.getOrPut(thisObj) { EphemeralSessionHeaders() }
+                        entry.method = "POST"
+                        if (ct != null) entry.contentType = ct
+                        if (bytes != null) entry.bodyBytes = bytes
+                    }
+                }
+            )
+            bridge.hookAllMethodsByName(
+                clazz = reqBuilderCls,
+                methodName = "method",
+                before = cb@{ thisObj, args ->
+                    if (!isForegroundActive.get() || thisObj == null || args.isEmpty()) return@cb
+                    val m = args[0] as? String ?: return@cb
+                    val reqBody = args.getOrNull(1)
+                    val (ct, bytes) = if (reqBody != null) extractOkHttpRequestBodySafe(reqBody) else Pair(null, null)
+                    synchronized(builderHeaderMap) {
+                        val entry = builderHeaderMap.getOrPut(thisObj) { EphemeralSessionHeaders() }
+                        entry.method = m.trim().uppercase()
+                        if (ct != null) entry.contentType = ct
+                        if (bytes != null) entry.bodyBytes = bytes
+                    }
+                }
+            )
+            bridge.hookAllMethodsByName(
+                clazz = reqBuilderCls,
+                methodName = "build",
+                after = cb@{ thisObj, _, _ ->
+                    if (!isForegroundActive.get() || thisObj == null) return@cb
+                    val captured = synchronized(builderHeaderMap) {
+                        builderHeaderMap[thisObj]?.copy(extraHeaders = LinkedHashMap(builderHeaderMap[thisObj]?.extraHeaders ?: emptyMap()))
+                    } ?: return@cb
+                    val uStr = captured.url ?: return@cb
+                    val httpMethod = captured.method ?: if (captured.bodyBytes != null) "POST" else "GET"
+                    if (isReplayableQuotaEndpoint(uStr, httpMethod)) {
+                        recordLearnedQuotaEndpoint(
+                            url = uStr,
+                            method = httpMethod,
+                            rpcHint = "OkHttp-Learned",
+                            contentType = captured.contentType,
+                            bodyBytes = captured.bodyBytes,
+                            extraHeaders = captured.extraHeaders
+                        )
+                    }
+                }
+            )
+        }
+
+        val respCls = findClassSafe("okhttp3.Response", cl)
+        if (respCls != null && markDynamicHookOnce("okhttp_response", respCls)) {
+            bridge.hookAllMethodsByName(
+                clazz = respCls,
+                methodName = "body",
+                after = cb@{ thisObj, _, result ->
+                    if (!isForegroundActive.get() || thisObj == null || result == null) return@cb
+                    val ctx = extractOkHttpResponseContextSafe(thisObj) ?: return@cb
+                    pruneRequestMapsIfNeeded()
+                    requestContextMap[System.identityHashCode(result)] = ctx
+                }
+            )
         }
 
         val respBodyCls = findClassSafe("okhttp3.ResponseBody", cl) ?: return
@@ -2257,18 +2560,20 @@ object QuotaCoreEngine {
         bridge.hookAllMethodsByName(
             clazz = respBodyCls,
             methodName = "bytes",
-            after = cb@{ _, _, result ->
+            after = cb@{ thisObj, _, result ->
                 if (!isForegroundActive.get()) return@cb
                 val bytes = result as? ByteArray ?: return@cb
                 if (bytes.size !in 6..MAX_STREAM_ACCUM_BYTES) return@cb
-                val sess = activeSessionTag.get()
+                val boundCtx = thisObj?.let { requestContextMap.remove(System.identityHashCode(it)) }
+                val sess = boundCtx?.sessionTag ?: activeSessionTag.get()
                 submitForegroundWork {
                     val snap = try {
                         QuotaTextParser.scanProtoBufBytes(
                             rawBytes = bytes,
                             length = bytes.size,
                             prev = getBaseSnapshotForSession(sess),
-                            source = "OkHttp-PB"
+                            source = "OkHttp-PB",
+                            rpcMethodHint = boundCtx?.urlOrMethod
                         )
                     } catch (t: Throwable) {
                         QuotaHealthMonitor.recordProtobufParseFailure(
@@ -2279,8 +2584,20 @@ object QuotaCoreEngine {
                         null
                     }
                     if (snap != null) {
+                        val reqUrl = boundCtx?.urlOrMethod
+                        if (reqUrl != null) {
+                            recordLearnedQuotaEndpoint(
+                                url = reqUrl,
+                                method = boundCtx.httpMethod ?: "GET",
+                                rpcHint = "OkHttp-PB",
+                                contentType = boundCtx.contentType,
+                                bodyBytes = boundCtx.bodyBytes,
+                                extraHeaders = boundCtx.extraHeaders,
+                                forceFromParsedResponse = true
+                            )
+                        }
                         publishSnapshotForSession(snap, sess)
-                    } else if (QuotaTextParser.isLikelyCorruptedQuotaProto(bytes, bytes.size, null)) {
+                    } else if (QuotaTextParser.isLikelyCorruptedQuotaProto(bytes, bytes.size, boundCtx?.urlOrMethod)) {
                         QuotaHealthMonitor.recordProtobufParseFailure(sess, "OkHttp-PB", "corrupt quota ResponseBody")
                     }
                 }
@@ -2290,21 +2607,116 @@ object QuotaCoreEngine {
         bridge.hookAllMethodsByName(
             clazz = respBodyCls,
             methodName = "string",
-            after = cb@{ _, _, result ->
+            after = cb@{ thisObj, _, result ->
                 if (!isForegroundActive.get()) return@cb
                 val raw = result as? String ?: return@cb
                 if (raw.length > MAX_STREAM_ACCUM_BYTES || !QuotaTextParser.fastHasQuotaKeyword(raw)) return@cb
-                val sess = activeSessionTag.get()
+                val boundCtx = thisObj?.let { requestContextMap.remove(System.identityHashCode(it)) }
+                val sess = boundCtx?.sessionTag ?: activeSessionTag.get()
                 submitForegroundWork {
                     val snap = QuotaTextParser.parseInAppStructuredPayload(
                         payload = raw,
                         prev = getBaseSnapshotForSession(sess),
                         source = "OkHttp-JSON"
                     )
-                    if (snap != null) publishSnapshotForSession(snap, sess)
+                    if (snap != null) {
+                        val reqUrl = boundCtx?.urlOrMethod
+                        if (reqUrl != null) {
+                            recordLearnedQuotaEndpoint(
+                                url = reqUrl,
+                                method = boundCtx.httpMethod ?: "GET",
+                                rpcHint = "OkHttp-JSON",
+                                contentType = boundCtx.contentType,
+                                bodyBytes = boundCtx.bodyBytes,
+                                extraHeaders = boundCtx.extraHeaders,
+                                forceFromParsedResponse = true
+                            )
+                        }
+                        publishSnapshotForSession(snap, sess)
+                    }
                 }
             }
         )
+    }
+
+    private fun extractOkHttpRequestBodySafe(reqBody: Any): Pair<String?, ByteArray?> {
+        var contentType: String? = null
+        var bodyBytes: ByteArray? = null
+        try {
+            contentType = try {
+                reqBody.javaClass.getMethod("contentType").invoke(reqBody)?.toString()
+            } catch (_: Throwable) {
+                null
+            }
+            for (f in collectInstanceFieldsSafe(reqBody.javaClass)) {
+                f.isAccessible = true
+                when (val v = f.get(reqBody)) {
+                    is ByteArray -> if (v.size in 1..16_384) {
+                        bodyBytes = v.copyOf()
+                        break
+                    }
+                    else -> {
+                        if (v != null && v.javaClass.name.contains("ByteString")) {
+                            val b = try {
+                                v.javaClass.getMethod("toByteArray").invoke(v) as? ByteArray
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            if (b != null && b.size in 1..16_384) {
+                                bodyBytes = b
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return Pair(contentType, bodyBytes)
+    }
+
+    private fun extractOkHttpResponseContextSafe(respObj: Any): BoundRequestContext? {
+        return try {
+            val req = respObj.javaClass.getMethod("request").invoke(respObj) ?: return null
+            val url = req.javaClass.getMethod("url").invoke(req)?.toString() ?: return null
+            if (!isGoogleApiHost(url) || isNonQuotaTelemetryUrl(url)) return null
+            val method = (req.javaClass.getMethod("method").invoke(req) as? String)?.uppercase() ?: "GET"
+            val reqBody = try {
+                req.javaClass.getMethod("body").invoke(req)
+            } catch (_: Throwable) {
+                null
+            }
+            val (ct, bytes) = if (reqBody != null) extractOkHttpRequestBodySafe(reqBody) else Pair(null, null)
+            val safeHeaders = LinkedHashMap<String, String>()
+            try {
+                val headersObj = req.javaClass.getMethod("headers").invoke(req)
+                if (headersObj != null) {
+                    val size = (headersObj.javaClass.getMethod("size").invoke(headersObj) as? Int) ?: 0
+                    val nameM = headersObj.javaClass.getMethod("name", Int::class.javaPrimitiveType)
+                    val valM = headersObj.javaClass.getMethod("value", Int::class.javaPrimitiveType)
+                    for (i in 0 until minOf(size, 24)) {
+                        val k = nameM.invoke(headersObj, i) as? String ?: continue
+                        val v = valM.invoke(headersObj, i) as? String ?: continue
+                        if (isSafeTechnicalHeader(k.lowercase()) && v.isNotBlank()) {
+                            safeHeaders[k] = v
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            BoundRequestContext(
+                urlOrMethod = url,
+                httpMethod = method,
+                sessionTag = activeSessionTag.get(),
+                isQueryCandidate = isGeminiQueryEndpoint(url),
+                isQuotaEndpointCandidate = isReplayableQuotaEndpoint(url, method),
+                contentType = ct,
+                bodyBytes = bytes,
+                extraHeaders = safeHeaders
+            )
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun hookStructuredJsonPayloads(bridge: HookBridge) {
@@ -2513,6 +2925,9 @@ object QuotaCoreEngine {
                         appContext?.classLoader?.let { scanDexClassesForRepositoriesSafe(it) }
                     }
                     runForegroundViewModelAndRepoScan(sess)
+                    if (!hasCompletedLiveFetchThisWake.get() && localStorageScannedThisWake.compareAndSet(false, true)) {
+                        scanLocalHostStorageForCachedQuota(sess)
+                    }
                     fetchActiveQuotaOverHttp(sess, reason)
                 }
                 postToMain(delayMs = 250L, requireForeground = true) {
@@ -2728,7 +3143,105 @@ object QuotaCoreEngine {
             }
         }
 
+        // ProGuard-obfuscated ProtoLite fallback across discovered ViewModel/StateFlow/Repository objects
+        for (obj in visited.keys) {
+            val pb = trySerializeProtoLite(obj)
+            if (pb != null && pb.size in 6..MAX_STREAM_ACCUM_BYTES) {
+                val pbSnap = try {
+                    QuotaTextParser.scanProtoBufBytes(
+                        rawBytes = pb,
+                        length = pb.size,
+                        prev = baseSnapshot,
+                        source = "$source-PB",
+                        rpcMethodHint = obj.javaClass.name
+                    )
+                } catch (_: Throwable) {
+                    null
+                }
+                if (pbSnap != null && pbSnap.hasLiveData) return pbSnap
+            }
+        }
+
         return null
+    }
+
+    private fun scanLocalHostStorageForCachedQuota(sessionTag: String) {
+        if (!isForegroundActive.get()) return
+        val ctx = appContext ?: return
+        val hintKeys = arrayOf("quota", "usage", "allowance", "robin", "bard", "tier", "limit", "eligibility", "entitlement")
+
+        try {
+            val dsDir = File(ctx.filesDir, "datastore")
+            if (dsDir.isDirectory) {
+                val files = dsDir.listFiles() ?: emptyArray()
+                var checked = 0
+                for (f in files) {
+                    if (!isForegroundActive.get() || checked >= 12) break
+                    if (!f.isFile || f.length() !in 12L..65_536L) continue
+                    val fn = f.name.lowercase()
+                    if (!fn.endsWith(".pb") && !fn.endsWith(".preferences_pb")) continue
+                    if (hintKeys.none { fn.contains(it) }) continue
+                    checked++
+                    val bytes = try {
+                        f.readBytes()
+                    } catch (_: Throwable) {
+                        null
+                    } ?: continue
+                    val snap = try {
+                        QuotaTextParser.scanProtoBufBytes(
+                            rawBytes = bytes,
+                            length = bytes.size,
+                            prev = getBaseSnapshotForSession(sessionTag),
+                            source = "Local-DataStore",
+                            rpcMethodHint = fn
+                        )
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    if (snap != null && snap.hasLiveData) {
+                        publishSnapshotForSession(snap, sessionTag)
+                        break
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        try {
+            val prefsDir = File(ctx.applicationInfo.dataDir, "shared_prefs")
+            if (prefsDir.isDirectory) {
+                val files = prefsDir.listFiles() ?: emptyArray()
+                var checked = 0
+                for (f in files) {
+                    if (!isForegroundActive.get() || checked >= 12) break
+                    if (!f.isFile || f.length() !in 16L..65_536L) continue
+                    val fn = f.name.lowercase()
+                    if (!fn.endsWith(".xml") || fn.contains(QuotaTextParser.PREFS_NAME)) continue
+                    if (hintKeys.none { fn.contains(it) }) continue
+                    checked++
+                    val text = try {
+                        f.readText(StandardCharsets.UTF_8)
+                    } catch (_: Throwable) {
+                        null
+                    } ?: continue
+                    if (!QuotaTextParser.fastHasQuotaKeyword(text)) continue
+                    val snap = QuotaTextParser.parseInAppStructuredPayload(
+                        payload = text,
+                        prev = getBaseSnapshotForSession(sessionTag),
+                        source = "Local-Prefs"
+                    ) ?: QuotaTextParser.parseScreenQuotaTexts(
+                        text = text,
+                        prev = getBaseSnapshotForSession(sessionTag),
+                        source = "Local-Prefs"
+                    )
+                    if (snap != null && snap.hasLiveData) {
+                        publishSnapshotForSession(snap, sessionTag)
+                        break
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     private fun walkObjectGraphRecursive(
@@ -2875,6 +3388,28 @@ object QuotaCoreEngine {
                 is Double -> {
                     if (rawVal.isFinite() && objDoubles.size < 4) {
                         objDoubles.add(rawVal)
+                    }
+                }
+                is ByteArray -> {
+                    if (rawVal.size in 12..MAX_STREAM_ACCUM_BYTES) {
+                        try {
+                            val byteSnap = QuotaTextParser.scanProtoBufBytes(
+                                rawBytes = rawVal,
+                                length = rawVal.size,
+                                prev = QuotaHudView.Snapshot(),
+                                source = "MemBytes",
+                                rpcMethodHint = clsName
+                            )
+                            if (byteSnap != null && byteSnap.hasLiveData) {
+                                if (byteSnap.fiveHourQuota != "--") {
+                                    windowsOut.add(StructuralWindow(QuotaTextParser.MetricKind.FIVE_HOUR, byteSnap.fiveHourQuota, byteSnap.fiveHourReset, 4))
+                                }
+                                if (byteSnap.weeklyLimit != "--") {
+                                    windowsOut.add(StructuralWindow(QuotaTextParser.MetricKind.WEEKLY, byteSnap.weeklyLimit, byteSnap.weeklyReset, 4))
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
                 is String -> {
@@ -3113,7 +3648,7 @@ object QuotaCoreEngine {
     private fun onWebViewPageEvent(webView: WebView, rawUrl: String, delayEvaluateMs: Long) {
         if (!isForegroundActive.get()) return
         val lower = rawUrl.lowercase()
-        if (!lower.contains("google.com") || isNonQuotaTelemetryUrl(rawUrl)) return
+        if (!isGoogleApiHost(rawUrl) || isNonQuotaTelemetryUrl(rawUrl)) return
 
         try {
             val wvCookie = CookieManager.getInstance().getCookie(rawUrl)
@@ -3175,6 +3710,7 @@ object QuotaCoreEngine {
                                     source = "WebView-Script"
                                 )
                                 if (parsedScript != null && parsedScript.hasLiveData) {
+                                    recordLearnedQuotaEndpoint(rawUrl, "GET", rpcHint = "WebView-Script", forceFromParsedResponse = true)
                                     publishSnapshotForSession(parsedScript, sess)
                                 }
                             }
@@ -3185,6 +3721,7 @@ object QuotaCoreEngine {
                                     source = "WebView-DOM"
                                 )
                                 if (parsedDom != null && parsedDom.hasLiveData) {
+                                    recordLearnedQuotaEndpoint(rawUrl, "GET", rpcHint = "WebView-DOM", forceFromParsedResponse = true)
                                     publishSnapshotForSession(parsedDom, sess)
                                 }
                             }
@@ -3287,24 +3824,117 @@ object QuotaCoreEngine {
         }
     }
 
-    private fun readBoundedHttpResponse(conn: HttpURLConnection, maxChars: Int): String? {
+    private fun readBoundedHttpBytes(conn: HttpURLConnection, maxBytes: Int): ByteArray? {
         return try {
             val code = conn.responseCode
             if (code !in 200..299) return null
             val stream = conn.inputStream ?: return null
-            InputStreamReader(stream, StandardCharsets.UTF_8).use { reader ->
-                val sb = StringBuilder(minOf(65_536, maxChars))
-                val buf = CharArray(4096)
+            stream.use { input ->
+                val out = ByteArrayOutputStream(minOf(32_768, maxBytes))
+                val buf = ByteArray(4096)
+                var total = 0
                 var r: Int
-                while (reader.read(buf).also { r = it } != -1 && sb.length < maxChars) {
-                    val allow = minOf(r, maxChars - sb.length)
-                    sb.append(buf, 0, allow)
+                while (input.read(buf).also { r = it } != -1 && total < maxBytes) {
+                    val allow = minOf(r, maxBytes - total)
+                    out.write(buf, 0, allow)
+                    total += allow
                 }
-                sb.toString()
+                out.toByteArray()
             }
         } catch (_: Throwable) {
             null
         }
+    }
+
+    private fun readBoundedHttpResponse(conn: HttpURLConnection, maxChars: Int): String? {
+        val bytes = readBoundedHttpBytes(conn, minOf(maxChars * 2, 2_097_152)) ?: return null
+        if (bytes.isEmpty()) return null
+        return try {
+            val s = String(bytes, StandardCharsets.UTF_8)
+            if (s.length > maxChars) s.substring(0, maxChars) else s
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun parseHttpResponseBytes(
+        url: String,
+        bytes: ByteArray,
+        sessionTag: String,
+        sourceTag: String
+    ): QuotaHudView.Snapshot? {
+        if (bytes.isEmpty()) return null
+        val prev = getBaseSnapshotForSession(sessionTag)
+
+        var firstPrintable: Byte = 0
+        for (i in 0 until minOf(bytes.size, 32)) {
+            val b = bytes[i]
+            if (b != ' '.code.toByte() && b != '\n'.code.toByte() && b != '\r'.code.toByte() && b != '\t'.code.toByte()) {
+                firstPrintable = b
+                break
+            }
+        }
+        val looksLikeTextOrHtml = firstPrintable == '{'.code.toByte() ||
+            firstPrintable == '['.code.toByte() ||
+            firstPrintable == '<'.code.toByte() ||
+            firstPrintable == ')'.code.toByte()
+
+        if (looksLikeTextOrHtml) {
+            val text = try {
+                String(bytes, StandardCharsets.UTF_8)
+            } catch (_: Throwable) {
+                null
+            }
+            if (!text.isNullOrBlank()) {
+                extractWizTokensFromHtml(text)
+                val parsedText = QuotaTextParser.parseHtmlOrJsonPayload(
+                    payload = text,
+                    prev = prev,
+                    source = sourceTag
+                )
+                if (parsedText != null && parsedText.hasLiveData) {
+                    return parsedText
+                }
+            }
+        }
+
+        if (bytes.size >= 6) {
+            val parsedPb = try {
+                QuotaTextParser.scanProtoBufBytes(
+                    rawBytes = bytes,
+                    length = minOf(bytes.size, MAX_STREAM_ACCUM_BYTES),
+                    prev = prev,
+                    source = if (sourceTag.endsWith("-PB")) sourceTag else "$sourceTag-PB",
+                    rpcMethodHint = url
+                )
+            } catch (_: Throwable) {
+                null
+            }
+            if (parsedPb != null && parsedPb.hasLiveData) {
+                return parsedPb
+            }
+        }
+
+        if (!looksLikeTextOrHtml) {
+            val text = try {
+                String(bytes, StandardCharsets.UTF_8)
+            } catch (_: Throwable) {
+                null
+            }
+            if (!text.isNullOrBlank()) {
+                extractWizTokensFromHtml(text)
+                val parsedFallback = QuotaTextParser.parseHtmlOrJsonPayload(
+                    payload = text,
+                    prev = prev,
+                    source = sourceTag
+                )
+                if (parsedFallback != null && parsedFallback.hasLiveData) {
+                    return parsedFallback
+                }
+            }
+        }
+
+        return null
     }
 
     private fun fetchActiveQuotaOverHttp(sessionTag: String, reason: RefreshReason) {
@@ -3313,7 +3943,6 @@ object QuotaCoreEngine {
         val isManual = reason == RefreshReason.MANUAL_TAP || reason == RefreshReason.ACCOUNT_SWITCH
         val minInterval = if (isManual) 2_000L else 10_000L
         if (now - lastHttpFetchMs.get() < minInterval) return
-        lastHttpFetchMs.set(now)
 
         val dynState = activeDynamicSession.get()
         val authHeader = dynState.authorizationHeader
@@ -3334,40 +3963,70 @@ object QuotaCoreEngine {
         }
 
         // If neither cookie nor OAuth Bearer token is available yet, apply rolling estimation if queries exist
+        // WITHOUT poisoning lastHttpFetchMs so subsequent requests carrying real headers trigger immediately.
         if (cookieHeader.isNullOrBlank() && authHeader.isNullOrBlank()) {
             applySessionQueryEstimationIfNeeded(sessionTag)
             return
         }
 
+        lastHttpFetchMs.set(now)
+
         var fetchedSnapshot: QuotaHudView.Snapshot? = null
         val mobileUa = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
-        // 0. Replay learned GET quota endpoints captured from Gemini's own UI traffic
+        // 0. Replay learned GET & POST quota endpoints captured across current or prior sessions
         val learnedCopy: List<LearnedEndpoint> = synchronized(learnedEndpointsLock) {
             ArrayList(learnedQuotaEndpoints.values)
         }
         for (ep in learnedCopy.asReversed()) {
             if (!isForegroundActive.get() || fetchedSnapshot != null) break
-            if (!ep.method.equals("GET", ignoreCase = true)) continue
+            val isPost = ep.method.equals("POST", ignoreCase = true)
+            if (!isPost && !ep.method.equals("GET", ignoreCase = true)) continue
+            if (isPost && ep.url.contains("batchexecute") && ep.bodyBase64 == null && cachedXsrfToken.isNullOrBlank()) continue
             try {
                 val conn = (URL(ep.url).openConnection() as? HttpURLConnection) ?: continue
+                conn.requestMethod = ep.method.uppercase()
                 conn.instanceFollowRedirects = true
                 conn.connectTimeout = 5_000
                 conn.readTimeout = 5_000
+                for ((hk, hv) in ep.extraHeaders) {
+                    if (isSafeTechnicalHeader(hk.lowercase())) {
+                        conn.setRequestProperty(hk, hv)
+                    }
+                }
                 conn.setRequestProperty("User-Agent", mobileUa)
-                conn.setRequestProperty("Accept", "application/json, text/plain, */*")
+                if (!ep.extraHeaders.keys.any { it.equals("Accept", ignoreCase = true) }) {
+                    conn.setRequestProperty("Accept", "application/json, application/x-protobuf, text/plain, */*")
+                }
                 conn.setRequestProperty("X-Goog-AuthUser", authUser)
                 if (!cookieHeader.isNullOrBlank()) conn.setRequestProperty("Cookie", cookieHeader)
                 if (!authHeader.isNullOrBlank()) conn.setRequestProperty("Authorization", authHeader)
 
-                val body = readBoundedHttpResponse(conn, 262_144)
+                if (isPost) {
+                    conn.doOutput = true
+                    val ct = ep.contentType ?: "application/x-protobuf"
+                    conn.setRequestProperty("Content-Type", ct)
+                    val bodyBytes = ep.bodyBase64?.let {
+                        try {
+                            Base64.decode(it, Base64.DEFAULT)
+                        } catch (_: Throwable) {
+                            null
+                        }
+                    } ?: ByteArray(0)
+                    conn.outputStream.use { out ->
+                        if (bodyBytes.isNotEmpty()) out.write(bodyBytes)
+                        out.flush()
+                    }
+                }
+
+                val bytes = readBoundedHttpBytes(conn, 262_144)
                 conn.disconnect()
-                if (!body.isNullOrBlank()) {
-                    extractWizTokensFromHtml(body)
-                    val parsed = QuotaTextParser.parseHtmlOrJsonPayload(
-                        payload = body,
-                        prev = getBaseSnapshotForSession(sessionTag),
-                        source = ep.rpcHint ?: "Learned-HTTP"
+                if (bytes != null && bytes.isNotEmpty()) {
+                    val parsed = parseHttpResponseBytes(
+                        url = ep.url,
+                        bytes = bytes,
+                        sessionTag = sessionTag,
+                        sourceTag = ep.rpcHint ?: "Learned-HTTP"
                     )
                     if (parsed != null && parsed.hasLiveData) {
                         fetchedSnapshot = parsed
@@ -3377,10 +4036,11 @@ object QuotaCoreEngine {
             }
         }
 
-        // 1. Fetch Gemini Web app landing page up to 1.5 MB: captures SNlM0e/FdrFJe/cfb2h & full AF_initDataCallback blobs
-        if (fetchedSnapshot == null && isForegroundActive.get()) {
-            val primaryPath = if (authUser != "0") "https://gemini.google.com/u/$authUser/app?hl=zh-CN" else "https://gemini.google.com/app?hl=zh-CN"
-            val landingCandidates = arrayOf(primaryPath, "https://gemini.google.com/app?hl=en")
+        // 1. Fetch Gemini Web /usage & /app pages up to 1.5 MB: captures SNlM0e/FdrFJe/cfb2h & AF_initDataCallback blobs
+        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank() && isForegroundActive.get()) {
+            val usagePrimary = if (authUser != "0") "https://gemini.google.com/u/$authUser/usage?hl=zh-CN" else "https://gemini.google.com/usage?hl=zh-CN"
+            val appPrimary = if (authUser != "0") "https://gemini.google.com/u/$authUser/app?hl=zh-CN" else "https://gemini.google.com/app?hl=zh-CN"
+            val landingCandidates = arrayOf(usagePrimary, appPrimary, "https://gemini.google.com/app?hl=en")
             for (pageUrl in landingCandidates) {
                 if (fetchedSnapshot != null || !isForegroundActive.get()) break
                 try {
@@ -3393,22 +4053,24 @@ object QuotaCoreEngine {
                     conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
                     conn.setRequestProperty("Cache-Control", "no-cache")
                     conn.setRequestProperty("X-Goog-AuthUser", authUser)
-                    if (!cookieHeader.isNullOrBlank()) conn.setRequestProperty("Cookie", cookieHeader)
+                    conn.setRequestProperty("Cookie", cookieHeader)
                     if (!authHeader.isNullOrBlank()) conn.setRequestProperty("Authorization", authHeader)
 
                     val html = readBoundedHttpResponse(conn, 1_572_864)
                     conn.disconnect()
                     if (!html.isNullOrBlank()) {
                         extractWizTokensFromHtml(html)
+                        val isUsagePage = pageUrl.contains("/usage")
                         val parsed = QuotaTextParser.parseHtmlOrJsonPayload(
                             payload = html,
                             prev = getBaseSnapshotForSession(sessionTag),
-                            source = "Active-Web"
+                            source = if (isUsagePage) "Active-Web-Usage" else "Active-Web"
                         )
                         if (parsed != null && parsed.hasLiveData) {
                             fetchedSnapshot = parsed
+                            recordLearnedQuotaEndpoint(pageUrl, "GET", rpcHint = if (isUsagePage) "Active-Web-Usage" else "Active-Web", forceFromParsedResponse = true)
                         }
-                        if (cachedXsrfToken != null) break
+                        if (cachedXsrfToken != null && fetchedSnapshot != null) break
                     }
                 } catch (t: Throwable) {
                     safeLog(activeBridgeRef.get(), "Active Web fetch attempt: ${t.javaClass.simpleName} (${t.message})")
@@ -3477,6 +4139,7 @@ object QuotaCoreEngine {
         }
 
         if (fetchedSnapshot != null && fetchedSnapshot.hasLiveData) {
+            hasCompletedLiveFetchThisWake.set(true)
             safeLog(
                 activeBridgeRef.get(),
                 "Active HTTP quota resolved -> 5h=${fetchedSnapshot.fiveHourQuota} (${fetchedSnapshot.fiveHourReset}), Weekly=${fetchedSnapshot.weeklyLimit} (${fetchedSnapshot.weeklyReset})"
@@ -3863,6 +4526,10 @@ object QuotaCoreEngine {
 
         if (hasNonZeroQuotaData(cleanToApply) && !cleanToApply.isStaleOffline) {
             QuotaHealthMonitor.recordHealthySuccess(sessionTag)
+            val s = cleanToApply.source
+            if (s != "SessionEstimate" && s != "InAppCache" && s != "Local-DataStore" && s != "Local-Prefs") {
+                hasCompletedLiveFetchThisWake.set(true)
+            }
         }
 
         if (!shouldUpdateActiveHud) return
@@ -4021,9 +4688,10 @@ object QuotaCoreEngine {
             }
         }
 
+        // Keep persisted learnedQuotaEndpoints intact across soft session resets so next cold start
+        // still remembers the discovered quota RPC/URL template for replay.
         synchronized(learnedEndpointsLock) {
             clearedLearnedCount = learnedQuotaEndpoints.size
-            learnedQuotaEndpoints.clear()
         }
 
         cachedXsrfToken = null
@@ -4058,13 +4726,14 @@ object QuotaCoreEngine {
             }
         }
 
-        return "Session槽位=$target(live=$removedLiveSlot, cache=$removedCacheSlot), 端点缓存=$clearedLearnedCount, 流/WIZ令牌已重置"
+        return "Session槽位=$target(live=$removedLiveSlot, cache=$removedCacheSlot), 保留已学习端点=$clearedLearnedCount, 流/WIZ令牌已重置"
     }
 
     private fun loadSanitizedHostMirror(ctx: Context?) {
         if (ctx == null) return
         try {
             val prefs = ctx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+            loadLearnedEndpoints(prefs)
             val langCode = prefs.getString("ui_lang", null)
             val themeCode = prefs.getString("ui_theme", null)
             val savedSession = prefs.getString("session_id", null)
