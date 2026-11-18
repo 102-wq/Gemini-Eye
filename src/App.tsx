@@ -274,14 +274,36 @@ export default function App() {
   const settingsBarWeeklyRef = useRef<HTMLDivElement | null>(null);
 
   const hudPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const hudAnimRafRef = useRef<number | null>(null);
   const dragRef = useRef<{
     startX: number;
     startY: number;
     origX: number;
     origY: number;
+    targetX: number;
+    targetY: number;
+    lastClientX: number;
+    lastClientY: number;
+    lastTimeMs: number;
+    vx: number;
+    vy: number;
     moved: boolean;
     pointerDown: boolean;
-  }>({ startX: 0, startY: 0, origX: 0, origY: 0, moved: false, pointerDown: false });
+  }>({
+    startX: 0,
+    startY: 0,
+    origX: 0,
+    origY: 0,
+    targetX: 0,
+    targetY: 0,
+    lastClientX: 0,
+    lastClientY: 0,
+    lastTimeMs: 0,
+    vx: 0,
+    vy: 0,
+    moved: false,
+    pointerDown: false,
+  });
 
   const isZh = uiLang === 'zh';
 
@@ -322,6 +344,22 @@ export default function App() {
     if (settingsBar5hRef.current) settingsBar5hRef.current.style.width = w5;
     if (settingsBarWeeklyRef.current) settingsBarWeeklyRef.current.style.width = wWk;
   }, [activeSession, activeView, isGeminiForeground, isStaleOffline, isSessionDeepCleaned]);
+
+  useEffect(() => {
+    if (isGeminiForeground && hudCapsuleRef.current) {
+      const { x, y } = hudPosRef.current;
+      hudCapsuleRef.current.style.transform = `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)`;
+    }
+  }, [isGeminiForeground]);
+
+  useEffect(() => {
+    return () => {
+      if (hudAnimRafRef.current !== null) {
+        cancelAnimationFrame(hudAnimRafRef.current);
+        hudAnimRafRef.current = null;
+      }
+    };
+  }, []);
 
   const handleDownloadZip = () => {
     const blob = buildZipBlob(
@@ -552,41 +590,184 @@ export default function App() {
     setUsageSheetOpen(true);
   };
 
+  const getHudDragBounds = () => {
+    const capsule = hudCapsuleRef.current;
+    const host = capsule?.parentElement;
+    if (capsule && host) {
+      const maxLeftShift = Math.max(24, host.clientWidth - capsule.offsetWidth - 20);
+      const maxDownShift = Math.max(180, host.clientHeight - capsule.offsetHeight - 132);
+      return {
+        minX: -maxLeftShift,
+        maxX: 4,
+        minY: -6,
+        maxY: maxDownShift,
+      };
+    }
+    return { minX: -64, maxX: 8, minY: -8, maxY: 260 };
+  };
+
+  const clampHudValue = (val: number, min: number, max: number) =>
+    Math.max(min, Math.min(max, val));
+
+  const rubberBandHudValue = (val: number, min: number, max: number, maxOvershoot = 18) => {
+    if (val < min) {
+      const over = min - val;
+      return min - maxOvershoot * (1 - Math.exp(-over / 42));
+    }
+    if (val > max) {
+      const over = val - max;
+      return max + maxOvershoot * (1 - Math.exp(-over / 42));
+    }
+    return val;
+  };
+
+  const applyHudTransform = (x: number, y: number) => {
+    hudPosRef.current = { x, y };
+    if (hudCapsuleRef.current) {
+      hudCapsuleRef.current.style.transform = `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)`;
+    }
+  };
+
+  const ensureHudAnimationLoop = () => {
+    if (hudAnimRafRef.current !== null) return;
+    let lastFrameTime = performance.now();
+
+    const step = (now: number) => {
+      const dt = Math.min(34, Math.max(4, now - lastFrameTime));
+      lastFrameTime = now;
+      const frameScale = dt / 16.67;
+
+      const drag = dragRef.current;
+      const bounds = getHudDragBounds();
+
+      if (drag.pointerDown) {
+        const lerpAlpha = 1 - Math.pow(1 - 0.42, frameScale);
+        const curX = hudPosRef.current.x;
+        const curY = hudPosRef.current.y;
+        const dx = drag.targetX - curX;
+        const dy = drag.targetY - curY;
+
+        if (Math.abs(dx) < 0.08 && Math.abs(dy) < 0.08) {
+          applyHudTransform(drag.targetX, drag.targetY);
+          hudAnimRafRef.current = null;
+          return;
+        }
+        applyHudTransform(curX + dx * lerpAlpha, curY + dy * lerpAlpha);
+        hudAnimRafRef.current = requestAnimationFrame(step);
+        return;
+      }
+
+      // Release phase: inertial glide + smooth elastic settle back inside bounds
+      const decay = Math.pow(0.9, frameScale);
+      drag.vx *= decay;
+      drag.vy *= decay;
+
+      const rawNextTargetX = drag.targetX + drag.vx * dt;
+      const rawNextTargetY = drag.targetY + drag.vy * dt;
+      const clampedX = clampHudValue(rawNextTargetX, bounds.minX, bounds.maxX);
+      const clampedY = clampHudValue(rawNextTargetY, bounds.minY, bounds.maxY);
+
+      if (rawNextTargetX !== clampedX) drag.vx *= 0.45;
+      if (rawNextTargetY !== clampedY) drag.vy *= 0.45;
+
+      drag.targetX = clampedX;
+      drag.targetY = clampedY;
+
+      const curX = hudPosRef.current.x;
+      const curY = hudPosRef.current.y;
+      const followAlpha = 1 - Math.pow(1 - 0.26, frameScale);
+      const nextX = curX + (clampedX - curX) * followAlpha;
+      const nextY = curY + (clampedY - curY) * followAlpha;
+
+      const speed = Math.hypot(drag.vx, drag.vy);
+      const dist = Math.hypot(clampedX - nextX, clampedY - nextY);
+      if (speed < 0.025 && dist < 0.12) {
+        drag.vx = 0;
+        drag.vy = 0;
+        applyHudTransform(clampedX, clampedY);
+        hudAnimRafRef.current = null;
+        return;
+      }
+
+      applyHudTransform(nextX, nextY);
+      hudAnimRafRef.current = requestAnimationFrame(step);
+    };
+
+    hudAnimRafRef.current = requestAnimationFrame(step);
+  };
+
   const onHudPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
     if (target.closest('[data-hud-action="true"]')) {
       return;
     }
     e.currentTarget.setPointerCapture(e.pointerId);
+    const now = performance.now();
     dragRef.current = {
       startX: e.clientX,
       startY: e.clientY,
       origX: hudPosRef.current.x,
       origY: hudPosRef.current.y,
+      targetX: hudPosRef.current.x,
+      targetY: hudPosRef.current.y,
+      lastClientX: e.clientX,
+      lastClientY: e.clientY,
+      lastTimeMs: now,
+      vx: 0,
+      vy: 0,
       moved: false,
       pointerDown: true,
     };
   };
 
   const onHudPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current.pointerDown) return;
-    const dx = e.clientX - dragRef.current.startX;
-    const dy = e.clientY - dragRef.current.startY;
-    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
-      dragRef.current.moved = true;
+    const drag = dragRef.current;
+    if (!drag.pointerDown) return;
+
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (!drag.moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+      drag.moved = true;
     }
-    if (dragRef.current.moved) {
-      const nextX = Math.max(-48, Math.min(24, dragRef.current.origX + dx));
-      const nextY = Math.max(-24, Math.min(240, dragRef.current.origY + dy));
-      hudPosRef.current = { x: nextX, y: nextY };
-      if (hudCapsuleRef.current) {
-        hudCapsuleRef.current.style.translate = `${nextX}px ${nextY}px`;
-      }
-    }
+    if (!drag.moved) return;
+
+    const now = performance.now();
+    const dt = Math.min(64, Math.max(4, now - drag.lastTimeMs));
+    const instVx = (e.clientX - drag.lastClientX) / dt;
+    const instVy = (e.clientY - drag.lastClientY) / dt;
+
+    // Exponential velocity smoothing prevents fast-swipe spike jitter
+    drag.vx = drag.vx * 0.6 + clampHudValue(instVx, -1.6, 1.6) * 0.4;
+    drag.vy = drag.vy * 0.6 + clampHudValue(instVy, -1.6, 1.6) * 0.4;
+    drag.lastClientX = e.clientX;
+    drag.lastClientY = e.clientY;
+    drag.lastTimeMs = now;
+
+    const bounds = getHudDragBounds();
+    drag.targetX = rubberBandHudValue(drag.origX + dx, bounds.minX, bounds.maxX);
+    drag.targetY = rubberBandHudValue(drag.origY + dy, bounds.minY, bounds.maxY);
+
+    ensureHudAnimationLoop();
   };
 
-  const onHudPointerUp = () => {
-    dragRef.current.pointerDown = false;
+  const onHudPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag.pointerDown) return;
+    drag.pointerDown = false;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore if capture already released
+    }
+    if (drag.moved) {
+      if (performance.now() - drag.lastTimeMs > 70) {
+        drag.vx = 0;
+        drag.vy = 0;
+      }
+      ensureHudAnimationLoop();
+    }
   };
 
   const pickBarColorClass = (pct: number) => {
@@ -1270,7 +1451,8 @@ export default function App() {
                       onPointerDown={onHudPointerDown}
                       onPointerMove={onHudPointerMove}
                       onPointerUp={onHudPointerUp}
-                      className={`absolute top-12 right-2.5 max-w-[96%] inline-flex items-center px-2.5 py-1.5 rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none transition-colors ${capsuleContainerClass}`}
+                      onPointerCancel={onHudPointerUp}
+                      className={`absolute top-12 right-2.5 max-w-[96%] inline-flex items-center px-2.5 py-1.5 rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${capsuleContainerClass}`}
                     >
                       <span className={`font-semibold ${capsuleLabelClass}`}>5h</span>
                       <span
