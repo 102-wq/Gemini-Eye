@@ -53,6 +53,7 @@ class QuotaSyncProvider : ContentProvider() {
         val lastBridge: String = "",
         val overlayEnabled: Boolean = false,
         val zeroGuardCount: Int = 0,
+        val linkAnomalyCount: Int = 0,
         val devLogsJson: String = "[]"
     ) {
         val isActivelyBound: Boolean
@@ -81,6 +82,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putString(KEY_LAST_BRIDGE, lastBridge)
                 putBoolean(KEY_OVERLAY_ENABLED, false)
                 putInt(KEY_ZERO_GUARD_COUNT, zeroGuardCount)
+                putInt(KEY_LINK_ANOMALY_COUNT, linkAnomalyCount)
                 putString(KEY_DEV_LOGS_JSON, devLogsJson)
             }
         }
@@ -110,6 +112,7 @@ class QuotaSyncProvider : ContentProvider() {
                     lastBridge = bundle.getString(KEY_LAST_BRIDGE, "") ?: "",
                     overlayEnabled = false,
                     zeroGuardCount = bundle.getInt(KEY_ZERO_GUARD_COUNT, 0),
+                    linkAnomalyCount = bundle.getInt(KEY_LINK_ANOMALY_COUNT, 0),
                     devLogsJson = bundle.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
                 )
             }
@@ -196,7 +199,8 @@ class QuotaSyncProvider : ContentProvider() {
                 METHOD_APPEND_DEV_EVENT -> {
                     val eventJson = extras?.getString(KEY_DEV_EVENT_JSON)
                     val incrementZeroGuard = extras?.getBoolean(KEY_INCREMENT_ZERO_GUARD, false) ?: false
-                    val updated = appendDevEventLocal(appCtx, eventJson, incrementZeroGuard)
+                    val incrementLinkAnomaly = extras?.getBoolean(KEY_INCREMENT_LINK_ANOMALY, false) ?: false
+                    val updated = appendDevEventLocal(appCtx, eventJson, incrementZeroGuard, incrementLinkAnomaly)
                     HookTelemetryReceiver.notifyUiListeners()
                     updated.toBundle()
                 }
@@ -306,9 +310,11 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_LAST_BRIDGE = "last_bridge"
         const val KEY_OVERLAY_ENABLED = "overlay_enabled"
         const val KEY_ZERO_GUARD_COUNT = "zero_guard_count"
+        const val KEY_LINK_ANOMALY_COUNT = "link_anomaly_count"
         const val KEY_DEV_LOGS_JSON = "dev_logs_json"
         const val KEY_DEV_EVENT_JSON = "dev_event_json"
         const val KEY_INCREMENT_ZERO_GUARD = "increment_zero_guard"
+        const val KEY_INCREMENT_LINK_ANOMALY = "increment_link_anomaly"
 
         private const val ACTIVE_HOOK_WINDOW_MS = 12 * 60 * 60 * 1000L
         private const val MAX_DEV_CONSOLE_LOGS = 30
@@ -366,6 +372,7 @@ class QuotaSyncProvider : ContentProvider() {
                     lastBridge = prefs.getString(KEY_LAST_BRIDGE, "") ?: "",
                     overlayEnabled = false,
                     zeroGuardCount = prefs.getInt(KEY_ZERO_GUARD_COUNT, 0),
+                    linkAnomalyCount = prefs.getInt(KEY_LINK_ANOMALY_COUNT, 0),
                     devLogsJson = prefs.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
                 )
                 cachedState.set(loaded)
@@ -661,17 +668,22 @@ class QuotaSyncProvider : ContentProvider() {
         internal fun appendDevEventLocal(
             appCtx: Context,
             eventJson: String?,
-            incrementZeroGuard: Boolean
+            incrementZeroGuard: Boolean,
+            incrementLinkAnomaly: Boolean = false
         ): UnifiedState {
             val prev = ensureLoaded(appCtx)
             if (eventJson.isNullOrBlank()) return prev
 
-            val nextCount = if (incrementZeroGuard) prev.zeroGuardCount + 1 else prev.zeroGuardCount
+            val nextZeroCount = if (incrementZeroGuard) prev.zeroGuardCount + 1 else prev.zeroGuardCount
+            val nextAnomalyCount = if (incrementLinkAnomaly) prev.linkAnomalyCount + 1 else prev.linkAnomalyCount
             val nextArr = JSONArray()
             try {
                 val incoming = JSONObject(eventJson)
                 if (incrementZeroGuard && !incoming.has("triggerCount")) {
-                    incoming.put("triggerCount", nextCount)
+                    incoming.put("triggerCount", nextZeroCount)
+                }
+                if (incrementLinkAnomaly && !incoming.has("triggerCount")) {
+                    incoming.put("triggerCount", nextAnomalyCount)
                 }
                 nextArr.put(incoming)
                 val prevArr = JSONArray(prev.devLogsJson.ifBlank { "[]" })
@@ -685,7 +697,8 @@ class QuotaSyncProvider : ContentProvider() {
 
             val nextJson = nextArr.toString()
             val next = prev.copy(
-                zeroGuardCount = nextCount,
+                zeroGuardCount = nextZeroCount,
+                linkAnomalyCount = nextAnomalyCount,
                 devLogsJson = nextJson
             )
             cachedState.set(next)
@@ -693,7 +706,8 @@ class QuotaSyncProvider : ContentProvider() {
             try {
                 appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
                     .edit()
-                    .putInt(KEY_ZERO_GUARD_COUNT, nextCount)
+                    .putInt(KEY_ZERO_GUARD_COUNT, nextZeroCount)
+                    .putInt(KEY_LINK_ANOMALY_COUNT, nextAnomalyCount)
                     .putString(KEY_DEV_LOGS_JSON, nextJson)
                     .apply()
             } catch (_: Throwable) {
@@ -711,6 +725,7 @@ class QuotaSyncProvider : ContentProvider() {
             val prev = ensureLoaded(appCtx)
             val next = prev.copy(
                 zeroGuardCount = 0,
+                linkAnomalyCount = 0,
                 devLogsJson = "[]"
             )
             cachedState.set(next)
@@ -719,6 +734,7 @@ class QuotaSyncProvider : ContentProvider() {
                 appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
                     .edit()
                     .putInt(KEY_ZERO_GUARD_COUNT, 0)
+                    .putInt(KEY_LINK_ANOMALY_COUNT, 0)
                     .putString(KEY_DEV_LOGS_JSON, "[]")
                     .apply()
             } catch (_: Throwable) {
@@ -754,12 +770,47 @@ class QuotaSyncProvider : ContentProvider() {
                     put("detailEn", detailEn)
                 }
                 if (isInModuleProcess(context)) {
-                    appendDevEventLocal(context.applicationContext ?: context, obj.toString(), true)
+                    appendDevEventLocal(context.applicationContext ?: context, obj.toString(), true, false)
                     HookTelemetryReceiver.notifyUiListeners()
                 } else {
                     val extras = Bundle().apply {
                         putString(KEY_DEV_EVENT_JSON, obj.toString())
                         putBoolean(KEY_INCREMENT_ZERO_GUARD, true)
+                    }
+                    context.contentResolver.call(AUTHORITY_URI, METHOD_APPEND_DEV_EVENT, null, extras)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun recordLinkAnomalyEvent(
+            context: Context,
+            sessionId: String,
+            source: String,
+            cleanedSummary: String,
+            detailZh: String,
+            detailEn: String,
+            anomalyCount: Int
+        ) {
+            try {
+                val obj = JSONObject().apply {
+                    put("eventType", "LINK_ANOMALY")
+                    put("eventTimeMs", System.currentTimeMillis())
+                    put("cachedAtMs", 0L)
+                    put("sessionId", sessionId)
+                    put("source", source)
+                    put("restoredQuota", cleanedSummary)
+                    put("triggerCount", anomalyCount)
+                    put("detailZh", detailZh)
+                    put("detailEn", detailEn)
+                }
+                if (isInModuleProcess(context)) {
+                    appendDevEventLocal(context.applicationContext ?: context, obj.toString(), false, true)
+                    HookTelemetryReceiver.notifyUiListeners()
+                } else {
+                    val extras = Bundle().apply {
+                        putString(KEY_DEV_EVENT_JSON, obj.toString())
+                        putBoolean(KEY_INCREMENT_LINK_ANOMALY, true)
                     }
                     context.contentResolver.call(AUTHORITY_URI, METHOD_APPEND_DEV_EVENT, null, extras)
                 }

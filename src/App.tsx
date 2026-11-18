@@ -32,7 +32,8 @@ type DevEventType =
   | 'MANUAL_TAP'
   | 'BACKGROUND_SLEEP'
   | 'PROTO_SCAN'
-  | 'ZERO_GUARD';
+  | 'ZERO_GUARD'
+  | 'LINK_ANOMALY';
 
 interface CachedSnapshotEntry {
   cachedAtStr: string;
@@ -176,8 +177,10 @@ export default function App() {
   const [lastSyncNote, setLastSyncNote] = useState<string>('');
   const [devConsoleOpen, setDevConsoleOpen] = useState<boolean>(false);
   const [isStaleOffline, setIsStaleOffline] = useState<boolean>(false);
+  const [isSessionDeepCleaned, setIsSessionDeepCleaned] = useState<boolean>(false);
   const [zeroGuardCount, setZeroGuardCount] = useState<number>(0);
-  const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD'>('ALL');
+  const [linkAnomalyCount, setLinkAnomalyCount] = useState<number>(0);
+  const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY'>('ALL');
   const cachedSnapshotsRef = useRef<Record<string, CachedSnapshotEntry>>({
     sess_8f3a91c04b12: {
       cachedAtStr: formatFullTimestampMs(new Date(Date.now() - 18_500)),
@@ -304,18 +307,21 @@ export default function App() {
     if (consoleFilter === 'ZERO_GUARD') {
       return devLogs.filter((l) => l.eventType === 'ZERO_GUARD');
     }
+    if (consoleFilter === 'LINK_ANOMALY') {
+      return devLogs.filter((l) => l.eventType === 'LINK_ANOMALY');
+    }
     return devLogs;
   }, [devLogs, consoleFilter]);
 
   // Update mini progress bar fill widths via DOM refs (no inline style props)
   useEffect(() => {
-    const w5 = `${Math.max(8, Math.min(100, activeSession.parsed.fiveHourPct))}%`;
-    const wWk = `${Math.max(8, Math.min(100, activeSession.parsed.weeklyPct))}%`;
+    const w5 = isSessionDeepCleaned ? '0%' : `${Math.max(8, Math.min(100, activeSession.parsed.fiveHourPct))}%`;
+    const wWk = isSessionDeepCleaned ? '0%' : `${Math.max(8, Math.min(100, activeSession.parsed.weeklyPct))}%`;
     if (bar5hRef.current) bar5hRef.current.style.width = w5;
     if (barWeeklyRef.current) barWeeklyRef.current.style.width = wWk;
     if (settingsBar5hRef.current) settingsBar5hRef.current.style.width = w5;
     if (settingsBarWeeklyRef.current) settingsBarWeeklyRef.current.style.width = wWk;
-  }, [activeSession, activeView, isGeminiForeground, isStaleOffline]);
+  }, [activeSession, activeView, isGeminiForeground, isStaleOffline, isSessionDeepCleaned]);
 
   const handleDownloadZip = () => {
     const blob = buildZipBlob(
@@ -364,6 +370,7 @@ export default function App() {
     };
     const nextHit = zeroGuardCount + 1;
     setZeroGuardCount(nextHit);
+    setIsSessionDeepCleaned(false);
     setIsStaleOffline(true);
 
     const wkZh = formatWeeklyResetLabel(cached.weeklyReset, 'zh');
@@ -386,9 +393,42 @@ export default function App() {
     );
   };
 
+  const handleSimulateHealthAnomaly = () => {
+    const nextAnomaly = linkAnomalyCount + 1;
+    setLinkAnomalyCount(nextAnomaly);
+    setIsStaleOffline(false);
+    setIsSessionDeepCleaned(true);
+    delete cachedSnapshotsRef.current[activeSession.sessionTag];
+
+    const reasonZh =
+      nextAnomaly % 2 === 1
+        ? 'Protobuf 解析失败 (WireType corruption in quota stream)'
+        : '连续 3 次返回空数据 (Cronet-PB / Active-Fetch 3 consecutive nulls)';
+    const reasonEn =
+      nextAnomaly % 2 === 1
+        ? 'Protobuf parse failure (WireType corruption in quota stream)'
+        : '3 consecutive empty responses (Cronet-PB / Active-Fetch)';
+    const cleanedSlotInfo = `Session槽位=${activeSession.sessionTag}(live=true, cache=true), 端点缓存=2, 流/WIZ令牌已重置`;
+
+    setLastSyncNote(
+      isZh
+        ? `QuotaHealthMonitor 触发「链路异常」(第 ${nextAnomaly} 次)：${reasonZh}，已自动清除会话 ${activeSession.sessionTag} 缓存槽位`
+        : `QuotaHealthMonitor LINK_ANOMALY (#${nextAnomaly}): ${reasonEn}, executed deep cleanup of session slot ${activeSession.sessionTag}`
+    );
+
+    logDevEvent(
+      'LINK_ANOMALY',
+      activeSession.sessionTag,
+      `链路异常 (第 ${nextAnomaly} 次)：${reasonZh} [Cronet-PB]，已自动触发深层清理 -> ${cleanedSlotInfo}`,
+      `Link Anomaly (#${nextAnomaly}): ${reasonEn} [Cronet-PB], triggered deep cleanup -> ${cleanedSlotInfo}`,
+      'warn'
+    );
+  };
+
   const handleSwitchAccount = (acct: SimulatedAccountSession) => {
     setSelectedAccountId(acct.id);
     setIsStaleOffline(false);
+    setIsSessionDeepCleaned(false);
     setIsRefreshingHud(true);
     setLastSyncNote(
       isZh
@@ -464,6 +504,7 @@ export default function App() {
     setTimeout(() => {
       setIsRefreshingHud(false);
       setIsStaleOffline(false);
+      setIsSessionDeepCleaned(false);
       recordCachedNonZeroSnapshot(activeSession);
       logDevEvent(
         'PROTO_SCAN',
@@ -494,6 +535,7 @@ export default function App() {
     setTimeout(() => {
       setIsRefreshingHud(false);
       setIsStaleOffline(false);
+      setIsSessionDeepCleaned(false);
       recordCachedNonZeroSnapshot(activeSession);
       logDevEvent(
         'PROTO_SCAN',
@@ -1229,7 +1271,9 @@ export default function App() {
                         />
                       </span>
                       <span className="font-medium tabular-nums">
-                        {activeSession.parsed.fiveHourQuota} ({activeSession.parsed.fiveHourReset})
+                        {isSessionDeepCleaned
+                          ? '-- (--)'
+                          : `${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset})`}
                       </span>
 
                       <span
@@ -1252,7 +1296,9 @@ export default function App() {
                         />
                       </span>
                       <span className="font-medium tabular-nums">
-                        {activeSession.parsed.weeklyLimit} ({formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})
+                        {isSessionDeepCleaned
+                          ? '-- (--)'
+                          : `${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})`}
                       </span>
 
                       {isStaleOffline && (
@@ -1319,11 +1365,14 @@ export default function App() {
                       <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-300 border border-orange-500/30">
                         {isZh ? `归零防护: ${zeroGuardCount} 次` : `Zero-Guard: ${zeroGuardCount}`}
                       </span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-500/15 text-red-300 border border-red-500/30">
+                        {isZh ? `链路异常: ${linkAnomalyCount} 次` : `Link Anomaly: ${linkAnomalyCount}`}
+                      </span>
                     </span>
                     <span className="text-[11px] text-slate-400 block mt-0.5">
                       {isZh
-                        ? '记录出站头拦截、APP_OPEN 前台激活、QUERY_SENT 提问流、归零防护已触发（含缓存时间戳与恢复值）与毫秒时间戳'
-                        : 'Logs APP_OPEN, QUERY_SENT, ACCOUNT_SWITCH, ZERO_GUARD_TRIGGERED (with cache timestamp & restored values), and ProtoBuf scans'}
+                        ? '记录出站头拦截、归零防护已触发（含缓存时间戳与恢复值）、QuotaHealthMonitor 链路异常（含深层清理记录）与毫秒时间戳'
+                        : 'Logs APP_OPEN, QUERY_SENT, ZERO_GUARD_TRIGGERED, QuotaHealthMonitor LINK_ANOMALY (deep cleanup), and ProtoBuf scans'}
                     </span>
                   </div>
                 </div>
@@ -1380,6 +1429,17 @@ export default function App() {
                         >
                           {isZh ? `仅归零防护 (${zeroGuardCount})` : `Zero-Guard (${zeroGuardCount})`}
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => setConsoleFilter('LINK_ANOMALY')}
+                          className={`px-2 py-0.5 text-[10px] rounded transition-colors cursor-pointer ${
+                            consoleFilter === 'LINK_ANOMALY'
+                              ? 'bg-red-500/20 text-red-300 font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {isZh ? `仅链路异常 (${linkAnomalyCount})` : `Link Anomaly (${linkAnomalyCount})`}
+                        </button>
                       </div>
                     </div>
 
@@ -1390,6 +1450,14 @@ export default function App() {
                         className="px-2.5 py-1 text-[11px] rounded bg-orange-950/60 hover:bg-orange-900/60 text-orange-200 border border-orange-700/60 transition-colors cursor-pointer"
                       >
                         {isZh ? '模拟 Protobuf 归零防护' : 'Simulate Protobuf 0% Guard'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleSimulateHealthAnomaly}
+                        className="px-2.5 py-1 text-[11px] rounded bg-red-950/60 hover:bg-red-900/60 text-red-200 border border-red-700/60 transition-colors cursor-pointer"
+                      >
+                        {isZh ? '模拟链路异常 (PB失败/3次空)' : 'Simulate Link Anomaly'}
                       </button>
 
                       <button
@@ -1413,7 +1481,9 @@ export default function App() {
                         onClick={() => {
                           setDevLogs([]);
                           setZeroGuardCount(0);
+                          setLinkAnomalyCount(0);
                           setIsStaleOffline(false);
+                          setIsSessionDeepCleaned(false);
                         }}
                         className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-slate-800 hover:bg-red-950/40 text-slate-300 hover:text-red-300 border border-slate-700 hover:border-red-800 transition-colors cursor-pointer"
                         title={isZh ? '清空控制台日志' : 'Clear console logs'}
@@ -1432,14 +1502,20 @@ export default function App() {
                           ? isZh
                             ? '暂无「归零防护已触发」事件记录。点击右上角「模拟 Protobuf 归零防护」即可验证缓存快照时间戳与数值恢复。'
                             : 'No ZERO_GUARD_TRIGGERED events yet. Click "Simulate Protobuf 0% Guard" to inspect cache timestamp & value recovery.'
+                          : consoleFilter === 'LINK_ANOMALY'
+                          ? isZh
+                            ? '暂无「链路异常」事件记录。点击「模拟链路异常 (PB失败/3次空)」即可验证 QuotaHealthMonitor 自动深层清理 Session 缓存槽位。'
+                            : 'No LINK_ANOMALY events yet. Click "Simulate Link Anomaly" to inspect QuotaHealthMonitor deep session cleanup.'
                           : isZh
-                          ? '控制台暂无事件记录。在上方切换账号、发送提问或触发归零防护模拟以产生事件。'
-                          : 'No events logged. Switch accounts, send queries, or simulate Zero-Guard to capture events.'}
+                          ? '控制台暂无事件记录。在上方切换账号、发送提问或触发模拟按钮以产生事件。'
+                          : 'No events logged. Switch accounts, send queries, or click simulation buttons to capture events.'}
                       </div>
                     ) : (
                       visibleDevLogs.map((log) => {
                         const badgeColor =
-                          log.eventType === 'ZERO_GUARD'
+                          log.eventType === 'LINK_ANOMALY'
+                            ? 'bg-red-500/20 text-red-300 border-red-500/40'
+                            : log.eventType === 'ZERO_GUARD'
                             ? 'bg-orange-500/20 text-orange-300 border-orange-500/40'
                             : log.eventType === 'APP_OPEN'
                             ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
@@ -1454,7 +1530,11 @@ export default function App() {
                             : 'bg-zinc-700/40 text-zinc-300 border-zinc-600/40';
 
                         const eventLabel =
-                          log.eventType === 'ZERO_GUARD'
+                          log.eventType === 'LINK_ANOMALY'
+                            ? isZh
+                              ? '链路异常'
+                              : 'LINK_ANOMALY'
+                            : log.eventType === 'ZERO_GUARD'
                             ? isZh
                               ? '归零防护已触发'
                               : 'ZERO_GUARD_TRIGGERED'
@@ -1464,7 +1544,9 @@ export default function App() {
                           <div
                             key={log.id}
                             className={`flex items-start gap-2.5 py-1 px-1.5 rounded transition-colors ${
-                              log.eventType === 'ZERO_GUARD'
+                              log.eventType === 'LINK_ANOMALY'
+                                ? 'bg-red-950/25 hover:bg-red-950/40'
+                                : log.eventType === 'ZERO_GUARD'
                                 ? 'bg-orange-950/20 hover:bg-orange-950/35'
                                 : 'hover:bg-slate-900/60'
                             }`}

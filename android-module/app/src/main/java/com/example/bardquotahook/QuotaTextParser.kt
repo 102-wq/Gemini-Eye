@@ -448,6 +448,74 @@ object QuotaTextParser {
         return if (next != base && next.hasLiveData) next else null
     }
 
+    /**
+     * Checks whether a suspected quota payload (by RPC/URL hint or ASCII quota marker)
+     * failed gzip decompression or wire-format Protobuf validation.
+     */
+    fun isLikelyCorruptedQuotaProto(
+        rawBytes: ByteArray,
+        length: Int,
+        rpcMethodHint: String? = null
+    ): Boolean {
+        val safeLen = minOf(length, rawBytes.size)
+        if (safeLen < 4) return rpcMethodHint?.let { hasQuotaContextHint(it) } == true
+
+        val hintPresent = (rpcMethodHint?.let { hasQuotaContextHint(it) } == true) ||
+            scanAsciiQuotaMarker(rawBytes, 0, safeLen)
+        if (!hintPresent) return false
+
+        // Skip HTML/JSON text payloads
+        val firstNonWs = findFirstNonWhitespace(rawBytes, safeLen)
+        if (firstNonWs >= 0) {
+            val b = rawBytes[firstNonWs].toInt() and 0xFF
+            if (b == '{'.code || b == '['.code || b == '<'.code || b == ')'.code) return false
+        }
+
+        // Check gzip magic failure
+        if (safeLen >= 10 &&
+            (rawBytes[0].toInt() and 0xFF) == 0x1F &&
+            (rawBytes[1].toInt() and 0xFF) == 0x8B
+        ) {
+            val decompressed = gunzipBounded(rawBytes, 0, safeLen) ?: return true
+            if (decompressed.size < 2) return true
+            return !scanProtoMessageSlice(
+                buf = decompressed,
+                offset = 0,
+                end = decompressed.size,
+                depth = 0,
+                nowMs = System.currentTimeMillis(),
+                inheritedHint = true,
+                outWindows = ArrayList(2)
+            )
+        }
+
+        // Check gRPC length-prefixed header truncation or corrupt slice
+        if (safeLen >= 5 && ((rawBytes[0].toInt() and 0xFF) == 0 || (rawBytes[0].toInt() and 0xFF) == 1)) {
+            val frameLen = ((rawBytes[1].toInt() and 0xFF) shl 24) or
+                ((rawBytes[2].toInt() and 0xFF) shl 16) or
+                ((rawBytes[3].toInt() and 0xFF) shl 8) or
+                (rawBytes[4].toInt() and 0xFF)
+            if (frameLen > 0 && frameLen <= MAX_PROTO_SCAN_BYTES) {
+                if (5 + frameLen > safeLen) return false // streaming chunk not complete yet
+                if ((rawBytes[0].toInt() and 0xFF) == 1) {
+                    val dec = gunzipBounded(rawBytes, 5, frameLen) ?: return true
+                    return !scanProtoMessageSlice(dec, 0, dec.size, 0, System.currentTimeMillis(), true, ArrayList(2))
+                }
+                return !scanProtoMessageSlice(rawBytes, 5, 5 + frameLen, 0, System.currentTimeMillis(), true, ArrayList(2))
+            }
+        }
+
+        return !scanProtoMessageSlice(
+            buf = rawBytes,
+            offset = 0,
+            end = safeLen,
+            depth = 0,
+            nowMs = System.currentTimeMillis(),
+            inheritedHint = true,
+            outWindows = ArrayList(2)
+        )
+    }
+
     private fun scanProtoMessageSlice(
         buf: ByteArray,
         offset: Int,

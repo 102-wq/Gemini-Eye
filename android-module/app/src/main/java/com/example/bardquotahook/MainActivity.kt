@@ -199,28 +199,38 @@ class MainActivity : Activity() {
 
         val entries = QuotaSyncProvider.parseDevConsoleLogs(state.devLogsJson)
         val zeroCount = maxOf(state.zeroGuardCount, entries.count { it.eventType == "ZERO_GUARD" })
+        val anomalyCount = maxOf(state.linkAnomalyCount, entries.count { it.eventType == "LINK_ANOMALY" })
         devConsoleTitleView?.text = if (zh) "开发者控制台 (Dev Console)" else "Developer Console"
         devConsoleCountView?.text = if (zh) {
-            "归零防护已触发: $zeroCount 次"
+            "归零防护: $zeroCount | 链路异常: $anomalyCount"
         } else {
-            "Zero-Guard Triggered: $zeroCount"
+            "Zero-Guard: $zeroCount | Link Anomaly: $anomalyCount"
         }
         devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
         devConsoleLogsView?.text = if (entries.isEmpty()) {
             if (zh) {
-                "暂无「归零防护已触发」事件记录。\n当 Protobuf 返回 0 且存在历史非零缓存时，此处将打印缓存快照时间戳与已恢复的数值。"
+                "暂无「归零防护已触发」或「链路异常」事件记录。\n当触发 Protobuf 归零补偿、解析失败或连续 3 次空数据时，此处将输出诊断详情与清理记录。"
             } else {
-                "No ZERO_GUARD_TRIGGERED events recorded yet.\nWhen Protobuf returns 0 while valid cached quota exists, the cache timestamp & restored values appear here."
+                "No ZERO_GUARD_TRIGGERED or LINK_ANOMALY events recorded yet.\nZero compensation, Protobuf parse failures, or 3 consecutive empty responses appear here."
             }
         } else {
             entries.joinToString("\n\n") { entry ->
-                val evtTag = if (zh) "[归零防护已触发 #${entry.triggerCount}]" else "[ZERO_GUARD_TRIGGERED #${entry.triggerCount}]"
                 val evtTs = formatLogTime(entry.eventTimeMs)
-                val cachedTs = formatLogTime(entry.cachedAtMs)
-                if (zh) {
-                    "$evtTs $evtTag [${entry.source}]\n缓存快照时间戳: $cachedTs\n已恢复的数值: ${entry.restoredQuota}"
+                if (entry.eventType == "LINK_ANOMALY") {
+                    val evtTag = if (zh) "[链路异常 #${entry.triggerCount}]" else "[LINK_ANOMALY #${entry.triggerCount}]"
+                    if (zh) {
+                        "$evtTs $evtTag [${entry.source}]\n${entry.detailZh}"
+                    } else {
+                        "$evtTs $evtTag [${entry.source}]\n${entry.detailEn}"
+                    }
                 } else {
-                    "$evtTs $evtTag [${entry.source}]\nCached Snapshot Timestamp: $cachedTs\nRestored Values: ${entry.restoredQuota}"
+                    val evtTag = if (zh) "[归零防护已触发 #${entry.triggerCount}]" else "[ZERO_GUARD_TRIGGERED #${entry.triggerCount}]"
+                    val cachedTs = formatLogTime(entry.cachedAtMs)
+                    if (zh) {
+                        "$evtTs $evtTag [${entry.source}]\n缓存快照时间戳: $cachedTs\n已恢复的数值: ${entry.restoredQuota}"
+                    } else {
+                        "$evtTs $evtTag [${entry.source}]\nCached Snapshot Timestamp: $cachedTs\nRestored Values: ${entry.restoredQuota}"
+                    }
                 }
             }
         }

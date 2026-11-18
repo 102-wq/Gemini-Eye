@@ -349,10 +349,12 @@ object QuotaCoreEngine {
 
     private class RollingStreamBuffer(
         val urlHint: String?,
-        val sessionTag: String
+        val sessionTag: String,
+        val isQuotaCandidate: Boolean = false
     ) {
         private val out = ByteArrayOutputStream(4096)
         val createdAtMs: Long = System.currentTimeMillis()
+        @Volatile var resolvedQuotaSnapshot: Boolean = false
 
         @Synchronized
         fun appendAndSnapshot(chunk: ByteArray, len: Int): ByteArray? {
@@ -371,6 +373,9 @@ object QuotaCoreEngine {
             }
             return if (out.size() >= 6) out.toByteArray() else null
         }
+
+        @Synchronized
+        fun snapshotAllBytes(): ByteArray = out.toByteArray()
     }
 
     private data class StructuralWindow(
@@ -1615,12 +1620,28 @@ object QuotaCoreEngine {
             bridge.hookAllMethodsByName(
                 clazz = callbackCls,
                 methodName = cName,
-                after = { _, args, _ ->
-                    val reqObj = args.getOrNull(0)
-                    if (reqObj != null) {
-                        val id = System.identityHashCode(reqObj)
-                        cronetRollingStreams.remove(id)
-                        requestContextMap.remove(id)
+                after = cb@{ _, args, _ ->
+                    val reqObj = args.getOrNull(0) ?: return@cb
+                    val id = System.identityHashCode(reqObj)
+                    val holder = cronetRollingStreams.remove(id)
+                    val boundCtx = requestContextMap.remove(id)
+                    if (isForegroundActive.get() && holder != null && !holder.resolvedQuotaSnapshot) {
+                        val isQuotaUrl = holder.isQuotaCandidate ||
+                            boundCtx?.isQuotaEndpointCandidate == true ||
+                            isReplayableQuotaEndpoint(holder.urlHint, boundCtx?.httpMethod)
+                        if (isQuotaUrl) {
+                            val bytes = holder.snapshotAllBytes()
+                            val sess = holder.sessionTag.ifBlank { activeSessionTag.get() }
+                            submitForegroundWork {
+                                if (cName == "onFailed") {
+                                    QuotaHealthMonitor.recordEmptyResponse(sess, "Cronet-PB", "stream onFailed")
+                                } else if (bytes.isNotEmpty() && QuotaTextParser.isLikelyCorruptedQuotaProto(bytes, bytes.size, holder.urlHint)) {
+                                    QuotaHealthMonitor.recordProtobufParseFailure(sess, "Cronet-PB", "malformed/corrupt proto stream")
+                                } else {
+                                    QuotaHealthMonitor.recordEmptyResponse(sess, "Cronet-PB", "empty quota response")
+                                }
+                            }
+                        }
                     }
                 }
             )
@@ -1769,21 +1790,33 @@ object QuotaCoreEngine {
     ) {
         submitForegroundWork {
             pruneRequestMapsIfNeeded()
+            val boundCtx = requestContextMap[reqId]
+            val resolvedUrl = urlHint ?: boundCtx?.urlOrMethod
+            val quotaCand = boundCtx?.isQuotaEndpointCandidate == true ||
+                isReplayableQuotaEndpoint(resolvedUrl, boundCtx?.httpMethod)
             val holder = cronetRollingStreams.getOrPut(reqId) {
-                RollingStreamBuffer(urlHint, sessionTag)
+                RollingStreamBuffer(resolvedUrl, sessionTag, quotaCand)
             }
             val combined = holder.appendAndSnapshot(chunk, chunk.size) ?: return@submitForegroundWork
             val baseSnap = getBaseSnapshotForSession(holder.sessionTag)
-            val resolvedUrl = urlHint ?: holder.urlHint
-            val snap = QuotaTextParser.scanProtoBufBytes(
-                rawBytes = combined,
-                length = combined.size,
-                prev = baseSnap,
-                source = "Cronet-PB",
-                rpcMethodHint = resolvedUrl
-            )
+            val snap = try {
+                QuotaTextParser.scanProtoBufBytes(
+                    rawBytes = combined,
+                    length = combined.size,
+                    prev = baseSnap,
+                    source = "Cronet-PB",
+                    rpcMethodHint = holder.urlHint ?: resolvedUrl
+                )
+            } catch (t: Throwable) {
+                QuotaHealthMonitor.recordProtobufParseFailure(
+                    holder.sessionTag,
+                    "Cronet-PB",
+                    "${t.javaClass.simpleName}: ${t.message ?: "decode exception"}"
+                )
+                null
+            }
             if (snap != null) {
-                val boundCtx = requestContextMap[reqId]
+                holder.resolvedQuotaSnapshot = true
                 if (resolvedUrl != null && isReplayableQuotaEndpoint(resolvedUrl, boundCtx?.httpMethod)) {
                     recordLearnedQuotaEndpoint(resolvedUrl, boundCtx?.httpMethod ?: "GET", rpcHint = "Cronet-PB")
                 }
@@ -2073,28 +2106,59 @@ object QuotaCoreEngine {
             val targetSession = if (sessionTag != DEFAULT_SESSION_TAG) sessionTag else activeSessionTag.get()
             val baseSnap = getBaseSnapshotForSession(targetSession)
 
+            val isQuotaRpc = rpcHint?.let { QuotaTextParser.hasQuotaContextHint(it) } == true
             when (message) {
                 is ByteArray -> {
-                    val snap = QuotaTextParser.scanProtoBufBytes(
-                        rawBytes = message,
-                        length = message.size,
-                        prev = baseSnap,
-                        source = "gRPC-PB",
-                        rpcMethodHint = rpcHint
-                    )
-                    if (snap != null) publishSnapshotForSession(snap, targetSession)
-                }
-                is ByteBuffer -> {
-                    val bytes = copyCronetByteBufferNonDestructive(message)
-                    if (bytes != null) {
-                        val snap = QuotaTextParser.scanProtoBufBytes(
-                            rawBytes = bytes,
-                            length = bytes.size,
+                    val snap = try {
+                        QuotaTextParser.scanProtoBufBytes(
+                            rawBytes = message,
+                            length = message.size,
                             prev = baseSnap,
                             source = "gRPC-PB",
                             rpcMethodHint = rpcHint
                         )
-                        if (snap != null) publishSnapshotForSession(snap, targetSession)
+                    } catch (t: Throwable) {
+                        QuotaHealthMonitor.recordProtobufParseFailure(
+                            targetSession,
+                            "gRPC-PB",
+                            "${t.javaClass.simpleName}: ${t.message ?: "byteArray decode error"}"
+                        )
+                        null
+                    }
+                    if (snap != null) {
+                        publishSnapshotForSession(snap, targetSession)
+                    } else if (QuotaTextParser.isLikelyCorruptedQuotaProto(message, message.size, rpcHint)) {
+                        QuotaHealthMonitor.recordProtobufParseFailure(targetSession, "gRPC-PB", "corrupt quota ByteArray")
+                    } else if (isQuotaRpc) {
+                        QuotaHealthMonitor.recordEmptyResponse(targetSession, "gRPC-PB", "empty quota RPC message")
+                    }
+                }
+                is ByteBuffer -> {
+                    val bytes = copyCronetByteBufferNonDestructive(message)
+                    if (bytes != null) {
+                        val snap = try {
+                            QuotaTextParser.scanProtoBufBytes(
+                                rawBytes = bytes,
+                                length = bytes.size,
+                                prev = baseSnap,
+                                source = "gRPC-PB",
+                                rpcMethodHint = rpcHint
+                            )
+                        } catch (t: Throwable) {
+                            QuotaHealthMonitor.recordProtobufParseFailure(
+                                targetSession,
+                                "gRPC-PB",
+                                "${t.javaClass.simpleName}: ${t.message ?: "byteBuffer decode error"}"
+                            )
+                            null
+                        }
+                        if (snap != null) {
+                            publishSnapshotForSession(snap, targetSession)
+                        } else if (QuotaTextParser.isLikelyCorruptedQuotaProto(bytes, bytes.size, rpcHint)) {
+                            QuotaHealthMonitor.recordProtobufParseFailure(targetSession, "gRPC-PB", "corrupt quota ByteBuffer")
+                        } else if (isQuotaRpc) {
+                            QuotaHealthMonitor.recordEmptyResponse(targetSession, "gRPC-PB", "empty quota ByteBuffer")
+                        }
                     }
                 }
                 else -> {
@@ -2105,14 +2169,31 @@ object QuotaCoreEngine {
                     }
                     val serialized = trySerializeProtoLite(message)
                     if (serialized != null && serialized.size in 6..MAX_STREAM_ACCUM_BYTES) {
-                        val protoSnap = QuotaTextParser.scanProtoBufBytes(
-                            rawBytes = serialized,
-                            length = serialized.size,
-                            prev = baseSnap,
-                            source = "gRPC-PB",
-                            rpcMethodHint = rpcHint
-                        )
-                        if (protoSnap != null) publishSnapshotForSession(protoSnap, targetSession)
+                        val protoSnap = try {
+                            QuotaTextParser.scanProtoBufBytes(
+                                rawBytes = serialized,
+                                length = serialized.size,
+                                prev = baseSnap,
+                                source = "gRPC-PB",
+                                rpcMethodHint = rpcHint
+                            )
+                        } catch (t: Throwable) {
+                            QuotaHealthMonitor.recordProtobufParseFailure(
+                                targetSession,
+                                "gRPC-PB",
+                                "${t.javaClass.simpleName}: ${t.message ?: "protoLite decode error"}"
+                            )
+                            null
+                        }
+                        if (protoSnap != null) {
+                            publishSnapshotForSession(protoSnap, targetSession)
+                        } else if (QuotaTextParser.isLikelyCorruptedQuotaProto(serialized, serialized.size, rpcHint)) {
+                            QuotaHealthMonitor.recordProtobufParseFailure(targetSession, "gRPC-PB", "corrupt serialized ProtoLite")
+                        } else if (isQuotaRpc) {
+                            QuotaHealthMonitor.recordEmptyResponse(targetSession, "gRPC-PB", "empty gRPC model response")
+                        }
+                    } else if (isQuotaRpc) {
+                        QuotaHealthMonitor.recordEmptyResponse(targetSession, "gRPC-PB", "empty gRPC response")
                     }
                 }
             }
@@ -2182,13 +2263,26 @@ object QuotaCoreEngine {
                 if (bytes.size !in 6..MAX_STREAM_ACCUM_BYTES) return@cb
                 val sess = activeSessionTag.get()
                 submitForegroundWork {
-                    val snap = QuotaTextParser.scanProtoBufBytes(
-                        rawBytes = bytes,
-                        length = bytes.size,
-                        prev = getBaseSnapshotForSession(sess),
-                        source = "OkHttp-PB"
-                    )
-                    if (snap != null) publishSnapshotForSession(snap, sess)
+                    val snap = try {
+                        QuotaTextParser.scanProtoBufBytes(
+                            rawBytes = bytes,
+                            length = bytes.size,
+                            prev = getBaseSnapshotForSession(sess),
+                            source = "OkHttp-PB"
+                        )
+                    } catch (t: Throwable) {
+                        QuotaHealthMonitor.recordProtobufParseFailure(
+                            sess,
+                            "OkHttp-PB",
+                            "${t.javaClass.simpleName}: ${t.message ?: "bytes decode error"}"
+                        )
+                        null
+                    }
+                    if (snap != null) {
+                        publishSnapshotForSession(snap, sess)
+                    } else if (QuotaTextParser.isLikelyCorruptedQuotaProto(bytes, bytes.size, null)) {
+                        QuotaHealthMonitor.recordProtobufParseFailure(sess, "OkHttp-PB", "corrupt quota ResponseBody")
+                    }
                 }
             }
         )
@@ -3389,6 +3483,11 @@ object QuotaCoreEngine {
             )
             publishSnapshotForSession(fetchedSnapshot, sessionTag)
         } else {
+            QuotaHealthMonitor.recordEmptyResponse(
+                sessionTag = sessionTag,
+                source = "Active-Fetch",
+                reason = "HTTP/RPC returned empty quota payload"
+            )
             applySessionQueryEstimationIfNeeded(sessionTag)
         }
     }
@@ -3762,6 +3861,10 @@ object QuotaCoreEngine {
             safeLog(activeBridgeRef.get(), recoveryToLog!!)
         }
 
+        if (hasNonZeroQuotaData(cleanToApply) && !cleanToApply.isStaleOffline) {
+            QuotaHealthMonitor.recordHealthySuccess(sessionTag)
+        }
+
         if (!shouldUpdateActiveHud) return
 
         // Persist last verified live numbers cleanly (keep cached metrics, never lock disk mirror offline)
@@ -3787,6 +3890,175 @@ object QuotaCoreEngine {
                 }
             }
         }
+    }
+
+    /**
+     * QuotaHealthMonitor:
+     * Monitors extreme pipeline faults per Google account session:
+     * 1. Protobuf parse failure / malformed wire-format payload on quota-hinted traffic.
+     * 2. 3 consecutive empty quota responses (`EMPTY_STREAK_THRESHOLD = 3`).
+     *
+     * When triggered:
+     * - Emits a dedicated "链路异常" (`LINK_ANOMALY`) warning + Dev Console telemetry log.
+     * - Executes a deep cleanup of that session's cache slots & transient transport state.
+     */
+    private object QuotaHealthMonitor {
+        private const val EMPTY_STREAK_THRESHOLD = 3
+        private const val ANOMALY_COOLDOWN_MS = 2_000L
+
+        private val monitorLock = Any()
+        private val consecutiveEmptyBySession = HashMap<String, Int>()
+        private val lastAnomalyAtBySession = HashMap<String, Long>()
+        @Volatile private var totalAnomalyCount: Int = 0
+
+        fun recordHealthySuccess(sessionTag: String) {
+            val target = sessionTag.ifBlank { DEFAULT_SESSION_TAG }
+            synchronized(monitorLock) {
+                consecutiveEmptyBySession.remove(target)
+            }
+        }
+
+        fun recordProtobufParseFailure(
+            sessionTag: String,
+            source: String,
+            detail: String
+        ) {
+            val target = sessionTag.ifBlank { DEFAULT_SESSION_TAG }
+            triggerLinkAnomaly(
+                sessionTag = target,
+                source = source,
+                reasonZh = "Protobuf 解析失败 ($detail)",
+                reasonEn = "Protobuf parse failure ($detail)"
+            )
+        }
+
+        fun recordEmptyResponse(
+            sessionTag: String,
+            source: String,
+            reason: String
+        ) {
+            val target = sessionTag.ifBlank { DEFAULT_SESSION_TAG }
+            var streak = 0
+            var triggered = false
+            synchronized(monitorLock) {
+                streak = (consecutiveEmptyBySession[target] ?: 0) + 1
+                consecutiveEmptyBySession[target] = streak
+                if (streak >= EMPTY_STREAK_THRESHOLD) {
+                    consecutiveEmptyBySession[target] = 0
+                    triggered = true
+                }
+            }
+            if (triggered) {
+                triggerLinkAnomaly(
+                    sessionTag = target,
+                    source = source,
+                    reasonZh = "连续 $streak 次返回空数据 ($reason)",
+                    reasonEn = "$streak consecutive empty responses ($reason)"
+                )
+            }
+        }
+
+        private fun triggerLinkAnomaly(
+            sessionTag: String,
+            source: String,
+            reasonZh: String,
+            reasonEn: String
+        ) {
+            val now = System.currentTimeMillis()
+            val anomalyNum: Int
+            synchronized(monitorLock) {
+                val prevAt = lastAnomalyAtBySession[sessionTag] ?: 0L
+                if ((now - prevAt) < ANOMALY_COOLDOWN_MS) return
+                lastAnomalyAtBySession[sessionTag] = now
+                consecutiveEmptyBySession[sessionTag] = 0
+                totalAnomalyCount += 1
+                anomalyNum = totalAnomalyCount
+            }
+
+            val cleanedSlotInfo = performDeepSessionCleanup(sessionTag)
+            val ts = formatTimestampMs(now)
+            warnLog(
+                activeBridgeRef.get(),
+                "[链路异常 #$anomalyNum] session=$sessionTag | source=$source | $reasonZh | 已触发深层清理: $cleanedSlotInfo | time=$ts"
+            )
+
+            val ctx = appContext
+            if (ctx != null) {
+                val detailZh = "链路异常 (第 $anomalyNum 次)：$reasonZh [$source]，已自动触发深层清理 -> $cleanedSlotInfo"
+                val detailEn = "Link Anomaly (#$anomalyNum): $reasonEn [$source], triggered deep cleanup -> $cleanedSlotInfo"
+                submitForegroundWork {
+                    QuotaSyncProvider.recordLinkAnomalyEvent(
+                        context = ctx,
+                        sessionId = sessionTag,
+                        source = source,
+                        cleanedSummary = cleanedSlotInfo,
+                        detailZh = detailZh,
+                        detailEn = detailEn,
+                        anomalyCount = anomalyNum
+                    )
+                }
+            }
+        }
+    }
+
+    private fun performDeepSessionCleanup(sessionTag: String): String {
+        val target = sessionTag.ifBlank { DEFAULT_SESSION_TAG }
+        var removedLiveSlot = false
+        var removedCacheSlot = false
+        var clearedLearnedCount = 0
+
+        synchronized(sessionSnapshotsLock) {
+            removedLiveSlot = perSessionSnapshots.remove(target) != null
+            removedCacheSlot = cachedNonZeroSnapshots.remove(target) != null
+            cachedNonZeroTimestamps.remove(target)
+            pbZeroDebounceHits.remove(target)
+            lastPbZeroWarnAtMs.remove(target)
+            if (target == activeSessionTag.get()) {
+                latestSnapshot.set(QuotaHudView.Snapshot(source = "HealthReset"))
+                perSessionSnapshots.remove(DEFAULT_SESSION_TAG)
+                cachedNonZeroSnapshots.remove(DEFAULT_SESSION_TAG)
+                cachedNonZeroTimestamps.remove(DEFAULT_SESSION_TAG)
+            }
+        }
+
+        synchronized(learnedEndpointsLock) {
+            clearedLearnedCount = learnedQuotaEndpoints.size
+            learnedQuotaEndpoints.clear()
+        }
+
+        cachedXsrfToken = null
+        cachedFsidToken = null
+        cachedBuildLabel = null
+        lastHttpFetchMs.set(0L)
+        clearTransientBuffers(wipeCredentials = false)
+
+        val ctx = appContext
+        if (target == activeSessionTag.get() && ctx != null) {
+            try {
+                ctx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .remove("five")
+                    .remove("five_reset")
+                    .remove("week")
+                    .remove("week_reset")
+                    .putString("src", "HealthReset")
+                    .apply()
+            } catch (_: Throwable) {
+            }
+            if (isForegroundActive.get()) {
+                refreshHudOnUiThread()
+                submitForegroundWork {
+                    QuotaSyncProvider.publishSessionQuota(
+                        context = ctx,
+                        snapshot = QuotaHudView.Snapshot(source = "HealthReset"),
+                        sessionId = target,
+                        replaceSession = true
+                    )
+                }
+            }
+        }
+
+        return "Session槽位=$target(live=$removedLiveSlot, cache=$removedCacheSlot), 端点缓存=$clearedLearnedCount, 流/WIZ令牌已重置"
     }
 
     private fun loadSanitizedHostMirror(ctx: Context?) {
