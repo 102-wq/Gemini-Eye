@@ -599,7 +599,18 @@ export default function App() {
     return simDarkTheme ? 'bg-sky-400' : 'bg-blue-500';
   };
 
+  const isHighLoadQuota =
+    !isStaleOffline &&
+    !isSessionDeepCleaned &&
+    (activeSession.parsed.fiveHourPct > 90 || activeSession.parsed.weeklyPct > 90);
+
   const capsuleContainerClass = useMemo(() => {
+    const highLoadClass = isHighLoadQuota
+      ? simDarkTheme
+        ? 'animate-high-load-shadow ring-1 ring-red-400/35'
+        : 'animate-high-load-shadow ring-1 ring-red-500/30'
+      : '';
+
     if (isStaleOffline) {
       if (hudTheme === 'MIUIX') {
         return simDarkTheme
@@ -611,14 +622,16 @@ export default function App() {
         : 'bg-[#F5EFFB]/95 border-gray-400/50 text-gray-500 shadow-md shadow-indigo-950/10';
     }
     if (hudTheme === 'MIUIX') {
-      return simDarkTheme
+      const base = simDarkTheme
         ? 'bg-zinc-900/80 backdrop-blur-xl border-white/20 text-slate-50 shadow-lg shadow-black/40'
         : 'bg-white/85 backdrop-blur-xl border-slate-900/12 text-slate-900 shadow-lg shadow-slate-900/12';
+      return highLoadClass ? `${base} ${highLoadClass}` : base;
     }
-    return simDarkTheme
+    const base = simDarkTheme
       ? 'bg-[#292533]/95 border-[#938F99]/40 text-[#E6E1E5] shadow-md shadow-black/40'
       : 'bg-[#F5EFFB]/95 border-[#CAC4D0]/70 text-[#1D1B20] shadow-md shadow-indigo-950/10';
-  }, [hudTheme, simDarkTheme, isStaleOffline]);
+    return highLoadClass ? `${base} ${highLoadClass}` : base;
+  }, [hudTheme, simDarkTheme, isStaleOffline, isHighLoadQuota]);
 
   const capsuleLabelClass = useMemo(() => {
     if (isStaleOffline) {
