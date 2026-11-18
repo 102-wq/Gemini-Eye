@@ -1456,7 +1456,9 @@ export default function App() {
                     >
                       <span className={`font-semibold ${capsuleLabelClass}`}>5h</span>
                       <span
-                        className={`w-6 h-[5px] mx-1.5 rounded-full overflow-hidden shrink-0 ${capsuleTrackClass}`}
+                        className={`relative mx-1.5 rounded-full overflow-hidden shrink-0 transition-all duration-200 ${capsuleTrackClass} ${
+                          isHighLoadQuota ? 'w-7 h-[13px]' : 'w-6 h-[5px]'
+                        }`}
                       >
                         <span
                           ref={bar5hRef}
@@ -1464,6 +1466,17 @@ export default function App() {
                             activeSession.parsed.fiveHourPct
                           )}`}
                         />
+                        {isHighLoadQuota && (
+                          <span
+                            className={`pointer-events-none absolute inset-0 flex items-center justify-center text-[8px] font-bold leading-none tabular-nums ${
+                              activeSession.parsed.fiveHourPct >= 55 || simDarkTheme
+                                ? 'text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.65)]'
+                                : 'text-slate-900/85'
+                            }`}
+                          >
+                            {activeSession.parsed.fiveHourPct}%
+                          </span>
+                        )}
                       </span>
                       <span className="font-medium tabular-nums">
                         {isSessionDeepCleaned
@@ -1481,7 +1494,9 @@ export default function App() {
                         {hudLang === 'zh' ? '每周' : 'Weekly'}
                       </span>
                       <span
-                        className={`w-6 h-[5px] mx-1.5 rounded-full overflow-hidden shrink-0 ${capsuleTrackClass}`}
+                        className={`relative mx-1.5 rounded-full overflow-hidden shrink-0 transition-all duration-200 ${capsuleTrackClass} ${
+                          isHighLoadQuota ? 'w-7 h-[13px]' : 'w-6 h-[5px]'
+                        }`}
                       >
                         <span
                           ref={barWeeklyRef}
@@ -1489,6 +1504,17 @@ export default function App() {
                             activeSession.parsed.weeklyPct
                           )}`}
                         />
+                        {isHighLoadQuota && (
+                          <span
+                            className={`pointer-events-none absolute inset-0 flex items-center justify-center text-[8px] font-bold leading-none tabular-nums ${
+                              activeSession.parsed.weeklyPct >= 55 || simDarkTheme
+                                ? 'text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.65)]'
+                                : 'text-slate-900/85'
+                            }`}
+                          >
+                            {activeSession.parsed.weeklyPct}%
+                          </span>
+                        )}
                       </span>
                       <span className="font-medium tabular-nums">
                         {isSessionDeepCleaned
