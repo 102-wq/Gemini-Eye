@@ -857,7 +857,7 @@ object QuotaTextParser {
         return true
     }
 
-    private fun hasQuotaContextHint(s: String): Boolean {
+    fun hasQuotaContextHint(s: String): Boolean {
         if (s.isEmpty()) return false
         return s.contains("quota", ignoreCase = true) ||
             s.contains("limit", ignoreCase = true) ||
