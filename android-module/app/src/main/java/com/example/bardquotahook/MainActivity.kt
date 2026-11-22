@@ -43,6 +43,7 @@ class MainActivity : Activity() {
     private var devConsoleCountView: TextView? = null
     private var devConsoleClearBtn: Button? = null
     private var devConsoleLogsView: TextView? = null
+    private var forceScanBtn: Button? = null
     private var launchGeminiBtn: Button? = null
 
     private var stateObserver: ContentObserver? = null
@@ -187,7 +188,12 @@ class MainActivity : Activity() {
                 secAgo
             ) + "\nSession: $sessionLabel"
         } else {
-            loc.getString(R.string.settings_hook_waiting)
+            val extraHint = if (zh) {
+                "\n• 排查要点：确认 LSPosed 已勾选「Gemini」并强制停止后重开 Gemini；若悬浮窗已显示但此处仍提示等待，请在本模块应用信息中开启「自启动 / 允许关联启动」以放行 QuotaSyncProvider 跨进程通信。"
+            } else {
+                "\n• Checklist: Check com.google.android.apps.bard in LSPosed scope and force-stop/relaunch Gemini; if HUD shows inside Gemini but this screen stays Waiting, enable Autostart / Associated Startup for this module so QuotaSyncProvider IPC works."
+            }
+            loc.getString(R.string.settings_hook_waiting) + extraHint
         }
 
         val label5h = loc.getString(R.string.hud_label_5h)
@@ -223,6 +229,13 @@ class MainActivity : Activity() {
                     } else {
                         "$evtTs $evtTag [${entry.source}]\n${entry.detailEn}"
                     }
+                } else if (entry.eventType == "FULL_PROTOCOL_SCAN") {
+                    val evtTag = if (zh) "[全量协议扫描]" else "[FULL_PROTOCOL_SCAN]"
+                    if (zh) {
+                        "$evtTs $evtTag [${entry.source}]\n${entry.detailZh}"
+                    } else {
+                        "$evtTs $evtTag [${entry.source}]\n${entry.detailEn}"
+                    }
                 } else {
                     val evtTag = if (zh) "[归零防护已触发 #${entry.triggerCount}]" else "[ZERO_GUARD_TRIGGERED #${entry.triggerCount}]"
                     val cachedTs = formatLogTime(entry.cachedAtMs)
@@ -235,6 +248,7 @@ class MainActivity : Activity() {
             }
         }
 
+        forceScanBtn?.text = if (zh) "强制全量协议扫描 (TE: trailers + 5B帧头)" else "Force Full-Protocol Scan (TE: trailers + 5B Frame)"
         launchGeminiBtn?.text = loc.getString(R.string.settings_launch_gemini)
     }
 
@@ -513,6 +527,36 @@ class MainActivity : Activity() {
         devCard.addView(devHeaderRow)
         devCard.addView(devLogsTv)
 
+        // 2.8 Force Full-Protocol Diagnostic Scan Button
+        val scanBtn = Button(this).apply {
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
+            background = makeBtnDrawable("#0891B2")
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(12f)
+            }
+            setPadding(dp(12f), dp(12f), dp(12f), dp(12f))
+            setOnClickListener {
+                val st = QuotaSyncProvider.ensureLoaded(this@MainActivity)
+                QuotaSyncProvider.requestFullProtocolScan(this@MainActivity)
+                QuotaSyncProvider.recordFullProtocolScanEvent(
+                    context = this@MainActivity,
+                    sessionId = st.sessionId.ifBlank { "sess_default" },
+                    source = "MainActivity-Settings",
+                    summary = "Queued",
+                    detailZh = "[手动全量协议扫描已下发] 将在 Gemini 前台窗口激活 runForegroundFullProtocolDiagnostic()，打印出站 HTTP/2 TE: trailers 与 gRPC-RPC 5B 帧头并强制重拉",
+                    detailEn = "[Manual Full-Protocol Scan Queued] Will invoke runForegroundFullProtocolDiagnostic() in Gemini foreground to dump H2 TE: trailers & gRPC-RPC 5B frames"
+                )
+                refreshAllUi()
+            }
+        }
+        forceScanBtn = scanBtn
+
         // 3. Launch Gemini App Button
         val launchBtn = Button(this).apply {
             isAllCaps = false
@@ -524,7 +568,7 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dp(12f)
+                topMargin = dp(10f)
             }
             setPadding(dp(12f), dp(13f), dp(12f), dp(13f))
             setOnClickListener { launchGeminiNativeApp() }
@@ -537,6 +581,7 @@ class MainActivity : Activity() {
         container.addView(prefCard)
         container.addView(diagCard)
         container.addView(devCard)
+        container.addView(scanBtn)
         container.addView(launchBtn)
         scroll.addView(container)
         setContentView(scroll)

@@ -54,6 +54,7 @@ class QuotaSyncProvider : ContentProvider() {
         val overlayEnabled: Boolean = false,
         val zeroGuardCount: Int = 0,
         val linkAnomalyCount: Int = 0,
+        val forceScanSeq: Long = 0L,
         val devLogsJson: String = "[]"
     ) {
         val isActivelyBound: Boolean
@@ -83,6 +84,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putBoolean(KEY_OVERLAY_ENABLED, false)
                 putInt(KEY_ZERO_GUARD_COUNT, zeroGuardCount)
                 putInt(KEY_LINK_ANOMALY_COUNT, linkAnomalyCount)
+                putLong(KEY_FORCE_SCAN_SEQ, forceScanSeq)
                 putString(KEY_DEV_LOGS_JSON, devLogsJson)
             }
         }
@@ -113,6 +115,7 @@ class QuotaSyncProvider : ContentProvider() {
                     overlayEnabled = false,
                     zeroGuardCount = bundle.getInt(KEY_ZERO_GUARD_COUNT, 0),
                     linkAnomalyCount = bundle.getInt(KEY_LINK_ANOMALY_COUNT, 0),
+                    forceScanSeq = bundle.getLong(KEY_FORCE_SCAN_SEQ, 0L),
                     devLogsJson = bundle.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
                 )
             }
@@ -211,6 +214,12 @@ class QuotaSyncProvider : ContentProvider() {
                     updated.toBundle()
                 }
 
+                METHOD_REQUEST_FULL_SCAN -> {
+                    val updated = bumpForceScanSeqLocal(appCtx)
+                    HookTelemetryReceiver.notifyUiListeners()
+                    updated.toBundle()
+                }
+
                 else -> ensureLoaded(appCtx).toBundle()
             }
         } catch (_: Throwable) {
@@ -290,6 +299,7 @@ class QuotaSyncProvider : ContentProvider() {
         const val METHOD_HEARTBEAT = "heartbeat"
         const val METHOD_APPEND_DEV_EVENT = "append_dev_event"
         const val METHOD_CLEAR_DEV_EVENTS = "clear_dev_events"
+        const val METHOD_REQUEST_FULL_SCAN = "request_full_scan"
 
         const val KEY_FIVE = "five"
         const val KEY_FIVE_RESET = "five_reset"
@@ -311,6 +321,7 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_OVERLAY_ENABLED = "overlay_enabled"
         const val KEY_ZERO_GUARD_COUNT = "zero_guard_count"
         const val KEY_LINK_ANOMALY_COUNT = "link_anomaly_count"
+        const val KEY_FORCE_SCAN_SEQ = "force_scan_seq"
         const val KEY_DEV_LOGS_JSON = "dev_logs_json"
         const val KEY_DEV_EVENT_JSON = "dev_event_json"
         const val KEY_INCREMENT_ZERO_GUARD = "increment_zero_guard"
@@ -373,6 +384,7 @@ class QuotaSyncProvider : ContentProvider() {
                     overlayEnabled = false,
                     zeroGuardCount = prefs.getInt(KEY_ZERO_GUARD_COUNT, 0),
                     linkAnomalyCount = prefs.getInt(KEY_LINK_ANOMALY_COUNT, 0),
+                    forceScanSeq = prefs.getLong(KEY_FORCE_SCAN_SEQ, 0L),
                     devLogsJson = prefs.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
                 )
                 cachedState.set(loaded)
@@ -815,6 +827,75 @@ class QuotaSyncProvider : ContentProvider() {
                     context.contentResolver.call(AUTHORITY_URI, METHOD_APPEND_DEV_EVENT, null, extras)
                 }
             } catch (_: Throwable) {
+            }
+        }
+
+        fun recordFullProtocolScanEvent(
+            context: Context,
+            sessionId: String,
+            source: String,
+            summary: String,
+            detailZh: String,
+            detailEn: String,
+            scanCount: Int = 1
+        ) {
+            try {
+                val obj = JSONObject().apply {
+                    put("eventType", "FULL_PROTOCOL_SCAN")
+                    put("eventTimeMs", System.currentTimeMillis())
+                    put("cachedAtMs", 0L)
+                    put("sessionId", sessionId)
+                    put("source", source)
+                    put("restoredQuota", summary)
+                    put("triggerCount", scanCount)
+                    put("detailZh", detailZh)
+                    put("detailEn", detailEn)
+                }
+                if (isInModuleProcess(context)) {
+                    appendDevEventLocal(context.applicationContext ?: context, obj.toString(), false, false)
+                    HookTelemetryReceiver.notifyUiListeners()
+                } else {
+                    val extras = Bundle().apply {
+                        putString(KEY_DEV_EVENT_JSON, obj.toString())
+                    }
+                    context.contentResolver.call(AUTHORITY_URI, METHOD_APPEND_DEV_EVENT, null, extras)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        @Synchronized
+        internal fun bumpForceScanSeqLocal(appCtx: Context): UnifiedState {
+            val prev = ensureLoaded(appCtx)
+            val nextSeq = maxOf(prev.forceScanSeq + 1L, System.currentTimeMillis())
+            val next = prev.copy(forceScanSeq = nextSeq)
+            cachedState.set(next)
+            try {
+                appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putLong(KEY_FORCE_SCAN_SEQ, nextSeq)
+                    .apply()
+            } catch (_: Throwable) {
+            }
+            try {
+                appCtx.contentResolver.notifyChange(STATE_URI, null)
+            } catch (_: Throwable) {
+            }
+            return next
+        }
+
+        fun requestFullProtocolScan(context: Context): UnifiedState? {
+            return try {
+                if (isInModuleProcess(context)) {
+                    val updated = bumpForceScanSeqLocal(context.applicationContext ?: context)
+                    HookTelemetryReceiver.notifyUiListeners()
+                    updated
+                } else {
+                    val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_REQUEST_FULL_SCAN, null, null)
+                    UnifiedState.fromBundle(reply)
+                }
+            } catch (_: Throwable) {
+                null
             }
         }
 

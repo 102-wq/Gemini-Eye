@@ -5,6 +5,9 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 import java.util.zip.GZIPInputStream
 import kotlin.math.roundToInt
 
@@ -32,8 +35,8 @@ object QuotaTextParser {
     private const val FIVE_HOUR_MAX_WINDOW_SEC = 5L * 3600L + 600L      // 5h 10m
     private const val WEEKLY_MAX_WINDOW_SEC = 7L * 86400L + 3600L       // 7d 1h
     private const val MIN_FUTURE_RESET_SEC = 45L
-    private const val MAX_PROTO_SCAN_BYTES = 65_536
-    private const val MAX_GUNZIP_BYTES = 65_536
+    private const val MAX_PROTO_SCAN_BYTES = 262_144
+    private const val MAX_GUNZIP_BYTES = 262_144
 
     enum class MetricKind { FIVE_HOUR, WEEKLY, RESET }
 
@@ -65,9 +68,23 @@ object QuotaTextParser {
 
     private val structuredQuotaKeyRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
         Regex(
-            """^(?:five_hour_quota|five_hour_used|five_hour_percent|5h_quota|short_term_quota|short_term_percent|session_quota|remaining_quota|quota_remaining|prompts_remaining|weekly_limit|weekly_quota|weekly_used|weekly_percent|quota_limit|max_quota|five_reset|five_hour_reset|short_term_reset|weekly_reset|reset_time|reset_timestamp|reset_epoch|quota_reset)$""",
+            """^(?:five_hour_quota|five_hour_used|five_hour_percent|five_hour_usage_percent|five_hour_ratio|5h_quota|5h_percent|short_term_quota|short_term_percent|short_term_usage|session_quota|remaining_quota|quota_remaining|remaining_prompts|prompts_remaining|remaining_count|remaining_percent|remaining_ratio|weekly_limit|weekly_quota|weekly_used|weekly_percent|weekly_usage_percent|weekly_ratio|quota_used|quota_percent|quota_ratio|usage_percent|usage_percentage|usage_ratio|prompts_used|quota_limit|max_quota|max_prompts|five_reset|five_hour_reset|five_hour_reset_time|short_term_reset|weekly_reset|weekly_reset_time|reset_time|reset_timestamp|reset_at|reset_epoch|reset_seconds|quota_reset)$""",
             RegexOption.IGNORE_CASE
         )
+    }
+
+    private fun normalizeCamelToSnakeKey(rawKey: String): String {
+        if (rawKey.length > 64) return rawKey.lowercase()
+        val sb = StringBuilder(rawKey.length + 8)
+        for (i in rawKey.indices) {
+            val ch = rawKey[i]
+            if (ch.isUpperCase() && i > 0 && rawKey[i - 1].isLowerCase()) {
+                sb.append('_').append(ch.lowercaseChar())
+            } else {
+                sb.append(ch.lowercaseChar())
+            }
+        }
+        return sb.toString()
     }
 
     private val ratioOrPctRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
@@ -105,7 +122,8 @@ object QuotaTextParser {
 
     // Standard Gemini / Google compute cap denominators used to validate (used, limit) varint pairs
     private val plausibleLimitCaps = setOf(
-        5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100, 120, 150, 200, 250, 300, 500, 1000, 1500, 2000, 5000
+        3, 5, 8, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50, 60, 75, 80, 100, 120, 125, 150, 200, 250,
+        300, 400, 450, 500, 600, 750, 1000, 1500, 2000, 3000, 5000
     )
 
     // =========================================================================
@@ -180,8 +198,17 @@ object QuotaTextParser {
             text.contains("reset", ignoreCase = true) ||
             text.contains("remaining", ignoreCase = true) ||
             text.contains("weekly", ignoreCase = true) ||
+            text.contains("prompt", ignoreCase = true) ||
+            text.contains("capacity", ignoreCase = true) ||
+            text.contains("entitlement", ignoreCase = true) ||
+            text.contains("eligibility", ignoreCase = true) ||
             text.contains("已使用") ||
             text.contains("已用") ||
+            text.contains("剩余") ||
+            text.contains("可用") ||
+            text.contains("每周") ||
+            text.contains("额度") ||
+            text.contains("用量") ||
             text.contains("限额") ||
             text.contains("重置") ||
             text.contains("上限")
@@ -390,33 +417,48 @@ object QuotaTextParser {
             }
         }
 
-        // Also scan raw unframed ProtoBuf / GZIP buffer when not framed by gRPC 5-byte header
+        // Also scan raw unframed ProtoBuf / GZIP buffer when not completely framed by gRPC 5-byte header
         if (!parsedGrpcFrames) {
+            val firstFlag = rawBytes[0].toInt() and 0xFF
+            val firstFrameLen = if (safeLen >= 6) {
+                ((rawBytes[1].toInt() and 0xFF) shl 24) or
+                    ((rawBytes[2].toInt() and 0xFF) shl 16) or
+                    ((rawBytes[3].toInt() and 0xFF) shl 8) or
+                    (rawBytes[4].toInt() and 0xFF)
+            } else {
+                -1
+            }
+            val startOff = if ((firstFlag == 0 || firstFlag == 1) && firstFrameLen in 6..2_097_152 && safeLen > 6 && firstFlag == 0) 5 else 0
+
             val payloadBuf: ByteArray
+            val payloadOffset: Int
             val payloadLen: Int
-            if (safeLen >= 10 &&
-                (rawBytes[0].toInt() and 0xFF) == 0x1F &&
-                (rawBytes[1].toInt() and 0xFF) == 0x8B
+            if (safeLen - startOff >= 10 &&
+                (rawBytes[startOff].toInt() and 0xFF) == 0x1F &&
+                (rawBytes[startOff + 1].toInt() and 0xFF) == 0x8B
             ) {
-                val gunzipped = gunzipBounded(rawBytes, 0, safeLen)
+                val gunzipped = gunzipBounded(rawBytes, startOff, safeLen - startOff)
                 if (gunzipped != null) {
                     payloadBuf = gunzipped
+                    payloadOffset = 0
                     payloadLen = gunzipped.size
                 } else {
                     payloadBuf = rawBytes
+                    payloadOffset = startOff
                     payloadLen = safeLen
                 }
             } else {
                 payloadBuf = rawBytes
+                payloadOffset = startOff
                 payloadLen = safeLen
             }
 
-            if (scanAsciiQuotaMarker(payloadBuf, 0, payloadLen)) {
+            if (scanAsciiQuotaMarker(payloadBuf, payloadOffset, payloadLen - payloadOffset)) {
                 hasGlobalQuotaMarker = true
             }
             scanProtoMessageSlice(
                 buf = payloadBuf,
-                offset = 0,
+                offset = payloadOffset,
                 end = payloadLen,
                 depth = 0,
                 nowMs = nowMs,
@@ -435,9 +477,11 @@ object QuotaTextParser {
             .maxByOrNull { it.confidence }
 
         // Require either BOTH 5h & Weekly windows co-existing in the same RPC message,
-        // or a high-confidence window (paired Timestamp sub-message + quota context / cap).
+        // or a confident single window (Timestamp/Duration + metric or quota context).
         val pairedDualWindows = bestFive != null && bestWeek != null
-        val strongSingleWindow = (bestFive?.confidence ?: 0) >= 3 || (bestWeek?.confidence ?: 0) >= 3
+        val minSingleConf = if (hasGlobalQuotaMarker) 2 else 3
+        val strongSingleWindow = (bestFive?.confidence ?: 0) >= minSingleConf ||
+            (bestWeek?.confidence ?: 0) >= minSingleConf
         if (!pairedDualWindows && !strongSingleWindow) return null
 
         val base = sanitizeSnapshot(prev)
@@ -533,6 +577,7 @@ object QuotaTextParser {
 
         val scalars = ArrayList<ScalarEntry>(8)
         var nestedTimestamp: Pair<MetricKind, String>? = null
+        var stringMetricCandidate: String? = null
         var localHint = inheritedHint
         var explicitKindOverride: MetricKind? = null
 
@@ -577,8 +622,9 @@ object QuotaTextParser {
                     val sliceEnd = pos + sliceLen
 
                     if (sliceLen in 2..16384) {
-                        // 1. Check if sub-slice is a google.protobuf.Timestamp {1: seconds, 2: nanos}
+                        // 1. Check if sub-slice is a google.protobuf.Timestamp or google.protobuf.Duration
                         val ts = tryDecodeProtobufTimestamp(buf, pos, sliceEnd, nowMs)
+                            ?: tryDecodeProtobufDuration(buf, pos, sliceEnd, explicitKindOverride)
                         if (ts != null) {
                             nestedTimestamp = ts
                         } else if (isPrintableUtf8Ascii(buf, pos, sliceEnd)) {
@@ -596,6 +642,13 @@ object QuotaTextParser {
                                 str.contains("5h", ignoreCase = true) || str.contains("5-hour", ignoreCase = true) ||
                                     str.contains("short", ignoreCase = true) || str.contains("session", ignoreCase = true) ->
                                     explicitKindOverride = MetricKind.FIVE_HOUR
+                            }
+                            val isoTs = tryClassifyIso8601Timestamp(str, nowMs)
+                            if (isoTs != null && nestedTimestamp == null) {
+                                nestedTimestamp = isoTs
+                            } else if (stringMetricCandidate == null && str.length in 2..16) {
+                                val sanitizedStr = sanitizeQuotaMetric(str)
+                                if (sanitizedStr != "--") stringMetricCandidate = sanitizedStr
                             }
                         } else if (sliceLen <= 8192) {
                             // 2. Try nested ProtoBuf sub-message recursively
@@ -630,8 +683,9 @@ object QuotaTextParser {
 
         if (pos != end) return false
 
-        // Evaluate whether this sub-message represents a Quota Window (reset timestamp + usage/limit)
-        if (depth >= 1 && scalars.size <= 12) {
+        // Evaluate whether this message/sub-message represents a Quota Window (reset timestamp + usage/limit)
+        val allowDepthEval = depth >= 1 || localHint || explicitKindOverride != null || nestedTimestamp != null
+        if (allowDepthEval && scalars.size <= 16) {
             var detectedTs = nestedTimestamp
             var tsFieldNum = -1
             if (detectedTs == null) {
@@ -650,6 +704,7 @@ object QuotaTextParser {
                 val windowKind = explicitKindOverride ?: detectedTs.first
                 val resetTok = detectedTs.second
                 val metricPair = extractMetricFromScalars(scalars, tsFieldNum, allowZeroWithHint = localHint)
+                    ?: stringMetricCandidate?.let { it to 2 }
                 if (metricPair != null) {
                     var conf = metricPair.second
                     if (nestedTimestamp != null) conf += 1
@@ -667,6 +722,47 @@ object QuotaTextParser {
         }
 
         return true
+    }
+
+    private fun tryDecodeProtobufDuration(
+        buf: ByteArray,
+        offset: Int,
+        end: Int,
+        kindOverride: MetricKind?
+    ): Pair<MetricKind, String>? {
+        val len = end - offset
+        if (len !in 2..14) return null
+        var pos = offset
+        var secVal: Long? = null
+        var nanosOk = true
+        var count = 0
+
+        while (pos < end) {
+            val tagPair = readVarint64(buf, pos, end) ?: return null
+            val tag = tagPair.first
+            pos = tagPair.second
+            if ((tag and 0x07L) != 0L) return null
+            val fieldNum = (tag ushr 3).toInt()
+            val valPair = readVarint64(buf, pos, end) ?: return null
+            pos = valPair.second
+            count++
+            when (fieldNum) {
+                1 -> secVal = valPair.first
+                2 -> if (valPair.first !in 0L..999_999_999L) nanosOk = false
+                else -> return null
+            }
+        }
+
+        if (!nanosOk || count !in 1..2 || secVal == null) return null
+        if (secVal !in MIN_FUTURE_RESET_SEC..WEEKLY_MAX_WINDOW_SEC) return null
+        val isFive = when (kindOverride) {
+            MetricKind.FIVE_HOUR -> true
+            MetricKind.WEEKLY -> false
+            else -> secVal <= FIVE_HOUR_MAX_WINDOW_SEC
+        }
+        val kind = if (isFive) MetricKind.FIVE_HOUR else MetricKind.WEEKLY
+        val tok = if (isFive) formatDurationSeconds(secVal) else formatWeeklyDurationSeconds(secVal)
+        return if (tok != "--") kind to tok else null
     }
 
     /**
@@ -861,6 +957,23 @@ object QuotaTextParser {
         return true
     }
 
+    private fun tryClassifyIso8601Timestamp(raw: String, nowMs: Long): Pair<MetricKind, String>? {
+        val s = raw.trim()
+        if (s.length !in 19..34 || !s.contains('T') || !s.endsWith('Z')) return null
+        val patterns = arrayOf("yyyy-MM-dd'T'HH:mm:ss'Z'", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+        for (pat in patterns) {
+            try {
+                val fmt = SimpleDateFormat(pat, Locale.US).apply {
+                    timeZone = TimeZone.getTimeZone("UTC")
+                }
+                val parsed = fmt.parse(s) ?: continue
+                return classifyFutureEpochTimestamp(parsed.time, nowMs)
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
     fun hasQuotaContextHint(s: String): Boolean {
         if (s.isEmpty()) return false
         return s.contains("quota", ignoreCase = true) ||
@@ -868,9 +981,14 @@ object QuotaTextParser {
             s.contains("usage", ignoreCase = true) ||
             s.contains("remaining", ignoreCase = true) ||
             s.contains("allowance", ignoreCase = true) ||
+            s.contains("eligibility", ignoreCase = true) ||
+            s.contains("entitlement", ignoreCase = true) ||
             s.contains("weekly", ignoreCase = true) ||
             s.contains("short_term", ignoreCase = true) ||
-            s.contains("ratelimit", ignoreCase = true)
+            s.contains("ratelimit", ignoreCase = true) ||
+            s.contains("rate_limit", ignoreCase = true) ||
+            s.contains("prompt", ignoreCase = true) ||
+            s.contains("subscription", ignoreCase = true)
     }
 
     private fun findFirstNonWhitespace(buf: ByteArray, len: Int): Int {
@@ -1017,25 +1135,46 @@ object QuotaTextParser {
         depth: Int,
         nowMs: Long,
         out: MutableList<DecodedProtoWindow>
-    ) {
-        if (depth > 5 || out.size >= 8) return
+    ): Pair<MetricKind, String>? {
+        if (depth > 6 || out.size >= 8) return null
         val len = minOf(arr.length(), 24)
         var detectedTs: Pair<MetricKind, String>? = null
         val nums = ArrayList<Double>(6)
+        var explicitTextMetric: String? = null
 
         for (i in 0 until len) {
             val elem = arr.opt(i) ?: continue
             when (elem) {
-                is JSONArray -> scanJspbArrayRecursive(elem, depth + 1, nowMs, out)
+                is JSONArray -> {
+                    val childTs = scanJspbArrayRecursive(elem, depth + 1, nowMs, out)
+                    if (childTs != null && detectedTs == null && elem.length() in 1..2) {
+                        // Google JSPB represents protobuf.Timestamp as a child [seconds, nanos] array
+                        detectedTs = childTs
+                    }
+                }
                 is String -> {
                     val s = elem.trim()
                     if (depth < 4 && s.length >= 4 && (s[0] == '[' || s[0] == '{')) {
                         try {
                             when (val inner = JSONTokener(s).nextValue()) {
-                                is JSONArray -> scanJspbArrayRecursive(inner, depth + 1, nowMs, out)
+                                is JSONArray -> {
+                                    val childTs = scanJspbArrayRecursive(inner, depth + 1, nowMs, out)
+                                    if (childTs != null && detectedTs == null && inner.length() in 1..2) {
+                                        detectedTs = childTs
+                                    }
+                                }
                             }
                         } catch (_: Throwable) {
                         }
+                    } else if (detectedTs == null && s.all { it.isDigit() } && s.length in 10..16) {
+                        s.toLongOrNull()?.let { lv ->
+                            classifyFutureEpochTimestamp(lv, nowMs)?.let { detectedTs = it }
+                        }
+                    } else if (detectedTs == null && s.length in 19..34 && s.endsWith('Z')) {
+                        tryClassifyIso8601Timestamp(s, nowMs)?.let { detectedTs = it }
+                    } else if (explicitTextMetric == null && s.length in 2..16) {
+                        val sanitized = sanitizeQuotaMetric(s)
+                        if (sanitized != "--") explicitTextMetric = sanitized
                     }
                 }
                 is Number -> {
@@ -1050,7 +1189,7 @@ object QuotaTextParser {
             }
         }
 
-        if (detectedTs != null && nums.isNotEmpty() && len <= 10) {
+        if (detectedTs != null && (nums.isNotEmpty() || explicitTextMetric != null) && len <= 24) {
             var metric = "--"
             var conf = 1
             // Check non-zero (used, limit) pair first to avoid [0, pageSize, futureEpoch] false 0%
@@ -1073,6 +1212,9 @@ object QuotaTextParser {
                 if (frac != null) {
                     metric = formatFractionAsPercent(frac)
                     conf = 2
+                } else if (explicitTextMetric != null) {
+                    metric = explicitTextMetric
+                    conf = 2
                 } else if (ints.size == 1 && ints[0] in 1..100) {
                     metric = sanitizeQuotaMetric("${ints[0]}%")
                     conf = 2
@@ -1082,6 +1224,9 @@ object QuotaTextParser {
                 out.add(DecodedProtoWindow(detectedTs.first, metric, detectedTs.second, conf))
             }
         }
+
+        // Propagate pure [seconds] or [seconds, nanos] Timestamp array upward to its enclosing window
+        return if (detectedTs != null && len in 1..2 && explicitTextMetric == null) detectedTs else null
     }
 
     /**
@@ -1132,13 +1277,13 @@ object QuotaTextParser {
 
         // 4. Regex scan for explicit quota JSON properties in minified script text
         if (!foundAny) {
-            val keyValMatches = Regex(""""([a-zA-Z0-9_]{3,36})"\s*:\s*([0-9.]+|"[^"]+")""").findAll(trimmed)
+            val keyValMatches = Regex(""""([a-zA-Z0-9_]{3,48})"\s*:\s*([0-9.]+|"[^"]+")""").findAll(trimmed)
             val extracted = mutableMapOf<String, String>()
             for (m in keyValMatches) {
-                val k = m.groupValues[1].lowercase()
+                val snakeKey = normalizeCamelToSnakeKey(m.groupValues[1])
                 val v = m.groupValues[2].trim('"')
-                if (structuredQuotaKeyRegex.matches(k)) {
-                    extracted[k] = v
+                if (structuredQuotaKeyRegex.matches(snakeKey)) {
+                    extracted[snakeKey] = v
                 }
             }
             if (extracted.isNotEmpty()) {
@@ -1498,13 +1643,14 @@ object QuotaTextParser {
                 val keys = node.keys()
                 while (keys.hasNext()) {
                     val key = keys.next()
+                    val snakeKey = normalizeCamelToSnakeKey(key)
                     val value = node.opt(key)
-                    if (structuredQuotaKeyRegex.matches(key) &&
+                    if (structuredQuotaKeyRegex.matches(snakeKey) &&
                         value != null &&
                         value !is JSONObject &&
                         value !is JSONArray
                     ) {
-                        out[key.lowercase()] = value.toString()
+                        out[snakeKey] = value.toString()
                     } else if (value is JSONObject || value is JSONArray) {
                         collectFromJson(value, out, depth + 1)
                     } else if (value is String && depth < 5) {
@@ -1550,13 +1696,17 @@ object QuotaTextParser {
         var weekReset = base.weeklyReset
 
         var remainingVal: String? = null
+        var usedCountVal: String? = null
         var totalLimitVal: String? = null
 
         for ((k, v) in fields) {
             when {
-                k == "remaining_quota" || k == "quota_remaining" || k == "prompts_remaining" ->
+                k == "remaining_quota" || k == "quota_remaining" || k == "prompts_remaining" ||
+                    k == "remaining_prompts" || k == "remaining_count" ->
                     remainingVal = v
-                k == "quota_limit" || k == "max_quota" ->
+                k == "prompts_used" || k == "quota_used" ->
+                    usedCountVal = v
+                k == "quota_limit" || k == "max_quota" || k == "max_prompts" ->
                     totalLimitVal = v
                 k.contains("week") && k.contains("reset") -> {
                     val clean = normalizeFieldCandidate(v, MetricKind.RESET)
@@ -1574,10 +1724,38 @@ object QuotaTextParser {
                     val clean = normalizeFieldCandidate(v, MetricKind.WEEKLY)
                     if (clean != "--") weekly = clean
                 }
+                k == "quota_percent" || k == "quota_ratio" || k == "usage_percent" || k == "usage_percentage" || k == "usage_ratio" -> {
+                    val clean = normalizeFieldCandidate(v, MetricKind.FIVE_HOUR)
+                    if (clean != "--") fiveHour = clean
+                }
+                k == "remaining_percent" || k == "remaining_ratio" -> {
+                    val remPct = normalizeFieldCandidate(v, MetricKind.FIVE_HOUR)
+                    val pctM = pctNumRegex.matchEntire(remPct)
+                    if (pctM != null) {
+                        val rem = pctM.groupValues.getOrNull(1)?.toFloatOrNull()
+                        if (rem != null && rem in 0f..100f) {
+                            val used = (100f - rem).roundToInt().coerceIn(0, 100)
+                            val usedClean = sanitizeQuotaMetric("$used%")
+                            if (usedClean != "--") fiveHour = usedClean
+                        }
+                    }
+                }
             }
         }
 
-        if (remainingVal != null &&
+        if (usedCountVal != null &&
+            totalLimitVal != null &&
+            usedCountVal.all { it.isDigit() } &&
+            totalLimitVal.all { it.isDigit() }
+        ) {
+            val used = usedCountVal.toIntOrNull()
+            val lim = totalLimitVal.toIntOrNull()
+            if (used != null && lim != null && lim > 0 && used in 0..lim) {
+                val usedPct = ((used.toDouble() / lim.toDouble()) * 100.0).roundToInt()
+                val pctClean = sanitizeQuotaMetric("$usedPct%")
+                if (pctClean != "--") fiveHour = pctClean
+            }
+        } else if (remainingVal != null &&
             totalLimitVal != null &&
             remainingVal.all { it.isDigit() } &&
             totalLimitVal.all { it.isDigit() }

@@ -32,6 +32,8 @@ type DevEventType =
   | 'MANUAL_TAP'
   | 'BACKGROUND_SLEEP'
   | 'PROTO_SCAN'
+  | 'FULL_PROTOCOL_SCAN'
+  | 'BATTERY_IMPACT'
   | 'ZERO_GUARD'
   | 'LINK_ANOMALY';
 
@@ -181,12 +183,23 @@ export default function App() {
   const [isRefreshingHud, setIsRefreshingHud] = useState<boolean>(false);
   const [usageSheetOpen, setUsageSheetOpen] = useState<boolean>(false);
   const [lastSyncNote, setLastSyncNote] = useState<string>('');
+  const [lastDiagTraceSummary, setLastDiagTraceSummary] = useState<string>('');
   const [devConsoleOpen, setDevConsoleOpen] = useState<boolean>(false);
   const [isStaleOffline, setIsStaleOffline] = useState<boolean>(false);
+  const [lastCachedTimestamp, setLastCachedTimestamp] = useState<string>('');
   const [isSessionDeepCleaned, setIsSessionDeepCleaned] = useState<boolean>(false);
   const [zeroGuardCount, setZeroGuardCount] = useState<number>(0);
   const [linkAnomalyCount, setLinkAnomalyCount] = useState<number>(0);
-  const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY'>('ALL');
+  const [bgWakeupCount, setBgWakeupCount] = useState<number>(0);
+  const [fgDispatchCount, setFgDispatchCount] = useState<number>(1);
+  const [activePoolThreads, setActivePoolThreads] = useState<number>(0);
+  const [poolStateLabel, setPoolStateLabel] = useState<'IDLE_ZERO_THREADS' | 'FG_ON_DEMAND_ACTIVE' | 'SLEEP_PURGED'>('IDLE_ZERO_THREADS');
+  const [batteryImpactCount, setBatteryImpactCount] = useState<number>(1);
+  const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
+  const bgWakeupCountRef = useRef<number>(0);
+  const fgDispatchCountRef = useRef<number>(1);
+  bgWakeupCountRef.current = bgWakeupCount;
+  fgDispatchCountRef.current = fgDispatchCount;
   const cachedSnapshotsRef = useRef<Record<string, CachedSnapshotEntry>>({
     sess_8f3a91c04b12: {
       cachedAtStr: formatFullTimestampMs(new Date(Date.now() - 18_500)),
@@ -244,7 +257,24 @@ export default function App() {
       detailEn: 'Cronet UrlRequest.onReadCompleted header captured: [__Secure-1PSID, X-Goog-AuthUser:0]. Protobuf scanned dual windows: 5h=15% (1h52m), Weekly=29% (0day23h)',
       level: 'info',
     },
+    {
+      id: 'init-3',
+      timestamp: '09:41:07',
+      timeMs: '09:41:07.355',
+      eventType: 'BATTERY_IMPACT',
+      sessionTag: 'sess_8f3a91c04b12',
+      detailZh: '[零后台功耗基线] 累计后台线程唤醒=0 | 前台按需派发=1 | 线程池状态: FG_ON_DEMAND_ACTIVE(1) -> allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS(0 活跃线程)',
+      detailEn: '[Zero-Background Baseline] Cumulative BG Thread Wakeups=0 | FG On-Demand Dispatches=1 | Pool State: FG_ON_DEMAND_ACTIVE(1) -> allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS(0 active threads)',
+      level: 'info',
+    },
   ]);
+
+  const FOREGROUND_HEARTBEAT_INTERVAL_MS = 30_000;
+  const lastQuotaUpdateAtRef = useRef<number>(Date.now());
+  const heartbeatTimerRef = useRef<number | null>(null);
+  const heartbeatReplayTimerRef = useRef<number | null>(null);
+  const isGeminiForegroundRef = useRef<boolean>(isGeminiForeground);
+  const isZhRef = useRef<boolean>(uiLang === 'zh');
 
   const logDevEvent = (
     eventType: DevEventType,
@@ -279,6 +309,11 @@ export default function App() {
   const settingsBar5hRef = useRef<HTMLDivElement | null>(null);
   const settingsBarWeeklyRef = useRef<HTMLDivElement | null>(null);
 
+  const HUD_FRAME_SMOOTH_OFFSET_MS = 8;
+  const HUD_TOUCH_JITTER_DEADBAND_PX = 1.1;
+  const HUD_TOUCH_SAMPLE_WINDOW_MS = 8;
+  const HUD_MAGNET_EDGE_THRESHOLD_PX = 40;
+
   const hudPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const hudAnimRafRef = useRef<number | null>(null);
   const dragRef = useRef<{
@@ -286,11 +321,14 @@ export default function App() {
     startY: number;
     origX: number;
     origY: number;
+    filteredX: number;
+    filteredY: number;
     targetX: number;
     targetY: number;
     lastClientX: number;
     lastClientY: number;
     lastTimeMs: number;
+    lastSampleTimeMs: number;
     vx: number;
     vy: number;
     moved: boolean;
@@ -300,11 +338,14 @@ export default function App() {
     startY: 0,
     origX: 0,
     origY: 0,
+    filteredX: 0,
+    filteredY: 0,
     targetX: 0,
     targetY: 0,
     lastClientX: 0,
     lastClientY: 0,
     lastTimeMs: 0,
+    lastSampleTimeMs: 0,
     vx: 0,
     vy: 0,
     moved: false,
@@ -330,6 +371,10 @@ export default function App() {
     () => ACCOUNT_SESSIONS.find((s) => s.id === selectedAccountId) ?? ACCOUNT_SESSIONS[0],
     [selectedAccountId]
   );
+  const activeSessionRef = useRef<SimulatedAccountSession>(activeSession);
+  isGeminiForegroundRef.current = isGeminiForeground;
+  isZhRef.current = isZh;
+  activeSessionRef.current = activeSession;
 
   const visibleDevLogs = useMemo(() => {
     if (consoleFilter === 'ZERO_GUARD') {
@@ -338,8 +383,55 @@ export default function App() {
     if (consoleFilter === 'LINK_ANOMALY') {
       return devLogs.filter((l) => l.eventType === 'LINK_ANOMALY');
     }
+    if (consoleFilter === 'BATTERY_IMPACT') {
+      return devLogs.filter((l) => l.eventType === 'BATTERY_IMPACT');
+    }
     return devLogs;
   }, [devLogs, consoleFilter]);
+
+  const recordBatteryImpactEvent = (
+    sessionTag: string,
+    phase: 'FG_DISPATCH' | 'FG_SETTLE_IDLE' | 'BG_SLEEP_PURGE' | 'HEARTBEAT_REPLAY',
+    reasonTag: string
+  ) => {
+    if (phase === 'FG_DISPATCH' || phase === 'HEARTBEAT_REPLAY') {
+      const nextFg = fgDispatchCountRef.current + 1;
+      fgDispatchCountRef.current = nextFg;
+      setFgDispatchCount(nextFg);
+      setActivePoolThreads(1);
+      setPoolStateLabel('FG_ON_DEMAND_ACTIVE');
+      setBatteryImpactCount((c) => c + 1);
+      logDevEvent(
+        'BATTERY_IMPACT',
+        sessionTag,
+        `[线程池按需唤醒 · ${reasonTag}] 累计后台线程唤醒=${bgWakeupCountRef.current} | 前台按需派发=${nextFg} | 线程池状态: IDLE_ZERO_THREADS(0) -> FG_ON_DEMAND_ACTIVE(1 守护线程, keepAlive=5s)`,
+        `[On-Demand Pool Wake · ${reasonTag}] Cumulative BG Thread Wakeups=${bgWakeupCountRef.current} | FG Dispatches=${nextFg} | Pool State: IDLE_ZERO_THREADS(0) -> FG_ON_DEMAND_ACTIVE(1 daemon thread, keepAlive=5s)`,
+        'info'
+      );
+    } else if (phase === 'FG_SETTLE_IDLE') {
+      setActivePoolThreads(0);
+      setPoolStateLabel('IDLE_ZERO_THREADS');
+      setBatteryImpactCount((c) => c + 1);
+      logDevEvent(
+        'BATTERY_IMPACT',
+        sessionTag,
+        `[按需任务完成 · ${reasonTag}] 累计后台线程唤醒=${bgWakeupCountRef.current} | 前台按需派发=${fgDispatchCountRef.current} | 线程池状态: FG_ON_DEMAND_ACTIVE(1) -> allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS(0 活跃线程)`,
+        `[On-Demand Task Settled · ${reasonTag}] Cumulative BG Thread Wakeups=${bgWakeupCountRef.current} | FG Dispatches=${fgDispatchCountRef.current} | Pool State: FG_ON_DEMAND_ACTIVE(1) -> allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS(0 active threads)`,
+        'success'
+      );
+    } else {
+      setActivePoolThreads(0);
+      setPoolStateLabel('SLEEP_PURGED');
+      setBatteryImpactCount((c) => c + 1);
+      logDevEvent(
+        'BATTERY_IMPACT',
+        sessionTag,
+        `[零后台休眠清零 · ${reasonTag}] 累计后台线程唤醒=${bgWakeupCountRef.current} (拦截非UI守护进程 :interactor/:gms) | 队列已清空并调用 purge() -> SLEEP_PURGED(0 活跃线程, 0 后台定时器)`,
+        `[Zero-Background Sleep Purge · ${reasonTag}] Cumulative BG Thread Wakeups=${bgWakeupCountRef.current} (:interactor/:gms daemons skipped) | Queue drained & purge() -> SLEEP_PURGED(0 active threads, 0 bg timers)`,
+        'success'
+      );
+    }
+  };
 
   // Update mini progress bar fill widths via DOM refs (no inline style props)
   useEffect(() => {
@@ -392,15 +484,116 @@ export default function App() {
     setTimeout(() => setCopiedPath(null), 1800);
   };
 
+  const clearHeartbeatTimers = () => {
+    if (heartbeatTimerRef.current !== null) {
+      window.clearTimeout(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    if (heartbeatReplayTimerRef.current !== null) {
+      window.clearTimeout(heartbeatReplayTimerRef.current);
+      heartbeatReplayTimerRef.current = null;
+    }
+  };
+
+  const triggerSilentHeartbeatGetUserQuotaReplay = () => {
+    if (!isGeminiForegroundRef.current) return;
+    const acct = activeSessionRef.current;
+    const elapsedSec = Math.max(
+      30,
+      Math.round((Date.now() - lastQuotaUpdateAtRef.current) / 1000)
+    );
+    lastQuotaUpdateAtRef.current = Date.now();
+
+    logDevEvent(
+      'FULL_PROTOCOL_SCAN',
+      acct.sessionTag,
+      `[前台心跳检查 · ${elapsedSec}s 无更新] 前台持续活跃满 30 秒未收到新额度快照，强制静默重放 gRPC batchExecute 'GetUserQuota' (robinandroid-pa / BardChatUi · hOoQ4d) 以保证数据鲜活`,
+      `[Foreground Heartbeat Check · ${elapsedSec}s Idle] No quota updates received after 30s of foreground activity; forcing silent gRPC batchExecute 'GetUserQuota' replay (robinandroid-pa / BardChatUi · hOoQ4d)`,
+      'event'
+    );
+    recordBatteryImpactEvent(acct.sessionTag, 'HEARTBEAT_REPLAY', '30s_HEARTBEAT');
+
+    if (heartbeatReplayTimerRef.current !== null) {
+      window.clearTimeout(heartbeatReplayTimerRef.current);
+    }
+    heartbeatReplayTimerRef.current = window.setTimeout(() => {
+      heartbeatReplayTimerRef.current = null;
+      if (!isGeminiForegroundRef.current) return;
+      const latestAcct = activeSessionRef.current;
+      const cachedAtStr = formatFullTimestampMs(new Date());
+      lastQuotaUpdateAtRef.current = Date.now();
+      cachedSnapshotsRef.current[latestAcct.sessionTag] = {
+        cachedAtStr,
+        fiveHourQuota: latestAcct.parsed.fiveHourQuota,
+        fiveHourReset: latestAcct.parsed.fiveHourReset,
+        weeklyLimit: latestAcct.parsed.weeklyLimit,
+        weeklyReset: latestAcct.parsed.weeklyReset,
+        source: 'gRPC-GetUserQuota',
+      };
+      setLastCachedTimestamp(cachedAtStr);
+      setIsStaleOffline(false);
+      setIsSessionDeepCleaned(false);
+      setLastSyncNote(
+        isZhRef.current
+          ? `前台 30s 心跳静默校验完成 (${latestAcct.sessionTag})：已通过 gRPC batchExecute 'GetUserQuota' 刷新最新额度快照`
+          : `30s foreground heartbeat verified (${latestAcct.sessionTag}): silently replayed gRPC batchExecute 'GetUserQuota' for freshness`
+      );
+      logDevEvent(
+        'PROTO_SCAN',
+        latestAcct.sessionTag,
+        `[静默 GetUserQuota 重放完成] 无感校验成功 [5h=${latestAcct.parsed.fiveHourQuota} (${latestAcct.parsed.fiveHourReset}), 每周=${latestAcct.parsed.weeklyLimit} (${formatWeeklyResetLabel(latestAcct.parsed.weeklyReset, 'zh')})]，已重置 30s 前台心跳计时器`,
+        `[Silent GetUserQuota Replay Complete] Freshness verified without UI interruption [5h=${latestAcct.parsed.fiveHourQuota} (${latestAcct.parsed.fiveHourReset}), Weekly=${latestAcct.parsed.weeklyLimit} (${formatWeeklyResetLabel(latestAcct.parsed.weeklyReset, 'en')})]; 30s heartbeat reset`,
+        'success'
+      );
+      recordBatteryImpactEvent(latestAcct.sessionTag, 'FG_SETTLE_IDLE', '30s_HEARTBEAT');
+      scheduleForegroundHeartbeat();
+    }, 420);
+  };
+
+  const scheduleForegroundHeartbeat = () => {
+    if (heartbeatTimerRef.current !== null) {
+      window.clearTimeout(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    if (!isGeminiForegroundRef.current) return;
+    const elapsed = Date.now() - lastQuotaUpdateAtRef.current;
+    const waitMs = Math.max(250, FOREGROUND_HEARTBEAT_INTERVAL_MS - elapsed);
+    heartbeatTimerRef.current = window.setTimeout(() => {
+      heartbeatTimerRef.current = null;
+      if (!isGeminiForegroundRef.current) return;
+      if (Date.now() - lastQuotaUpdateAtRef.current >= FOREGROUND_HEARTBEAT_INTERVAL_MS - 100) {
+        triggerSilentHeartbeatGetUserQuotaReplay();
+      } else {
+        scheduleForegroundHeartbeat();
+      }
+    }, waitMs);
+  };
+
+  useEffect(() => {
+    if (!isGeminiForeground) {
+      clearHeartbeatTimers();
+      return;
+    }
+    scheduleForegroundHeartbeat();
+    return () => {
+      clearHeartbeatTimers();
+    };
+  }, [isGeminiForeground, selectedAccountId]);
+
   const recordCachedNonZeroSnapshot = (acct: SimulatedAccountSession) => {
+    const now = Date.now();
+    lastQuotaUpdateAtRef.current = now;
+    const cachedAtStr = formatFullTimestampMs(new Date(now));
     cachedSnapshotsRef.current[acct.sessionTag] = {
-      cachedAtStr: formatFullTimestampMs(new Date()),
+      cachedAtStr,
       fiveHourQuota: acct.parsed.fiveHourQuota,
       fiveHourReset: acct.parsed.fiveHourReset,
       weeklyLimit: acct.parsed.weeklyLimit,
       weeklyReset: acct.parsed.weeklyReset,
       source: acct.parsed.source,
     };
+    setLastCachedTimestamp(cachedAtStr);
+    scheduleForegroundHeartbeat();
   };
 
   const handleSimulateProtobufZeroGuard = () => {
@@ -412,6 +605,8 @@ export default function App() {
       weeklyReset: activeSession.parsed.weeklyReset,
       source: activeSession.parsed.source,
     };
+    cachedSnapshotsRef.current[activeSession.sessionTag] = cached;
+    setLastCachedTimestamp(cached.cachedAtStr);
     const nextHit = zeroGuardCount + 1;
     setZeroGuardCount(nextHit);
     setIsSessionDeepCleaned(false);
@@ -469,6 +664,90 @@ export default function App() {
     );
   };
 
+  const buildOutboundProtocolFrameTrace = (acct: SimulatedAccountSession) => {
+    const authUserIdx =
+      acct.id === 'account-workspace' ? '1' : acct.id === 'account-heavy' ? '2' : '0';
+    const quotaHexLen = (24 + (acct.parsed.fiveHourPct % 15)).toString(16).toUpperCase().padStart(2, '0');
+    const streamHexLen = (68 + (acct.parsed.weeklyPct % 24)).toString(16).toUpperCase().padStart(2, '0');
+
+    const h2TrailersLines = [
+      `H2 Outbound #1 -> :method=POST :authority=robinandroid-pa.googleapis.com :path=/$rpc/google.internal.robin.v1.RobinService/GetUserQuota | TE: trailers | content-type=application/grpc | grpc-encoding=identity | grpc-accept-encoding=gzip,identity | x-goog-authuser=${authUserIdx}`,
+      `H2 Outbound #2 -> :method=POST :authority=gemini.google.com :path=/_/BardChatUi/data/batchexecute?rpcids=hOoQ4d,o4g7id | TE: trailers | x-same-domain=1 | x-goog-authuser=${authUserIdx}`,
+    ];
+    const grpc5bFrames = [
+      `gRPC-RPC 5B Frame #1 -> Header[00 00 00 00 ${quotaHexLen}] (Flag=0x00 Identity, PayloadLen=${parseInt(quotaHexLen, 16)}B) -> GetUserQuota [${acct.sessionTag}]`,
+      `gRPC-RPC 5B Frame #2 -> Header[01 00 00 00 ${streamHexLen}] (Flag=0x01 GZIP, PayloadLen=${parseInt(streamHexLen, 16)}B) -> StreamGenerate [${acct.sessionTag}]`,
+      `gRPC-RPC 5B Frame #3 -> Header[00 00 00 00 0E] (Flag=0x00 Identity, PayloadLen=14B) -> BardChatUi/batchexecute(hOoQ4d)`,
+    ];
+    return { h2TrailersLines, grpc5bFrames };
+  };
+
+  const runForegroundFullProtocolDiagnostic = (
+    trigger: 'ACCOUNT_SWITCH' | 'MANUAL_TAP' | 'FORCE_SETTINGS_SCAN',
+    acct: SimulatedAccountSession,
+    usageUiOpened: boolean
+  ) => {
+    const { h2TrailersLines, grpc5bFrames } = buildOutboundProtocolFrameTrace(acct);
+    const compactTrace = `${h2TrailersLines[0]}\n${grpc5bFrames[0]}`;
+    setLastDiagTraceSummary(compactTrace);
+
+    if (trigger === 'FORCE_SETTINGS_SCAN') {
+      logDevEvent(
+        'FULL_PROTOCOL_SCAN',
+        acct.sessionTag,
+        `[HUD 设置弹窗 · 强制全量协议扫描] 手动调用 runForegroundFullProtocolDiagnostic()，正在采集并打印出站 HTTP/2 TE: trailers 与 gRPC-RPC 5B 帧头...`,
+        `[HUD Settings Modal · Force Full-Protocol Scan] Manually invoked runForegroundFullProtocolDiagnostic(); dumping outbound HTTP/2 TE: trailers & gRPC-RPC 5B frame headers...`,
+        'event'
+      );
+      h2TrailersLines.forEach((line) => {
+        logDevEvent(
+          'FULL_PROTOCOL_SCAN',
+          acct.sessionTag,
+          `[出站 HTTP/2 头] ${line}`,
+          `[Outbound H2 Header] ${line}`,
+          'info'
+        );
+      });
+      grpc5bFrames.forEach((frameLine) => {
+        logDevEvent(
+          'FULL_PROTOCOL_SCAN',
+          acct.sessionTag,
+          `[出站帧头] ${frameLine}`,
+          `[Outbound Frame] ${frameLine}`,
+          'info'
+        );
+      });
+      return;
+    }
+
+    if (!usageUiOpened) {
+      logDevEvent(
+        'LINK_ANOMALY',
+        acct.sessionTag,
+        `[被动拦截诊断 · 未打开额度页] ${trigger}: 首页仅发射 StreamGenerate/Clearcut 懒加载未触发 GetUserQuota；若无全量扫描易出现：①APP_OPEN 首轮冷却抢跑错过 Cookie(__Secure-1PSID)/Bearer 抵达窗口；②Telemetry/Play 作用域覆盖单一 Auth 槽位引发 401；③gRPC start(listenerId) 与 sendMessage(callId) 请求体脱节或 https://grpc/ 虚拟域名被正则拦截`,
+        `[Passive Hook Diagnosis · Usage UI Closed] ${trigger}: Home screen emits StreamGenerate/Clearcut without calling GetUserQuota; passive capture misses due to (1) initial throttle outrunning delayed Cookie/Bearer headers, (2) cross-service Auth token overwrite, (3) gRPC listenerId/callId body mismatch & virtual host filter`,
+        'warn'
+      );
+      setTimeout(() => {
+        logDevEvent(
+          'FULL_PROTOCOL_SCAN',
+          acct.sessionTag,
+          `[前台全量协议快照监听器激活] Activity.onWindowFocusChanged(hasFocus=true) 触发四栈强扫：①DataStore PB (${acct.sessionTag}) -> ②perHostAuthorizations 按域隔离鉴权 + CookieManager -> ③DI Repo/内嵌 WebView XHR 探针 -> ④Cronet H2(TE:trailers)/gRPC-RPC(5B帧头)/batchexecute(动态刷新 SNlM0e at=) 主动重放\n${h2TrailersLines[0]}\n${grpc5bFrames[0]}`,
+          `[Foreground Full-Protocol Snapshot Listener] Activity.onWindowFocusChanged(hasFocus=true) forced 4-stack sweep: (1) DataStore PB -> (2) Scoped perHostAuthorizations + CookieManager -> (3) DI Repo/Attached WebView probe -> (4) Cronet H2(TE:trailers)/gRPC-RPC(5B frame)/batchexecute(SNlM0e refresh) replay\n${h2TrailersLines[0]}\n${grpc5bFrames[0]}`,
+          'event'
+        );
+      }, 240);
+    } else {
+      logDevEvent(
+        'FULL_PROTOCOL_SCAN',
+        acct.sessionTag,
+        `[前台全量协议快照监听器 · 额度页已打开] 捕获直连 ${acct.headerSummary}，已学习并持久化去凭据端点模板与 5B gRPC/XHR 请求体供后续冷启无感直连复用\n${h2TrailersLines[0]}\n${grpc5bFrames[0]}`,
+        `[Foreground Full-Protocol Snapshot Listener · Usage UI Open] Direct hit via ${acct.headerSummary}; persisted credential-free endpoint & framed request payload for zero-touch cold-start replay\n${h2TrailersLines[0]}\n${grpc5bFrames[0]}`,
+        'info'
+      );
+    }
+  };
+
   const handleSwitchAccount = (acct: SimulatedAccountSession) => {
     setSelectedAccountId(acct.id);
     setIsStaleOffline(false);
@@ -476,27 +755,30 @@ export default function App() {
     setIsRefreshingHud(true);
     setLastSyncNote(
       isZh
-        ? `检测到出站动态请求头变更 (${acct.sessionTag})：已自动隔离旧账号缓存并切换至当前 Google 账号额度`
-        : `Dynamic outgoing auth/cookie header changed (${acct.sessionTag}): isolated previous cache & switched to active Google account quota`
+        ? `检测到出站动态请求头变更 (${acct.sessionTag})：已隔离旧账号凭证/端点，并触发前台全量协议快照扫描`
+        : `Dynamic outgoing auth/cookie header changed (${acct.sessionTag}): isolated previous credentials & triggered foreground full-protocol snapshot scan`
     );
     logDevEvent(
       'ACCOUNT_SWITCH',
       acct.sessionTag,
-      `动态出站头变更 [${acct.accountLabelZh}]。归档上一个账号快照，切换至独立数据槽 [5h=${acct.parsed.fiveHourQuota}, Weekly=${acct.parsed.weeklyLimit}]，无缝隔离防污染`,
-      `Dynamic header change [${acct.accountLabelEn}]. Archived previous session, switched to isolated slot [5h=${acct.parsed.fiveHourQuota}, Weekly=${acct.parsed.weeklyLimit}]`,
+      `动态出站头变更 [${acct.accountLabelZh}]。清空旧 perHostAuthorizations 作用域缓存并切换至独立数据槽 [5h=${acct.parsed.fiveHourQuota}, Weekly=${acct.parsed.weeklyLimit}]`,
+      `Dynamic header change [${acct.accountLabelEn}]. Flushed scoped perHostAuthorizations & switched to isolated slot [5h=${acct.parsed.fiveHourQuota}, Weekly=${acct.parsed.weeklyLimit}]`,
       'warn'
     );
+    runForegroundFullProtocolDiagnostic('ACCOUNT_SWITCH', acct, usageSheetOpen);
+    recordBatteryImpactEvent(acct.sessionTag, 'FG_DISPATCH', 'ACCOUNT_SWITCH');
     setTimeout(() => {
       setIsRefreshingHud(false);
       recordCachedNonZeroSnapshot(acct);
       logDevEvent(
         'PROTO_SCAN',
         acct.sessionTag,
-        `出站流拦截完成 (${acct.headerSummary})。QuotaSyncProvider(replaceSession=true) 广播已同步`,
-        `Outbound stream intercepted (${acct.headerSummary}). QuotaSyncProvider(replaceSession=true) broadcast synchronized`,
-        'info'
+        `全量协议重放与出站流拦截完成 (${acct.headerSummary})。QuotaSyncProvider(replaceSession=true) 广播已同步`,
+        `Full-protocol replay & outbound stream intercepted (${acct.headerSummary}). QuotaSyncProvider(replaceSession=true) broadcast synchronized`,
+        'success'
       );
-    }, 550);
+      recordBatteryImpactEvent(acct.sessionTag, 'FG_SETTLE_IDLE', 'ACCOUNT_SWITCH');
+    }, 620);
   };
 
   const handleToggleForeground = (fg: boolean) => {
@@ -505,28 +787,33 @@ export default function App() {
     setLastSyncNote(
       fg
         ? isZh
-          ? 'Gemini 进入前台 (APP_OPEN)：HUD 已挂载并触发一次轻量级前台额度刷新'
-          : 'Gemini entered foreground (APP_OPEN): HUD attached & triggered single lightweight refresh'
+          ? 'Gemini 进入前台 (APP_OPEN)：HUD 已挂载并激活前台全量协议快照监听器'
+          : 'Gemini entered foreground (APP_OPEN): HUD attached & armed foreground full-protocol snapshot listener'
         : isZh
         ? 'Gemini 退至后台 (TRIM_MEMORY_UI_HIDDEN)：HUD 已卸载、注销监听、清空临时凭证缓冲，工作线程降至 0'
         : 'Gemini moved to background: HUD detached, observers unregistered, buffers wiped, 0 active threads'
     );
     if (fg) {
+      lastQuotaUpdateAtRef.current = Date.now();
+      scheduleForegroundHeartbeat();
       logDevEvent(
         'APP_OPEN',
         activeSession.sessionTag,
-        `Gemini Activity.onResume 前台激活。startedActivityCount=1, 挂载 QuotaHudView, 注册 ContentObserver, 触发单次轻量级刷新`,
-        `Gemini Activity.onResume foreground wake. startedActivityCount=1, attached QuotaHudView, registered ContentObserver, triggered lightweight refresh`,
+        `Gemini Activity.onResume / onWindowFocusChanged 前台激活。startedActivityCount=1, 挂载 QuotaHudView, 注册前台全量协议快照监听器（含 30s 无更新静默心跳）`,
+        `Gemini Activity.onResume / onWindowFocusChanged foreground wake. startedActivityCount=1, attached QuotaHudView, armed full-protocol snapshot listener (30s idle heartbeat active)`,
         'success'
       );
+      recordBatteryImpactEvent(activeSession.sessionTag, 'FG_DISPATCH', 'APP_OPEN');
     } else {
+      clearHeartbeatTimers();
       logDevEvent(
         'BACKGROUND_SLEEP',
         activeSession.sessionTag,
-        `Gemini 退至后台 (TRIM_MEMORY_UI_HIDDEN)。startedActivityCount=0, isForegroundActive=false, 移除 HUD, 清理临时请求头缓冲, 线程池缩减至 0`,
-        `Gemini left foreground (TRIM_MEMORY_UI_HIDDEN). startedActivityCount=0, isForegroundActive=false, detached HUD, wiped buffers, 0 active threads`,
+        `Gemini 退至后台 (TRIM_MEMORY_UI_HIDDEN)。startedActivityCount=0, isForegroundActive=false, 移除 HUD, 注销 30s 前台心跳检测, 清理临时请求头缓冲, 线程池缩减至 0`,
+        `Gemini left foreground (TRIM_MEMORY_UI_HIDDEN). startedActivityCount=0, isForegroundActive=false, detached HUD, cleared 30s foreground heartbeat, wiped buffers, 0 active threads`,
         'warn'
       );
+      recordBatteryImpactEvent(activeSession.sessionTag, 'BG_SLEEP_PURGE', 'TRIM_MEMORY_UI_HIDDEN');
     }
   };
 
@@ -545,6 +832,7 @@ export default function App() {
       `User query stream initiated (Cronet.start / gRPC ClientCall.sendMessage). Captured dynamic credentials, debounced post-query refresh queued`,
       'event'
     );
+    recordBatteryImpactEvent(activeSession.sessionTag, 'FG_DISPATCH', 'QUERY_SENT');
     setTimeout(() => {
       setIsRefreshingHud(false);
       setIsStaleOffline(false);
@@ -557,6 +845,7 @@ export default function App() {
         `Query response ProtoBuf parsed. Current quota: 5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), Weekly=${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, 'en')})`,
         'info'
       );
+      recordBatteryImpactEvent(activeSession.sessionTag, 'FG_SETTLE_IDLE', 'QUERY_SENT');
     }, 600);
   };
 
@@ -566,16 +855,18 @@ export default function App() {
     setIsRefreshingHud(true);
     setLastSyncNote(
       isZh
-        ? `手动前台刷新 (MANUAL_TAP · ${activeSession.sessionTag})：扫描当前前台 Activity ViewModel / StateFlow 状态（零网页轮询 / 零常驻服务）`
-        : `Manual foreground refresh (MANUAL_TAP · ${activeSession.sessionTag}): scanned foreground Activity ViewModel / StateFlow holders (zero web polling)`
+        ? `手动前台刷新 (MANUAL_TAP · ${activeSession.sessionTag})：绕过节流强制执行全量协议快照扫描（零后台服务）`
+        : `Manual foreground refresh (MANUAL_TAP · ${activeSession.sessionTag}): bypassed throttle to run foreground full-protocol snapshot scan`
     );
     logDevEvent(
       'MANUAL_TAP',
       activeSession.sessionTag,
-      `HUD 胶囊刷新图标点击 (MANUAL_TAP)。强制触发展开 Activity 实例 ViewModel / StateFlow / Repository 内存扫描`,
-      `HUD capsule refresh icon clicked (MANUAL_TAP). Forcing on-demand scan of foreground Activity ViewModels & StateFlow holders`,
+      `HUD 胶囊刷新图标点击 (MANUAL_TAP)。当前状态 usageSheetOpen=${usageSheetOpen}，绕过冷启动节流并触发 ForegroundFullProtocolSnapshotScan`,
+      `HUD capsule refresh clicked (MANUAL_TAP). usageSheetOpen=${usageSheetOpen}, bypassing cooldown & invoking ForegroundFullProtocolSnapshotScan`,
       'event'
     );
+    runForegroundFullProtocolDiagnostic('MANUAL_TAP', activeSession, usageSheetOpen);
+    recordBatteryImpactEvent(activeSession.sessionTag, 'FG_DISPATCH', 'MANUAL_TAP');
     setTimeout(() => {
       setIsRefreshingHud(false);
       setIsStaleOffline(false);
@@ -584,16 +875,47 @@ export default function App() {
       logDevEvent(
         'PROTO_SCAN',
         activeSession.sessionTag,
-        `内存与出站响应扫描完毕。HUD 视图重绘完成 [Source: ${activeSession.parsed.source}]`,
-        `Memory & response stream scan finished. HUD view redrawn [Source: ${activeSession.parsed.source}]`,
+        `全量协议快照扫描完毕 [5h=${activeSession.parsed.fiveHourQuota}, Weekly=${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, 'zh')}]。HUD 重绘完成 [Source: ${activeSession.parsed.source}]`,
+        `Full-protocol snapshot scan finished [5h=${activeSession.parsed.fiveHourQuota}, Weekly=${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, 'en')}]. HUD redrawn [Source: ${activeSession.parsed.source}]`,
         'success'
       );
-    }, 650);
+      recordBatteryImpactEvent(activeSession.sessionTag, 'FG_SETTLE_IDLE', 'MANUAL_TAP');
+    }, 680);
   };
 
   const triggerOpenUsageWebpage = (e: React.MouseEvent) => {
     e.stopPropagation();
     setUsageSheetOpen(true);
+    setIsStaleOffline(false);
+    setIsSessionDeepCleaned(false);
+    recordCachedNonZeroSnapshot(activeSession);
+  };
+
+  const handleForceFullProtocolScanFromSettings = () => {
+    if (isRefreshingHud || !isGeminiForeground) return;
+    setIsRefreshingHud(true);
+    setDevConsoleOpen(true);
+    setLastSyncNote(
+      isZh
+        ? `HUD 设置弹窗手动触发「强制全量协议扫描」(${activeSession.sessionTag})：已打印出站 HTTP/2 TE: trailers 与 gRPC-RPC 5B 帧头并强制重拉额度`
+        : `Manual "Force Full-Protocol Scan" triggered from HUD Settings (${activeSession.sessionTag}): dumped outbound H2 TE: trailers & gRPC-RPC 5B frames and forced fresh pull`
+    );
+    runForegroundFullProtocolDiagnostic('FORCE_SETTINGS_SCAN', activeSession, usageSheetOpen);
+    recordBatteryImpactEvent(activeSession.sessionTag, 'FG_DISPATCH', 'FORCE_SETTINGS_SCAN');
+    setTimeout(() => {
+      setIsRefreshingHud(false);
+      setIsStaleOffline(false);
+      setIsSessionDeepCleaned(false);
+      recordCachedNonZeroSnapshot(activeSession);
+      logDevEvent(
+        'PROTO_SCAN',
+        activeSession.sessionTag,
+        `强制全量协议扫描重拉完成 [5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), 每周=${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, 'zh')})] · Source: ${activeSession.parsed.source}`,
+        `Force full-protocol pull complete [5h=${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset}), Weekly=${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, 'en')})] · Source: ${activeSession.parsed.source}`,
+        'success'
+      );
+      recordBatteryImpactEvent(activeSession.sessionTag, 'FG_SETTLE_IDLE', 'FORCE_SETTINGS_SCAN');
+    }, 520);
   };
 
   const getHudDragBounds = () => {
@@ -647,13 +969,26 @@ export default function App() {
       const bounds = getHudDragBounds();
 
       if (drag.pointerDown) {
-        const lerpAlpha = 1 - Math.pow(1 - 0.42, frameScale);
+        // Decay residual velocity if finger pauses while held so the 8ms lead offset settles to exact finger position
+        const idleSinceSample = now - drag.lastSampleTimeMs;
+        if (idleSinceSample > 24) {
+          const holdDecay = Math.pow(0.72, frameScale);
+          drag.vx *= holdDecay;
+          drag.vy *= holdDecay;
+        }
+
+        const leadX = clampHudValue(drag.vx * HUD_FRAME_SMOOTH_OFFSET_MS, -14, 14);
+        const leadY = clampHudValue(drag.vy * HUD_FRAME_SMOOTH_OFFSET_MS, -14, 14);
+        drag.targetX = rubberBandHudValue(drag.filteredX + leadX, bounds.minX, bounds.maxX);
+        drag.targetY = rubberBandHudValue(drag.filteredY + leadY, bounds.minY, bounds.maxY);
+
+        const lerpAlpha = 1 - Math.pow(1 - 0.48, frameScale);
         const curX = hudPosRef.current.x;
         const curY = hudPosRef.current.y;
         const dx = drag.targetX - curX;
         const dy = drag.targetY - curY;
 
-        if (Math.abs(dx) < 0.08 && Math.abs(dy) < 0.08) {
+        if (Math.abs(dx) < 0.08 && Math.abs(dy) < 0.08 && Math.hypot(drag.vx, drag.vy) < 0.015) {
           applyHudTransform(drag.targetX, drag.targetY);
           hudAnimRafRef.current = null;
           return;
@@ -663,34 +998,87 @@ export default function App() {
         return;
       }
 
-      // Release phase: inertial glide + smooth elastic settle back inside bounds
+      // Release phase: inertial glide + smooth elastic settle + 40px edge Magnetism
       const decay = Math.pow(0.9, frameScale);
       drag.vx *= decay;
       drag.vy *= decay;
 
       const rawNextTargetX = drag.targetX + drag.vx * dt;
       const rawNextTargetY = drag.targetY + drag.vy * dt;
-      const clampedX = clampHudValue(rawNextTargetX, bounds.minX, bounds.maxX);
-      const clampedY = clampHudValue(rawNextTargetY, bounds.minY, bounds.maxY);
+      let nextTargetX = clampHudValue(rawNextTargetX, bounds.minX, bounds.maxX);
+      let nextTargetY = clampHudValue(rawNextTargetY, bounds.minY, bounds.maxY);
 
-      if (rawNextTargetX !== clampedX) drag.vx *= 0.45;
-      if (rawNextTargetY !== clampedY) drag.vy *= 0.45;
+      if (rawNextTargetX !== nextTargetX) drag.vx *= 0.45;
+      if (rawNextTargetY !== nextTargetY) drag.vy *= 0.45;
 
-      drag.targetX = clampedX;
-      drag.targetY = clampedY;
+      const speed = Math.hypot(drag.vx, drag.vy);
+      let magnetPending = false;
+      const capsule = hudCapsuleRef.current;
+
+      // Magnetism: when drag stops/settles and HUD center is within 40px of any usable screen edge,
+      // find the nearest boundary and smoothly interpolate drag.targetX/Y flush to that edge.
+      if (capsule && speed < 0.18) {
+        const halfW = capsule.offsetWidth / 2;
+        const halfH = capsule.offsetHeight / 2;
+        const baseLeft = capsule.offsetLeft;
+        const baseTop = capsule.offsetTop;
+
+        const centerX = baseLeft + nextTargetX + halfW;
+        const centerY = baseTop + nextTargetY + halfH;
+
+        const minCenterX = baseLeft + bounds.minX + halfW;
+        const maxCenterX = baseLeft + bounds.maxX + halfW;
+        const minCenterY = baseTop + bounds.minY + halfH;
+        const maxCenterY = baseTop + bounds.maxY + halfH;
+
+        const distLeft = Math.abs(centerX - minCenterX);
+        const distRight = Math.abs(maxCenterX - centerX);
+        const distTop = Math.abs(centerY - minCenterY);
+        const distBottom = Math.abs(maxCenterY - centerY);
+
+        const nearestEdgeXDist = Math.min(distLeft, distRight);
+        const nearestEdgeYDist = Math.min(distTop, distBottom);
+        const magnetAlpha = 1 - Math.pow(1 - 0.24, frameScale);
+
+        if (nearestEdgeXDist <= HUD_MAGNET_EDGE_THRESHOLD_PX) {
+          const snapX = distLeft <= distRight ? bounds.minX : bounds.maxX;
+          const deltaSnapX = snapX - nextTargetX;
+          if (Math.abs(deltaSnapX) < 0.12) {
+            nextTargetX = snapX;
+          } else {
+            nextTargetX += deltaSnapX * magnetAlpha;
+            drag.vx *= 0.6;
+            magnetPending = true;
+          }
+        }
+
+        if (nearestEdgeYDist <= HUD_MAGNET_EDGE_THRESHOLD_PX) {
+          const snapY = distTop <= distBottom ? bounds.minY : bounds.maxY;
+          const deltaSnapY = snapY - nextTargetY;
+          if (Math.abs(deltaSnapY) < 0.12) {
+            nextTargetY = snapY;
+          } else {
+            nextTargetY += deltaSnapY * magnetAlpha;
+            drag.vy *= 0.6;
+            magnetPending = true;
+          }
+        }
+      }
+
+      drag.targetX = nextTargetX;
+      drag.targetY = nextTargetY;
 
       const curX = hudPosRef.current.x;
       const curY = hudPosRef.current.y;
-      const followAlpha = 1 - Math.pow(1 - 0.26, frameScale);
-      const nextX = curX + (clampedX - curX) * followAlpha;
-      const nextY = curY + (clampedY - curY) * followAlpha;
+      const followAlpha = 1 - Math.pow(1 - 0.28, frameScale);
+      const nextX = curX + (nextTargetX - curX) * followAlpha;
+      const nextY = curY + (nextTargetY - curY) * followAlpha;
 
-      const speed = Math.hypot(drag.vx, drag.vy);
-      const dist = Math.hypot(clampedX - nextX, clampedY - nextY);
-      if (speed < 0.025 && dist < 0.12) {
+      const dist = Math.hypot(nextTargetX - nextX, nextTargetY - nextY);
+      if (!magnetPending && speed < 0.025 && dist < 0.12) {
         drag.vx = 0;
         drag.vy = 0;
-        applyHudTransform(clampedX, clampedY);
+        applyHudTransform(nextTargetX, nextTargetY);
         hudAnimRafRef.current = null;
         return;
       }
@@ -714,11 +1102,14 @@ export default function App() {
       startY: e.clientY,
       origX: hudPosRef.current.x,
       origY: hudPosRef.current.y,
+      filteredX: hudPosRef.current.x,
+      filteredY: hudPosRef.current.y,
       targetX: hudPosRef.current.x,
       targetY: hudPosRef.current.y,
       lastClientX: e.clientX,
       lastClientY: e.clientY,
       lastTimeMs: now,
+      lastSampleTimeMs: now,
       vx: 0,
       vy: 0,
       moved: false,
@@ -738,20 +1129,42 @@ export default function App() {
     if (!drag.moved) return;
 
     const now = performance.now();
+    const stepDx = e.clientX - drag.lastClientX;
+    const stepDy = e.clientY - drag.lastClientY;
+    const stepDist = Math.hypot(stepDx, stepDy);
+    const sampleDt = now - drag.lastSampleTimeMs;
+
+    // Anti-jitter touch sampling: drop sub-pixel digitizer tremor bursts within 8ms window
+    if (stepDist < HUD_TOUCH_JITTER_DEADBAND_PX && sampleDt < HUD_TOUCH_SAMPLE_WINDOW_MS) {
+      return;
+    }
+
     const dt = Math.min(64, Math.max(4, now - drag.lastTimeMs));
-    const instVx = (e.clientX - drag.lastClientX) / dt;
-    const instVy = (e.clientY - drag.lastClientY) / dt;
+    const instVx = stepDx / dt;
+    const instVy = stepDy / dt;
 
     // Exponential velocity smoothing prevents fast-swipe spike jitter
-    drag.vx = drag.vx * 0.6 + clampHudValue(instVx, -1.6, 1.6) * 0.4;
-    drag.vy = drag.vy * 0.6 + clampHudValue(instVy, -1.6, 1.6) * 0.4;
+    drag.vx = drag.vx * 0.55 + clampHudValue(instVx, -1.8, 1.8) * 0.45;
+    drag.vy = drag.vy * 0.55 + clampHudValue(instVy, -1.8, 1.8) * 0.45;
     drag.lastClientX = e.clientX;
     drag.lastClientY = e.clientY;
     drag.lastTimeMs = now;
+    drag.lastSampleTimeMs = now;
 
+    // Adaptive speed-coupled position smoothing (suppresses slow micro-jitter while preserving fast swipe tracking)
+    const speed = Math.hypot(drag.vx, drag.vy);
+    const posAlpha = clampHudValue(0.48 + speed * 0.44, 0.48, 0.96);
+    const rawX = drag.origX + dx;
+    const rawY = drag.origY + dy;
+    drag.filteredX = drag.filteredX + (rawX - drag.filteredX) * posAlpha;
+    drag.filteredY = drag.filteredY + (rawY - drag.filteredY) * posAlpha;
+
+    // Apply 8ms predictive frame-smoothing offset to reduce touch-to-display drag latency on Android
     const bounds = getHudDragBounds();
-    drag.targetX = rubberBandHudValue(drag.origX + dx, bounds.minX, bounds.maxX);
-    drag.targetY = rubberBandHudValue(drag.origY + dy, bounds.minY, bounds.maxY);
+    const leadX = clampHudValue(drag.vx * HUD_FRAME_SMOOTH_OFFSET_MS, -14, 14);
+    const leadY = clampHudValue(drag.vy * HUD_FRAME_SMOOTH_OFFSET_MS, -14, 14);
+    drag.targetX = rubberBandHudValue(drag.filteredX + leadX, bounds.minX, bounds.maxX);
+    drag.targetY = rubberBandHudValue(drag.filteredY + leadY, bounds.minY, bounds.maxY);
 
     ensureHudAnimationLoop();
   };
@@ -768,7 +1181,10 @@ export default function App() {
       // ignore if capture already released
     }
     if (drag.moved) {
-      if (performance.now() - drag.lastTimeMs > 70) {
+      const bounds = getHudDragBounds();
+      drag.targetX = clampHudValue(drag.filteredX, bounds.minX, bounds.maxX);
+      drag.targetY = clampHudValue(drag.filteredY, bounds.minY, bounds.maxY);
+      if (performance.now() - drag.lastSampleTimeMs > 64) {
         drag.vx = 0;
         drag.vy = 0;
       }
@@ -1383,20 +1799,20 @@ export default function App() {
 
                       {usageSheetOpen && isGeminiForeground && (
                         <div
-                          className={`p-4 rounded-2xl border space-y-2.5 ${
+                          className={`p-3.5 rounded-2xl border space-y-2 max-h-[250px] overflow-y-auto ${
                             simDarkTheme
                               ? 'bg-zinc-900 border-zinc-700 text-zinc-100'
                               : 'bg-white border-slate-200 text-slate-900 shadow-xs'
                           }`}
                         >
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-mono font-semibold text-blue-500">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-mono font-semibold text-blue-500 truncate">
                               com.example.bardquotahook.MainActivity
                             </span>
                             <button
                               type="button"
                               onClick={() => setUsageSheetOpen(false)}
-                              className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                              className="text-xs text-slate-400 hover:text-slate-600 shrink-0 cursor-pointer"
                             >
                               {isZh ? '关闭' : 'Close'}
                             </button>
@@ -1415,6 +1831,36 @@ export default function App() {
                               <strong>{activeSession.parsed.weeklyLimit}</strong> (
                               {formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})
                             </div>
+                          </div>
+
+                          <div className="pt-1.5 border-t border-slate-200/60 dark:border-zinc-700/70 space-y-1.5">
+                            <button
+                              type="button"
+                              onClick={handleForceFullProtocolScanFromSettings}
+                              disabled={isRefreshingHud}
+                              className={`w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                                isRefreshingHud
+                                  ? 'bg-cyan-700/70 text-cyan-100 cursor-wait'
+                                  : 'bg-cyan-600 hover:bg-cyan-700 text-white'
+                              }`}
+                            >
+                              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingHud ? 'animate-spin' : ''}`} />
+                              <span>
+                                {isZh ? '强制全量协议扫描' : 'Force Full-Protocol Scan'}
+                              </span>
+                            </button>
+
+                            {lastDiagTraceSummary && (
+                              <pre
+                                className={`p-2 rounded-lg text-[10px] leading-snug font-mono whitespace-pre-wrap break-all border ${
+                                  simDarkTheme
+                                    ? 'bg-zinc-950 border-zinc-800 text-cyan-300'
+                                    : 'bg-slate-900 border-slate-800 text-cyan-300'
+                                }`}
+                              >
+                                {lastDiagTraceSummary}
+                              </pre>
+                            )}
                           </div>
                         </div>
                       )}
@@ -1458,131 +1904,158 @@ export default function App() {
                       onPointerMove={onHudPointerMove}
                       onPointerUp={onHudPointerUp}
                       onPointerCancel={onHudPointerUp}
-                      className={`absolute top-12 right-2.5 max-w-[96%] inline-flex items-center px-2.5 py-1.5 rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${capsuleContainerClass}`}
+                      className={`absolute top-12 right-2.5 max-w-[96%] inline-flex flex-col items-stretch rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${
+                        isStaleOffline ? 'px-3 py-1.5' : 'px-2.5 py-1.5'
+                      } ${capsuleContainerClass}`}
                     >
-                      {isStaleOffline && (
-                        <span
-                          title={hudLang === 'zh' ? '当前数据为离线缓存状态' : 'Cached offline state'}
-                          aria-label={hudLang === 'zh' ? '离线缓存状态' : 'Offline cached'}
-                          className="relative flex items-center justify-center w-2 h-2 mr-1.5 shrink-0"
-                        >
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75" />
+                      <div className="inline-flex items-center">
+                        {isStaleOffline && (
                           <span
-                            className={`relative inline-flex rounded-full w-1.5 h-1.5 animate-pulse ${
-                              simDarkTheme
-                                ? 'bg-orange-400 shadow-[0_0_6px_rgba(251,146,60,0.85)]'
-                                : 'bg-orange-500 shadow-[0_0_5px_rgba(249,115,22,0.7)]'
-                            }`}
-                          />
-                        </span>
-                      )}
-                      <span className={`font-semibold ${capsuleLabelClass}`}>5h</span>
-                      <span
-                        className={`relative mx-1.5 rounded-full overflow-hidden shrink-0 transition-all duration-200 ${capsuleTrackClass} ${
-                          isHighLoadQuota ? 'w-7 h-[13px]' : 'w-6 h-[5px]'
-                        }`}
-                      >
-                        <span
-                          ref={bar5hRef}
-                          className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
-                            activeSession.parsed.fiveHourPct
-                          )}`}
-                        />
-                        {isHighLoadQuota && (
-                          <span
-                            className={`pointer-events-none absolute inset-0 flex items-center justify-center text-[8px] font-bold leading-none tabular-nums ${
-                              activeSession.parsed.fiveHourPct >= 55 || simDarkTheme
-                                ? 'text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.65)]'
-                                : 'text-slate-900/85'
-                            }`}
+                            title={hudLang === 'zh' ? '当前数据为离线缓存状态' : 'Cached offline state'}
+                            aria-label={hudLang === 'zh' ? '离线缓存状态' : 'Offline cached'}
+                            className="relative flex items-center justify-center w-2 h-2 mr-1.5 shrink-0"
                           >
-                            {activeSession.parsed.fiveHourPct}%
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75" />
+                            <span
+                              className={`relative inline-flex rounded-full w-1.5 h-1.5 animate-pulse ${
+                                simDarkTheme
+                                  ? 'bg-orange-400 shadow-[0_0_6px_rgba(251,146,60,0.85)]'
+                                  : 'bg-orange-500 shadow-[0_0_5px_rgba(249,115,22,0.7)]'
+                              }`}
+                            />
                           </span>
                         )}
-                      </span>
-                      <span className="font-medium tabular-nums">
-                        {isSessionDeepCleaned
-                          ? '-- (--)'
-                          : `${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset})`}
-                      </span>
-
-                      <span
-                        className={`w-px h-3 mx-2 shrink-0 ${
-                          simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
-                        }`}
-                      />
-
-                      <span className={`font-semibold ${capsuleLabelClass}`}>
-                        {hudLang === 'zh' ? '每周' : 'Weekly'}
-                      </span>
-                      <span
-                        className={`relative mx-1.5 rounded-full overflow-hidden shrink-0 transition-all duration-200 ${capsuleTrackClass} ${
-                          isHighLoadQuota ? 'w-7 h-[13px]' : 'w-6 h-[5px]'
-                        }`}
-                      >
+                        <span className={`font-semibold ${capsuleLabelClass}`}>5h</span>
                         <span
-                          ref={barWeeklyRef}
-                          className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
-                            activeSession.parsed.weeklyPct
-                          )}`}
-                        />
-                        {isHighLoadQuota && (
-                          <span
-                            className={`pointer-events-none absolute inset-0 flex items-center justify-center text-[8px] font-bold leading-none tabular-nums ${
-                              activeSession.parsed.weeklyPct >= 55 || simDarkTheme
-                                ? 'text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.65)]'
-                                : 'text-slate-900/85'
-                            }`}
-                          >
-                            {activeSession.parsed.weeklyPct}%
-                          </span>
-                        )}
-                      </span>
-                      <span className="font-medium tabular-nums">
-                        {isSessionDeepCleaned
-                          ? '-- (--)'
-                          : `${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})`}
-                      </span>
-
-                      {isStaleOffline && (
-                        <span
-                          className={`ml-1.5 px-1.5 py-0.5 rounded text-[9px] font-semibold border shrink-0 ${
-                            simDarkTheme
-                              ? 'bg-slate-500/15 text-slate-400 border-slate-500/35'
-                              : 'bg-slate-500/10 text-slate-500 border-slate-400/40'
+                          className={`relative mx-1.5 rounded-full overflow-hidden shrink-0 transition-all duration-200 ${capsuleTrackClass} ${
+                            isHighLoadQuota ? 'w-7 h-[13px]' : 'w-6 h-[5px]'
                           }`}
                         >
-                          {hudLang === 'zh' ? '离线' : 'Offline'}
+                          <span
+                            ref={bar5hRef}
+                            className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
+                              activeSession.parsed.fiveHourPct
+                            )}`}
+                          />
+                          {isHighLoadQuota && (
+                            <span
+                              className={`pointer-events-none absolute inset-0 flex items-center justify-center text-[8px] font-bold leading-none tabular-nums ${
+                                activeSession.parsed.fiveHourPct >= 55 || simDarkTheme
+                                  ? 'text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.65)]'
+                                  : 'text-slate-900/85'
+                              }`}
+                            >
+                              {activeSession.parsed.fiveHourPct}%
+                            </span>
+                          )}
                         </span>
-                      )}
+                        <span className="font-medium tabular-nums">
+                          {isSessionDeepCleaned
+                            ? '-- (--)'
+                            : `${activeSession.parsed.fiveHourQuota} (${activeSession.parsed.fiveHourReset})`}
+                        </span>
 
-                      <span
-                        className={`w-px h-3 ml-2 mr-1 shrink-0 ${
-                          simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
-                        }`}
-                      />
-
-                      <button
-                        type="button"
-                        data-hud-action="true"
-                        onClick={triggerSimulatedRefresh}
-                        title={isZh ? '手动刷新当前前台额度' : 'Refresh foreground quota'}
-                        className={`w-5 h-5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
-                      >
-                        <RefreshCw
-                          className={`w-3 h-3 ${isRefreshingHud ? 'animate-spin' : ''}`}
+                        <span
+                          className={`w-px h-3 mx-2 shrink-0 ${
+                            simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
+                          }`}
                         />
-                      </button>
 
-                      <button
-                        type="button"
-                        data-hud-action="true"
-                        onClick={triggerOpenUsageWebpage}
-                        title={isZh ? '打开模块设置' : 'Open Module Settings'}
-                        className={`w-5 h-5 ml-0.5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
-                      >
-                        <ExternalLink className="w-3 h-3" />
-                      </button>
+                        <span className={`font-semibold ${capsuleLabelClass}`}>
+                          {hudLang === 'zh' ? '每周' : 'Weekly'}
+                        </span>
+                        <span
+                          className={`relative mx-1.5 rounded-full overflow-hidden shrink-0 transition-all duration-200 ${capsuleTrackClass} ${
+                            isHighLoadQuota ? 'w-7 h-[13px]' : 'w-6 h-[5px]'
+                          }`}
+                        >
+                          <span
+                            ref={barWeeklyRef}
+                            className={`block h-full rounded-full transition-all duration-300 ${pickBarColorClass(
+                              activeSession.parsed.weeklyPct
+                            )}`}
+                          />
+                          {isHighLoadQuota && (
+                            <span
+                              className={`pointer-events-none absolute inset-0 flex items-center justify-center text-[8px] font-bold leading-none tabular-nums ${
+                                activeSession.parsed.weeklyPct >= 55 || simDarkTheme
+                                  ? 'text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.65)]'
+                                  : 'text-slate-900/85'
+                              }`}
+                            >
+                              {activeSession.parsed.weeklyPct}%
+                            </span>
+                          )}
+                        </span>
+                        <span className="font-medium tabular-nums">
+                          {isSessionDeepCleaned
+                            ? '-- (--)'
+                            : `${activeSession.parsed.weeklyLimit} (${formatWeeklyResetLabel(activeSession.parsed.weeklyReset, hudLang)})`}
+                        </span>
+
+                        {isStaleOffline && (
+                          <span
+                            className={`ml-1.5 px-1.5 py-0.5 rounded text-[9px] font-semibold border shrink-0 ${
+                              simDarkTheme
+                                ? 'bg-slate-500/15 text-slate-400 border-slate-500/35'
+                                : 'bg-slate-500/10 text-slate-500 border-slate-400/40'
+                            }`}
+                          >
+                            {hudLang === 'zh' ? '离线' : 'Offline'}
+                          </span>
+                        )}
+
+                        <span
+                          className={`w-px h-3 ml-2 mr-1 shrink-0 ${
+                            simDarkTheme ? 'bg-white/15' : 'bg-slate-900/12'
+                          }`}
+                        />
+
+                        <button
+                          type="button"
+                          data-hud-action="true"
+                          onClick={triggerSimulatedRefresh}
+                          title={isZh ? '手动刷新当前前台额度' : 'Refresh foreground quota'}
+                          className={`w-5 h-5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 ${isRefreshingHud ? 'animate-spin' : ''}`}
+                          />
+                        </button>
+
+                        <button
+                          type="button"
+                          data-hud-action="true"
+                          onClick={triggerOpenUsageWebpage}
+                          title={isZh ? '打开模块设置' : 'Open Module Settings'}
+                          className={`w-5 h-5 ml-0.5 inline-flex items-center justify-center rounded-full transition-colors shrink-0 cursor-pointer ${capsuleIconClass}`}
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                        </button>
+                      </div>
+
+                      {isStaleOffline && (() => {
+                        const cachedAt =
+                          cachedSnapshotsRef.current[activeSession.sessionTag]?.cachedAtStr ||
+                          lastCachedTimestamp ||
+                          '';
+                        if (!cachedAt) return null;
+                        return (
+                          <div
+                            title={`Last Cached: ${cachedAt}`}
+                            className={`mt-1 pt-0.5 border-t flex items-center gap-1 pl-3.5 text-[9px] leading-tight font-mono tabular-nums ${
+                              simDarkTheme
+                                ? 'border-white/10 text-slate-400/90'
+                                : 'border-slate-900/10 text-slate-500/95'
+                            }`}
+                          >
+                            <span className="w-1 h-1 rounded-full bg-orange-400/80 shrink-0" />
+                            <span>
+                              {hudLang === 'zh' ? '最近缓存' : 'Last Cached'}: {cachedAt.slice(0, 19)}
+                            </span>
+                          </div>
+                        );
+                      })()}
                     </div>
                   )}
               </div>
@@ -1610,6 +2083,9 @@ export default function App() {
                       </span>
                       <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-500/15 text-red-300 border border-red-500/30">
                         {isZh ? `链路异常: ${linkAnomalyCount} 次` : `Link Anomaly: ${linkAnomalyCount}`}
+                      </span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
+                        {isZh ? `后台唤醒: ${bgWakeupCount} 次` : `BG Wakeups: ${bgWakeupCount}`}
                       </span>
                     </span>
                     <span className="text-[11px] text-slate-400 block mt-0.5">
@@ -1649,6 +2125,10 @@ export default function App() {
                         Foreground: <strong className={isGeminiForeground ? 'text-emerald-400' : 'text-amber-400'}>{isGeminiForeground ? 'true' : 'false (0 threads)'}</strong>
                       </span>
                       <span className="text-slate-700">|</span>
+                      <span className="text-[11px] text-slate-400 font-mono">
+                        Pool: <strong className="text-teal-300">{poolStateLabel} ({activePoolThreads}t · FG {fgDispatchCount} / BG {bgWakeupCount})</strong>
+                      </span>
+                      <span className="text-slate-700">|</span>
                       <div className="inline-flex items-center gap-1 bg-slate-950 p-0.5 rounded border border-slate-800">
                         <button
                           type="button"
@@ -1682,6 +2162,17 @@ export default function App() {
                           }`}
                         >
                           {isZh ? `仅链路异常 (${linkAnomalyCount})` : `Link Anomaly (${linkAnomalyCount})`}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConsoleFilter('BATTERY_IMPACT')}
+                          className={`px-2 py-0.5 text-[10px] rounded transition-colors cursor-pointer ${
+                            consoleFilter === 'BATTERY_IMPACT'
+                              ? 'bg-teal-500/20 text-teal-300 font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {isZh ? `功耗与线程 (${batteryImpactCount})` : `Battery Impact (${batteryImpactCount})`}
                         </button>
                       </div>
                     </div>
@@ -1725,6 +2216,9 @@ export default function App() {
                           setDevLogs([]);
                           setZeroGuardCount(0);
                           setLinkAnomalyCount(0);
+                          setBatteryImpactCount(0);
+                          setFgDispatchCount(0);
+                          setBgWakeupCount(0);
                           setIsStaleOffline(false);
                           setIsSessionDeepCleaned(false);
                         }}
@@ -1749,6 +2243,10 @@ export default function App() {
                           ? isZh
                             ? '暂无「链路异常」事件记录。点击「模拟链路异常 (PB失败/3次空)」即可验证 QuotaHealthMonitor 自动深层清理 Session 缓存槽位。'
                             : 'No LINK_ANOMALY events yet. Click "Simulate Link Anomaly" to inspect QuotaHealthMonitor deep session cleanup.'
+                          : consoleFilter === 'BATTERY_IMPACT'
+                          ? isZh
+                            ? '暂无「功耗与线程 (BATTERY_IMPACT)」事件记录。切换前后台、切号或发送提问即可追踪累计后台唤醒次数与线程池状态迁移。'
+                            : 'No BATTERY_IMPACT events yet. Toggle foreground/background, switch accounts, or send a query to monitor cumulative background wakeups & thread-pool states.'
                           : isZh
                           ? '控制台暂无事件记录。在上方切换账号、发送提问或触发模拟按钮以产生事件。'
                           : 'No events logged. Switch accounts, send queries, or click simulation buttons to capture events.'}
@@ -1770,6 +2268,10 @@ export default function App() {
                             ? 'bg-purple-500/15 text-purple-300 border-purple-500/30'
                             : log.eventType === 'MANUAL_TAP'
                             ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                            : log.eventType === 'FULL_PROTOCOL_SCAN'
+                            ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                            : log.eventType === 'BATTERY_IMPACT'
+                            ? 'bg-teal-500/20 text-teal-300 border-teal-500/40'
                             : 'bg-zinc-700/40 text-zinc-300 border-zinc-600/40';
 
                         const eventLabel =
@@ -1781,6 +2283,14 @@ export default function App() {
                             ? isZh
                               ? '归零防护已触发'
                               : 'ZERO_GUARD_TRIGGERED'
+                            : log.eventType === 'FULL_PROTOCOL_SCAN'
+                            ? isZh
+                              ? '全量协议扫描'
+                              : 'FULL_PROTOCOL_SCAN'
+                            : log.eventType === 'BATTERY_IMPACT'
+                            ? isZh
+                              ? '功耗与线程'
+                              : 'BATTERY_IMPACT'
                             : log.eventType;
 
                         return (
@@ -1791,6 +2301,8 @@ export default function App() {
                                 ? 'bg-red-950/25 hover:bg-red-950/40'
                                 : log.eventType === 'ZERO_GUARD'
                                 ? 'bg-orange-950/20 hover:bg-orange-950/35'
+                                : log.eventType === 'BATTERY_IMPACT'
+                                ? 'bg-teal-950/20 hover:bg-teal-950/35'
                                 : 'hover:bg-slate-900/60'
                             }`}
                           >

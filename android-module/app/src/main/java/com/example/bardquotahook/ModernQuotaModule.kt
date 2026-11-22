@@ -53,7 +53,7 @@ class ModernQuotaModule : XposedModule() {
     override fun onHotReloaded(param: HotReloadedParam) {
         try {
             currentProcessName = param.processName
-            QuotaCoreEngine.forceSleepForHotReload()
+            QuotaCoreEngine.forceSleepForHotReload(resetHookTracking = true)
 
             for (unhookFn in activeUnhookCallbacks) {
                 try {
@@ -107,7 +107,7 @@ class ModernQuotaModule : XposedModule() {
                         val method = moduleRef.javaClass.methods.firstOrNull {
                             it.name == "getRemotePreferences" && it.parameterTypes.size == 1
                         }
-                        method?.invoke(moduleRef, group) as? SharedPreferences
+                        method?.apply { isAccessible = true }?.invoke(moduleRef, group) as? SharedPreferences
                     } catch (_: Throwable) {
                         null
                     }
@@ -126,24 +126,34 @@ class ModernQuotaModule : XposedModule() {
                             .setExceptionMode(ExceptionMode.PROTECTIVE)
                             .intercept(XposedInterface.Hooker { chain ->
                                 val thisObj = try {
-                                    val m = chain.javaClass.methods.firstOrNull {
-                                        it.name == "getThisObject" || it.name == "getThis" || it.name == "thisObject"
-                                    }
-                                    m?.invoke(chain)
+                                    chain.thisObject
                                 } catch (_: Throwable) {
-                                    null
+                                    try {
+                                        val m = chain.javaClass.methods.firstOrNull {
+                                            it.name == "getThisObject" || it.name == "getThis" || it.name == "thisObject"
+                                        }
+                                        m?.apply { isAccessible = true }?.invoke(chain)
+                                    } catch (_: Throwable) {
+                                        null
+                                    }
                                 }
                                 val argsArr = try {
-                                    val m = chain.javaClass.methods.firstOrNull {
-                                        it.name == "getArgs" || it.name == "args"
-                                    }
-                                    when (val res = m?.invoke(chain)) {
-                                        is Array<*> -> Array<Any?>(res.size) { i -> res[i] }
-                                        is List<*> -> Array<Any?>(res.size) { i -> res[i] }
-                                        else -> emptyArray()
-                                    }
+                                    val list = chain.args
+                                    Array<Any?>(list.size) { i -> list[i] }
                                 } catch (_: Throwable) {
-                                    emptyArray()
+                                    try {
+                                        val m = chain.javaClass.methods.firstOrNull {
+                                            it.name == "getArgs" || it.name == "args"
+                                        }
+                                        m?.isAccessible = true
+                                        when (val res = m?.invoke(chain)) {
+                                            is Array<*> -> Array<Any?>(res.size) { i -> res[i] }
+                                            is List<*> -> Array<Any?>(res.size) { i -> res[i] }
+                                            else -> emptyArray()
+                                        }
+                                    } catch (_: Throwable) {
+                                        emptyArray()
+                                    }
                                 }
 
                                 if (before != null) {
