@@ -1167,11 +1167,12 @@ object QuotaTextParser {
                         } catch (_: Throwable) {
                         }
                     } else if (detectedTs == null && s.all { it.isDigit() } && s.length in 10..16) {
-                        s.toLongOrNull()?.let { lv ->
-                            classifyFutureEpochTimestamp(lv, nowMs)?.let { detectedTs = it }
+                        val lv = s.toLongOrNull()
+                        if (lv != null) {
+                            detectedTs = classifyFutureEpochTimestamp(lv, nowMs)
                         }
                     } else if (detectedTs == null && s.length in 19..34 && s.endsWith('Z')) {
-                        tryClassifyIso8601Timestamp(s, nowMs)?.let { detectedTs = it }
+                        detectedTs = tryClassifyIso8601Timestamp(s, nowMs)
                     } else if (explicitTextMetric == null && s.length in 2..16) {
                         val sanitized = sanitizeQuotaMetric(s)
                         if (sanitized != "--") explicitTextMetric = sanitized
@@ -1189,7 +1190,8 @@ object QuotaTextParser {
             }
         }
 
-        if (detectedTs != null && (nums.isNotEmpty() || explicitTextMetric != null) && len <= 24) {
+        val tsSnapshot = detectedTs
+        if (tsSnapshot != null && (nums.isNotEmpty() || explicitTextMetric != null) && len <= 24) {
             var metric = "--"
             var conf = 1
             // Check non-zero (used, limit) pair first to avoid [0, pageSize, futureEpoch] false 0%
@@ -1221,12 +1223,12 @@ object QuotaTextParser {
                 }
             }
             if (metric != "--") {
-                out.add(DecodedProtoWindow(detectedTs.first, metric, detectedTs.second, conf))
+                out.add(DecodedProtoWindow(tsSnapshot.first, metric, tsSnapshot.second, conf))
             }
         }
 
         // Propagate pure [seconds] or [seconds, nanos] Timestamp array upward to its enclosing window
-        return if (detectedTs != null && len in 1..2 && explicitTextMetric == null) detectedTs else null
+        return if (tsSnapshot != null && len in 1..2 && explicitTextMetric == null) tsSnapshot else null
     }
 
     /**

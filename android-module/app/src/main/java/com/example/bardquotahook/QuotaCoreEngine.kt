@@ -1732,10 +1732,12 @@ object QuotaCoreEngine {
                 clazz = provCls,
                 methodName = "getAllProviders",
                 after = { _, _, result ->
-                    val list = result as? Iterable<*> ?: return@after
-                    for (prov in list) {
-                        if (prov != null) {
-                            bindHooksForClassLoader(prov.javaClass.classLoader, bridge)
+                    val list = result as? Iterable<*>
+                    if (list != null) {
+                        for (prov in list) {
+                            if (prov != null) {
+                                bindHooksForClassLoader(prov.javaClass.classLoader, bridge)
+                            }
                         }
                     }
                 }

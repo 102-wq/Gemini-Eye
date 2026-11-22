@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Cpu,
   Download,
   ExternalLink,
   FileCode,
@@ -198,6 +199,8 @@ export default function App() {
   const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
   const bgWakeupCountRef = useRef<number>(0);
   const fgDispatchCountRef = useRef<number>(1);
+  const activePoolThreadsRef = useRef<number>(0);
+  const appOpenSettleTimerRef = useRef<number | null>(null);
   bgWakeupCountRef.current = bgWakeupCount;
   fgDispatchCountRef.current = fgDispatchCount;
   const cachedSnapshotsRef = useRef<Record<string, CachedSnapshotEntry>>({
@@ -398,28 +401,45 @@ export default function App() {
       const nextFg = fgDispatchCountRef.current + 1;
       fgDispatchCountRef.current = nextFg;
       setFgDispatchCount(nextFg);
-      setActivePoolThreads(1);
+      const prevThreads = activePoolThreadsRef.current;
+      const nextThreads = prevThreads + 1;
+      activePoolThreadsRef.current = nextThreads;
+      setActivePoolThreads(nextThreads);
       setPoolStateLabel('FG_ON_DEMAND_ACTIVE');
       setBatteryImpactCount((c) => c + 1);
       logDevEvent(
         'BATTERY_IMPACT',
         sessionTag,
-        `[线程池按需唤醒 · ${reasonTag}] 累计后台线程唤醒=${bgWakeupCountRef.current} | 前台按需派发=${nextFg} | 线程池状态: IDLE_ZERO_THREADS(0) -> FG_ON_DEMAND_ACTIVE(1 守护线程, keepAlive=5s)`,
-        `[On-Demand Pool Wake · ${reasonTag}] Cumulative BG Thread Wakeups=${bgWakeupCountRef.current} | FG Dispatches=${nextFg} | Pool State: IDLE_ZERO_THREADS(0) -> FG_ON_DEMAND_ACTIVE(1 daemon thread, keepAlive=5s)`,
-        'info'
+        `[线程池按需唤醒 · ${reasonTag}] 累计后台线程唤醒=${bgWakeupCountRef.current} | 前台按需派发=${nextFg} | 活跃线程 ${prevThreads} -> ${nextThreads} (${
+          nextThreads > 1 ? '并发突发 MULTI_THREAD_BURST' : 'FG_ON_DEMAND_ACTIVE, keepAlive=5s'
+        })`,
+        `[On-Demand Pool Wake · ${reasonTag}] Cumulative BG Wakeups=${bgWakeupCountRef.current} | FG Dispatches=${nextFg} | Active Threads ${prevThreads} -> ${nextThreads} (${
+          nextThreads > 1 ? 'MULTI_THREAD_BURST' : 'FG_ON_DEMAND_ACTIVE daemon, keepAlive=5s'
+        })`,
+        nextThreads > 1 ? 'warn' : 'info'
       );
     } else if (phase === 'FG_SETTLE_IDLE') {
-      setActivePoolThreads(0);
-      setPoolStateLabel('IDLE_ZERO_THREADS');
+      const prevThreads = activePoolThreadsRef.current;
+      const nextThreads = Math.max(0, prevThreads - 1);
+      activePoolThreadsRef.current = nextThreads;
+      setActivePoolThreads(nextThreads);
+      if (nextThreads === 0) {
+        setPoolStateLabel('IDLE_ZERO_THREADS');
+      }
       setBatteryImpactCount((c) => c + 1);
       logDevEvent(
         'BATTERY_IMPACT',
         sessionTag,
-        `[按需任务完成 · ${reasonTag}] 累计后台线程唤醒=${bgWakeupCountRef.current} | 前台按需派发=${fgDispatchCountRef.current} | 线程池状态: FG_ON_DEMAND_ACTIVE(1) -> allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS(0 活跃线程)`,
-        `[On-Demand Task Settled · ${reasonTag}] Cumulative BG Thread Wakeups=${bgWakeupCountRef.current} | FG Dispatches=${fgDispatchCountRef.current} | Pool State: FG_ON_DEMAND_ACTIVE(1) -> allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS(0 active threads)`,
-        'success'
+        `[按需任务完成 · ${reasonTag}] 累计后台线程唤醒=${bgWakeupCountRef.current} | 前台按需派发=${fgDispatchCountRef.current} | 活跃线程 ${prevThreads} -> ${nextThreads} (${
+          nextThreads === 0 ? 'allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS' : '仍有并发任务运行中'
+        })`,
+        `[On-Demand Task Settled · ${reasonTag}] Cumulative BG Wakeups=${bgWakeupCountRef.current} | FG Dispatches=${fgDispatchCountRef.current} | Active Threads ${prevThreads} -> ${nextThreads} (${
+          nextThreads === 0 ? 'allowCoreThreadTimeOut(5s) -> IDLE_ZERO_THREADS' : 'concurrent tasks still draining'
+        })`,
+        nextThreads === 0 ? 'success' : 'info'
       );
     } else {
+      activePoolThreadsRef.current = 0;
       setActivePoolThreads(0);
       setPoolStateLabel('SLEEP_PURGED');
       setBatteryImpactCount((c) => c + 1);
@@ -431,6 +451,23 @@ export default function App() {
         'success'
       );
     }
+  };
+
+  const handleSimulateThreadBurst = () => {
+    const tag = activeSessionRef.current.sessionTag;
+    recordBatteryImpactEvent(tag, 'FG_DISPATCH', 'BURST_SCAN_W1');
+    window.setTimeout(() => {
+      if (!isGeminiForegroundRef.current) return;
+      recordBatteryImpactEvent(activeSessionRef.current.sessionTag, 'FG_DISPATCH', 'BURST_GRPC_W2');
+    }, 140);
+    window.setTimeout(() => {
+      if (!isGeminiForegroundRef.current) return;
+      recordBatteryImpactEvent(activeSessionRef.current.sessionTag, 'FG_SETTLE_IDLE', 'BURST_SCAN_W1');
+    }, 1050);
+    window.setTimeout(() => {
+      if (!isGeminiForegroundRef.current) return;
+      recordBatteryImpactEvent(activeSessionRef.current.sessionTag, 'FG_SETTLE_IDLE', 'BURST_GRPC_W2');
+    }, 1550);
   };
 
   // Update mini progress bar fill widths via DOM refs (no inline style props)
@@ -793,6 +830,10 @@ export default function App() {
         ? 'Gemini 退至后台 (TRIM_MEMORY_UI_HIDDEN)：HUD 已卸载、注销监听、清空临时凭证缓冲，工作线程降至 0'
         : 'Gemini moved to background: HUD detached, observers unregistered, buffers wiped, 0 active threads'
     );
+    if (appOpenSettleTimerRef.current !== null) {
+      window.clearTimeout(appOpenSettleTimerRef.current);
+      appOpenSettleTimerRef.current = null;
+    }
     if (fg) {
       lastQuotaUpdateAtRef.current = Date.now();
       scheduleForegroundHeartbeat();
@@ -804,6 +845,11 @@ export default function App() {
         'success'
       );
       recordBatteryImpactEvent(activeSession.sessionTag, 'FG_DISPATCH', 'APP_OPEN');
+      appOpenSettleTimerRef.current = window.setTimeout(() => {
+        appOpenSettleTimerRef.current = null;
+        if (!isGeminiForegroundRef.current) return;
+        recordBatteryImpactEvent(activeSessionRef.current.sessionTag, 'FG_SETTLE_IDLE', 'APP_OPEN');
+      }, 480);
     } else {
       clearHeartbeatTimers();
       logDevEvent(
@@ -2230,6 +2276,142 @@ export default function App() {
                       </button>
                     </div>
                   </div>
+
+                  {/* Real-Time Thread Pool Visualization Bar (0: Green, 1: Amber, >1: Red) */}
+                  {(() => {
+                    const maxSlots = 4;
+                    const poolTier =
+                      activePoolThreads === 0 ? 'idle' : activePoolThreads === 1 ? 'single' : 'burst';
+                    const cardTone =
+                      poolTier === 'idle'
+                        ? 'border-emerald-500/30 bg-emerald-950/20'
+                        : poolTier === 'single'
+                        ? 'border-amber-500/40 bg-amber-950/25'
+                        : 'border-red-500/50 bg-red-950/30';
+                    const barFillTone =
+                      poolTier === 'idle'
+                        ? 'bg-emerald-500 w-full opacity-35'
+                        : poolTier === 'single'
+                        ? 'bg-amber-500 w-1/4 animate-pulse'
+                        : activePoolThreads === 2
+                        ? 'bg-red-500 w-2/4 animate-pulse'
+                        : activePoolThreads === 3
+                        ? 'bg-red-500 w-3/4 animate-pulse'
+                        : 'bg-red-500 w-full animate-pulse';
+                    const badgeTone =
+                      poolTier === 'idle'
+                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                        : poolTier === 'single'
+                        ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                        : 'bg-red-500/20 text-red-300 border-red-500/50';
+                    const dotTone =
+                      poolTier === 'idle'
+                        ? 'bg-emerald-400'
+                        : poolTier === 'single'
+                        ? 'bg-amber-400 animate-ping'
+                        : 'bg-red-400 animate-ping';
+                    const statusLabel =
+                      poolTier === 'idle'
+                        ? isZh
+                          ? '0 活跃线程 · 零后台静默空闲'
+                          : '0 threads · Zero-Idle'
+                        : poolTier === 'single'
+                        ? isZh
+                          ? '1 活跃线程 · 单线程按需执行'
+                          : '1 thread · On-Demand Active'
+                        : isZh
+                        ? `${activePoolThreads} 活跃线程 · 并发突发负载`
+                        : `${activePoolThreads} threads · Concurrent Burst`;
+
+                    return (
+                      <div className={`rounded-xl border px-3 py-2.5 transition-colors duration-200 ${cardTone}`}>
+                        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                          <div className="flex items-center gap-2">
+                            <Cpu
+                              className={`w-3.5 h-3.5 ${
+                                poolTier === 'idle'
+                                  ? 'text-emerald-400'
+                                  : poolTier === 'single'
+                                  ? 'text-amber-400'
+                                  : 'text-red-400'
+                              }`}
+                            />
+                            <span className="text-[11px] font-semibold text-slate-200 font-mono">
+                              {isZh ? 'Thread Pool · 实时线程池负载' : 'Thread Pool · Real-Time Activity'}
+                            </span>
+                            <span
+                              className={`inline-flex items-center gap-1.5 text-[10px] font-mono font-semibold px-2 py-0.5 rounded border transition-colors ${badgeTone}`}
+                            >
+                              <span className="relative flex h-1.5 w-1.5">
+                                <span className={`absolute inline-flex h-full w-full rounded-full opacity-75 ${dotTone}`} />
+                                <span
+                                  className={`relative inline-flex rounded-full h-1.5 w-1.5 ${
+                                    poolTier === 'idle'
+                                      ? 'bg-emerald-400'
+                                      : poolTier === 'single'
+                                      ? 'bg-amber-400'
+                                      : 'bg-red-400'
+                                  }`}
+                                />
+                              </span>
+                              {statusLabel}
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-2.5 text-[10px] font-mono text-slate-400">
+                            <span className="hidden sm:inline-flex items-center gap-2">
+                              <span className="inline-flex items-center gap-1">
+                                <span className="w-2 h-2 rounded-xs bg-emerald-500" />0
+                              </span>
+                              <span className="inline-flex items-center gap-1">
+                                <span className="w-2 h-2 rounded-xs bg-amber-500" />1
+                              </span>
+                              <span className="inline-flex items-center gap-1">
+                                <span className="w-2 h-2 rounded-xs bg-red-500" />&gt;1
+                              </span>
+                            </span>
+                            <button
+                              type="button"
+                              disabled={!isGeminiForeground}
+                              onClick={handleSimulateThreadBurst}
+                              className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+                            >
+                              {isZh ? '并发测试 (2t)' : 'Burst Test (2t)'}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Continuous Dynamic Load Bar + Discrete Worker Slots */}
+                        <div className="space-y-1.5">
+                          <div className="w-full h-2.5 bg-slate-950/90 rounded-md overflow-hidden border border-slate-800/90 p-0.5">
+                            <div className={`h-full rounded-sm transition-all duration-200 ${barFillTone}`} />
+                          </div>
+
+                          <div className="grid grid-cols-4 gap-1.5">
+                            {Array.from({ length: maxSlots }).map((_, idx) => {
+                              const isSlotBusy = idx < activePoolThreads;
+                              const slotClass = !isSlotBusy
+                                ? poolTier === 'idle'
+                                  ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-400'
+                                  : 'bg-slate-900/90 border-slate-800 text-slate-500'
+                                : poolTier === 'single'
+                                ? 'bg-amber-500/85 border-amber-400 text-slate-950 font-bold'
+                                : 'bg-red-500/85 border-red-400 text-white font-bold';
+                              return (
+                                <div
+                                  key={idx}
+                                  className={`h-4 rounded border flex items-center justify-between px-1.5 text-[9px] font-mono transition-all duration-200 ${slotClass}`}
+                                >
+                                  <span>W{idx + 1}</span>
+                                  <span>{isSlotBusy ? 'RUN' : 'IDLE'}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* Terminal Log Stream Area */}
                   <div className="bg-slate-950 border border-slate-800/80 rounded-xl p-3 max-h-72 overflow-y-auto font-mono text-xs space-y-1.5 shadow-inner">
