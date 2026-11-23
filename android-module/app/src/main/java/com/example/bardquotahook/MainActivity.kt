@@ -243,6 +243,12 @@ class MainActivity : Activity() {
         val zeroCount = maxOf(state.zeroGuardCount, entries.count { it.eventType == "ZERO_GUARD" })
         val anomalyCount = maxOf(state.linkAnomalyCount, entries.count { it.eventType == "LINK_ANOMALY" })
         val batteryCount = entries.count { it.eventType == "BATTERY_IMPACT" }
+        val hasHighUsageTrend = energyObj.optBoolean("highUsageTrendActive", false)
+        val trendStreak = energyObj.optInt("trendConsecutiveIncreases", 0)
+        val trendStart = energyObj.optDouble("trendStartScore", 0.0)
+        val trendCur = energyObj.optDouble("trendCurrentScore", 0.0)
+        val trendDelta = energyObj.optDouble("trendWindowDelta", 0.0)
+
         devConsoleTitleView?.text = if (zh) "开发者控制台 (Dev Console)" else "Developer Console"
         devConsoleCountView?.text = if (zh) {
             "归零防护: $zeroCount | 链路异常: $anomalyCount | 功耗: $batteryCount"
@@ -250,14 +256,22 @@ class MainActivity : Activity() {
             "Zero-Guard: $zeroCount | Anomaly: $anomalyCount | Energy: $batteryCount"
         }
         devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
-        devConsoleLogsView?.text = if (entries.isEmpty()) {
-            if (zh) {
-                "暂无「归零防护已触发」、「链路异常」或「能耗监控」事件记录。\n当触发 Protobuf 归零补偿、解析失败、连续 3 次空数据或前台休眠里程碑时，此处将输出诊断详情。"
-            } else {
-                "No ZERO_GUARD_TRIGGERED, LINK_ANOMALY, or BATTERY_IMPACT events recorded yet.\nZero compensation, parse failures, 3 consecutive empties, and energy milestones appear here."
+        devConsoleLogsView?.text = buildString {
+            if (hasHighUsageTrend) {
+                if (zh) {
+                    append("⚠ High Usage Trend · 5分钟滑动窗口连续上升 $trendStreak 次 ($trendStart -> $trendCur, +$trendDelta 分)\n\n")
+                } else {
+                    append("⚠ High Usage Trend · $trendStreak consecutive increases in 5m window ($trendStart -> $trendCur, +$trendDelta pts)\n\n")
+                }
             }
-        } else {
-            entries.joinToString("\n\n") { entry ->
+            if (entries.isEmpty()) {
+                if (zh) {
+                    append("暂无「归零防护已触发」、「链路异常」或「能耗监控」事件记录。\n当触发 Protobuf 归零补偿、解析失败、连续 3 次空数据或前台休眠里程碑时，此处将输出诊断详情。")
+                } else {
+                    append("No ZERO_GUARD_TRIGGERED, LINK_ANOMALY, or BATTERY_IMPACT events recorded yet.\nZero compensation, parse failures, 3 consecutive empties, and energy milestones appear here.")
+                }
+            } else {
+                append(entries.joinToString("\n\n") { entry ->
                 val evtTs = formatLogTime(entry.eventTimeMs)
                 if (entry.eventType == "LINK_ANOMALY") {
                     val evtTag = if (zh) "[链路异常 #${entry.triggerCount}]" else "[LINK_ANOMALY #${entry.triggerCount}]"
@@ -289,6 +303,7 @@ class MainActivity : Activity() {
                         "$evtTs $evtTag [${entry.source}]\nCached Snapshot Timestamp: $cachedTs\nRestored Values: ${entry.restoredQuota}"
                     }
                 }
+                })
             }
         }
 
@@ -315,6 +330,15 @@ class MainActivity : Activity() {
         } else {
             ""
         }
+        val trendLine = if (hasHighUsageTrend) {
+            if (zh) {
+                "\n⚠ High Usage Trend: 5分钟窗口连续上升 $trendStreak 次 (+$trendDelta)"
+            } else {
+                "\n⚠ High Usage Trend: $trendStreak consecutive increases in 5m window (+$trendDelta)"
+            }
+        } else {
+            ""
+        }
 
         energyCardTitleView?.text = if (zh) "电池消耗影响 (Battery Impact)" else "Battery Impact & Energy Statistics"
         energyToggleBtn?.apply {
@@ -333,12 +357,12 @@ class MainActivity : Activity() {
                 "能耗评级: $eRating (Score=$eScore) | 估算耗电: ~${eMah} mAh (电量 $eBatStr)\n" +
                     "后台唤醒: 0 次 (1ns 门控拦截: $eBgSkip 次) | 线程池: ${ePoolAct}/${ePoolSize} 线程\n" +
                     "前台按需派发: $eFg 次 | Hook 事件: $eHooks | CPU/墙钟: ${eCpuMs}ms / ${eWallMs}ms\n" +
-                    "网络重放与拦截传输: $eNetReq 次 / $eNetBytes Bytes | 日志条目: $batteryCount$surgeLine"
+                    "网络重放与拦截传输: $eNetReq 次 / $eNetBytes Bytes | 日志条目: $batteryCount$surgeLine$trendLine"
             } else {
                 "Energy Rating: $eRating (Score=$eScore) | Est. Draw: ~${eMah} mAh (Bat $eBatStr)\n" +
                     "BG Wakeups: 0 (1ns Gated: $eBgSkip) | Thread Pool: ${ePoolAct}/${ePoolSize} threads\n" +
                     "FG Dispatches: $eFg | Hook Events: $eHooks | CPU/Wall: ${eCpuMs}ms / ${eWallMs}ms\n" +
-                    "Network Replays/Bytes: $eNetReq reqs / $eNetBytes B | Log Entries: $batteryCount$surgeLine"
+                    "Network Replays/Bytes: $eNetReq reqs / $eNetBytes B | Log Entries: $batteryCount$surgeLine$trendLine"
             }
         }
         energyExportReportView?.visibility =

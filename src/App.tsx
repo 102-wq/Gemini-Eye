@@ -21,6 +21,7 @@ import {
   Smartphone,
   Terminal,
   Trash2,
+  TrendingUp,
   UserCheck,
 } from 'lucide-react';
 import {
@@ -237,6 +238,16 @@ export default function App() {
     sessionTag: string;
     cycleReason: string;
   } | null>(null);
+  const [highUsageTrendAlert, setHighUsageTrendAlert] = useState<{
+    consecutiveIncreases: number;
+    startScore: number;
+    curScore: number;
+    delta: number;
+    windowSec: number;
+    timeMs: string;
+    sessionTag: string;
+    events: string[];
+  } | null>(null);
   const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
   const bgWakeupCountRef = useRef<number>(0);
   const fgDispatchCountRef = useRef<number>(1);
@@ -248,6 +259,10 @@ export default function App() {
   const heartbeatBaselineScoreRef = useRef<number>(0.52);
   const surgeAlertedInCycleRef = useRef<boolean>(false);
   const latestEnergyScoreRef = useRef<number>(0.52);
+  const energyTrendWindowRef = useRef<Array<{ ts: number; score: number; event: string }>>([
+    { ts: Date.now(), score: 0.52, event: 'INIT_BASELINE' },
+  ]);
+  const highUsageTrendAlertedStreakRef = useRef<number>(0);
   bgWakeupCountRef.current = bgWakeupCount;
   fgDispatchCountRef.current = fgDispatchCount;
   const cachedSnapshotsRef = useRef<Record<string, CachedSnapshotEntry>>({
@@ -538,6 +553,8 @@ export default function App() {
 
   const HIGH_BATTERY_IMPACT_THRESHOLD = 20;
   const HEARTBEAT_ENERGY_SURGE_DELTA = 15;
+  const ENERGY_TREND_WINDOW_MS = 5 * 60 * 1000;
+  const ENERGY_TREND_MIN_CONSECUTIVE_INCREASES = 3;
   latestEnergyScoreRef.current = energyImpactScore;
 
   const energyImpactRating = useMemo(() => {
@@ -547,6 +564,72 @@ export default function App() {
   }, [energyImpactScore]);
 
   const isHighBatteryImpact = energyImpactScore >= HIGH_BATTERY_IMPACT_THRESHOLD;
+
+  const evaluateBatteryUsageTrendWindow = (curScore: number, eventName: string) => {
+    const nowTs = Date.now();
+    const pruned = energyTrendWindowRef.current.filter(
+      (sample) => nowTs - sample.ts <= ENERGY_TREND_WINDOW_MS
+    );
+    const lastSample = pruned[pruned.length - 1];
+
+    if (lastSample && curScore === lastSample.score) {
+      energyTrendWindowRef.current = pruned;
+      return;
+    }
+
+    if (lastSample && curScore < lastSample.score) {
+      highUsageTrendAlertedStreakRef.current = 0;
+    }
+
+    const updated = [...pruned, { ts: nowTs, score: curScore, event: eventName }];
+    energyTrendWindowRef.current = updated;
+
+    let consecutiveIncreases = 0;
+    let streakStartIdx = updated.length - 1;
+    for (let i = updated.length - 1; i > 0; i--) {
+      if (updated[i].score > updated[i - 1].score) {
+        consecutiveIncreases += 1;
+        streakStartIdx = i - 1;
+      } else {
+        break;
+      }
+    }
+
+    if (consecutiveIncreases < ENERGY_TREND_MIN_CONSECUTIVE_INCREASES) {
+      return;
+    }
+
+    const startSample = updated[streakStartIdx];
+    const delta = Math.round((curScore - startSample.score) * 100) / 100;
+    const windowSec = Math.max(1, Math.round((nowTs - startSample.ts) / 1000));
+    const timeMs = formatFullTimestampMs(new Date(nowTs));
+    const sess = activeSessionRef.current.sessionTag;
+    const trailEvents = updated.slice(streakStartIdx).map((s) => s.event);
+
+    setHighUsageTrendAlert({
+      consecutiveIncreases,
+      startScore: startSample.score,
+      curScore,
+      delta,
+      windowSec,
+      timeMs,
+      sessionTag: sess,
+      events: trailEvents,
+    });
+
+    if (consecutiveIncreases > highUsageTrendAlertedStreakRef.current) {
+      highUsageTrendAlertedStreakRef.current = consecutiveIncreases;
+      setBatteryImpactCount((c) => c + 1);
+      setDevConsoleOpen(true);
+
+      const trendMsgEn = `[High Usage Trend] Detected ${consecutiveIncreases} consecutive Battery Impact Score increases within 5-min rolling window (${windowSec}s span): ${startSample.score} -> ${curScore} (+${delta.toFixed(2)} pts, session=${sess})`;
+      const trendMsgZh = `[High Usage Trend · 持续高功耗趋势] 5 分钟滑动窗口内检测到连续 ${consecutiveIncreases} 次 Battery Impact Score 上升（耗时 ${windowSec}s）：${startSample.score} -> ${curScore} (+${delta.toFixed(2)} 分，会话=${sess})`;
+
+      console.warn(trendMsgEn);
+      logDevEvent('BATTERY_IMPACT', sess, trendMsgZh, trendMsgEn, 'warn');
+      setLastSyncNote(isZhRef.current ? trendMsgZh : trendMsgEn);
+    }
+  };
 
   const pushHeartbeatEnergySurgeWarn = (curScore: number, cycleReason: string) => {
     const prevScore = Math.round(heartbeatBaselineScoreRef.current * 100) / 100;
@@ -595,7 +678,32 @@ export default function App() {
       { time: timeStr, score: energyImpactScore, cpuMs: energyCpuMs, event: eventName },
     ]);
     pushHeartbeatEnergySurgeWarn(energyImpactScore, eventName);
+    evaluateBatteryUsageTrendWindow(energyImpactScore, eventName);
   }, [energyImpactScore, energyCpuMs]);
+
+  const handleSimulateHighUsageTrend = () => {
+    const sess = activeSessionRef.current.sessionTag;
+    const stepTags = ['TREND_STEP_1', 'TREND_STEP_2', 'TREND_STEP_3'];
+    stepTags.forEach((stepTag, idx) => {
+      window.setTimeout(() => {
+        lastEnergyEventTagRef.current = stepTag;
+        setFgDispatchCount((c) => c + 1);
+        setEnergyCpuMs((v) => Math.round((v + 4.8 * (idx + 1)) * 10) / 10);
+        setEnergyWallMs((v) => Math.round((v + 18.0 * (idx + 1)) * 10) / 10);
+        setEnergyNetReqs((v) => v + 2);
+        setEnergyNetBytes((v) => v + 2800);
+        setEnergyHookEvents((v) => v + 8);
+        setBatteryImpactCount((c) => c + 1);
+        logDevEvent(
+          'BATTERY_IMPACT',
+          sess,
+          `[5m 趋势采样 #${idx + 1}/3 · ${stepTag}] 前台高频交互触发能耗递进样本采集`,
+          `[5m Trend Sample #${idx + 1}/3 · ${stepTag}] Foreground burst triggered progressive energy score sample`,
+          'info'
+        );
+      }, idx * 180);
+    });
+  };
 
   const handleSimulateHighBatteryImpact = () => {
     lastEnergyEventTagRef.current = 'HIGH_LOAD_SPIKE';
@@ -637,6 +745,9 @@ export default function App() {
           `累计 CPU / 墙钟耗时: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
           `网络重放与拦截传输: ${energyNetReqs} 次请求 / ${energyNetBytes} Bytes`,
           `估算电池消耗: ~${estimatedEnergyMah.toFixed(4)} mAh`,
+          highUsageTrendAlert
+            ? `趋势告警: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases} 次连续上升 / 5m 窗口: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
+            : '趋势告警: 正常 (5 分钟窗口无连续递增异常)',
           '',
           `--- 当前能耗事件日志 (${batteryLogs.length} 条) ---`,
         ]
@@ -650,6 +761,9 @@ export default function App() {
           `Cumulative CPU / Wall Time: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
           `Network Replays / Transferred: ${energyNetReqs} reqs / ${energyNetBytes} Bytes`,
           `Estimated Battery Draw: ~${estimatedEnergyMah.toFixed(4)} mAh`,
+          highUsageTrendAlert
+            ? `Trend Alert: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases} consecutive increases in 5m window: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
+            : 'Trend Alert: Normal (no consecutive 5m increase streak detected)',
           '',
           `--- Current Energy Usage Log (${batteryLogs.length} entries) ---`,
         ];
@@ -2802,6 +2916,14 @@ export default function App() {
                       <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
                         {isZh ? `后台唤醒: ${bgWakeupCount} 次` : `BG Wakeups: ${bgWakeupCount}`}
                       </span>
+                      {highUsageTrendAlert && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/50 animate-pulse">
+                          <TrendingUp className="w-3 h-3" />
+                          <span>
+                            High Usage Trend ({highUsageTrendAlert.consecutiveIncreases}x / 5m)
+                          </span>
+                        </span>
+                      )}
                     </span>
                     <span className="text-[11px] text-slate-400 block mt-0.5">
                       {isZh
@@ -2827,6 +2949,42 @@ export default function App() {
 
               {devConsoleOpen && (
                 <div className="p-4 space-y-3">
+                  {/* Developer Console Automated High Usage Trend Notification */}
+                  {highUsageTrendAlert && (
+                    <div
+                      role="alert"
+                      className="rounded-xl border border-rose-500/55 bg-gradient-to-r from-rose-950/75 via-red-950/60 to-amber-950/50 px-3.5 py-2.5 flex flex-wrap items-start justify-between gap-3 shadow-sm"
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <div className="w-7 h-7 rounded-lg bg-rose-500/20 border border-rose-500/40 flex items-center justify-center text-rose-300 shrink-0 mt-0.5">
+                          <TrendingUp className="w-4 h-4" />
+                        </div>
+                        <div className="space-y-0.5 font-mono min-w-0">
+                          <div className="text-xs font-bold text-rose-200 flex flex-wrap items-center gap-2">
+                            <span>High Usage Trend</span>
+                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-200 border border-rose-400/40">
+                              {isZh
+                                ? `5分钟窗口连续上升 ${highUsageTrendAlert.consecutiveIncreases} 次`
+                                : `${highUsageTrendAlert.consecutiveIncreases} consecutive increases in 5m window`}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-rose-100/90 break-words">
+                            {isZh
+                              ? `${highUsageTrendAlert.timeMs} · [${highUsageTrendAlert.sessionTag}] Energy Impact Score 在 ${highUsageTrendAlert.windowSec}s 内持续递增：${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore} (+${highUsageTrendAlert.delta.toFixed(2)} 分)`
+                              : `${highUsageTrendAlert.timeMs} · [${highUsageTrendAlert.sessionTag}] Consecutive Battery Impact Score climb over ${highUsageTrendAlert.windowSec}s: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore} (+${highUsageTrendAlert.delta.toFixed(2)} pts)`}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setHighUsageTrendAlert(null)}
+                        className="px-2.5 py-1 text-[10px] font-medium rounded-md bg-rose-900/60 hover:bg-rose-800/80 text-rose-100 border border-rose-700/60 shrink-0 cursor-pointer"
+                      >
+                        {isZh ? '确认忽略' : 'Dismiss'}
+                      </button>
+                    </div>
+                  )}
+
                   {/* Console Header Bar */}
                   <div className="flex flex-wrap items-center justify-between gap-2 px-1 text-xs">
                     <div className="flex flex-wrap items-center gap-2">
@@ -2943,7 +3101,12 @@ export default function App() {
                           skipNextEnergyHistoryPushRef.current = true;
                           heartbeatBaselineScoreRef.current = 0;
                           surgeAlertedInCycleRef.current = false;
+                          energyTrendWindowRef.current = [
+                            { ts: Date.now(), score: 0, event: 'RESET' },
+                          ];
+                          highUsageTrendAlertedStreakRef.current = 0;
                           setEnergySurgeAlert(null);
+                          setHighUsageTrendAlert(null);
                           const d = new Date();
                           const pad = (n: number) => String(n).padStart(2, '0');
                           setEnergyScoreHistory([
@@ -2998,6 +3161,15 @@ export default function App() {
                           className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-amber-950/60 hover:bg-amber-900/60 text-amber-200 border border-amber-700/60 transition-colors cursor-pointer"
                         >
                           <span>{isZh ? '模拟高能耗 (>=20)' : 'Simulate High Load'}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleSimulateHighUsageTrend}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-rose-950/60 hover:bg-rose-900/60 text-rose-200 border border-rose-700/60 transition-colors cursor-pointer"
+                        >
+                          <TrendingUp className="w-3 h-3" />
+                          <span>{isZh ? '模拟 5m 连续上升趋势' : 'Simulate 5m Trend'}</span>
                         </button>
 
                         <button

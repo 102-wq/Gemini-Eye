@@ -465,12 +465,22 @@ object QuotaCoreEngine {
         private val totalWallTimeNs = AtomicLong(0L)
         private val totalCpuTimeNs = AtomicLong(0L)
         private const val SURGE_DELTA_THRESHOLD = 15.0
+        private const val TREND_WINDOW_MS = 5 * 60 * 1000L
+        private const val TREND_MIN_CONSECUTIVE_INCREASES = 3
         private val logLock = Any()
         private val ringLogs = ArrayList<String>(32)
+        private val trendSamples = ArrayList<Pair<Long, Double>>(32)
         @Volatile private var lastHeartbeatScoreBaseline: Double = 0.0
         @Volatile private var surgeAlertedInCycle: Boolean = false
         @Volatile private var lastSurgeDelta: Double = 0.0
         @Volatile private var lastSurgeAtMs: Long = 0L
+        @Volatile private var highUsageTrendActive: Boolean = false
+        @Volatile private var trendConsecutiveIncreases: Int = 0
+        @Volatile private var trendStartScore: Double = 0.0
+        @Volatile private var trendCurrentScore: Double = 0.0
+        @Volatile private var trendWindowDelta: Double = 0.0
+        @Volatile private var lastTrendAlertAtMs: Long = 0L
+        @Volatile private var lastTrendAlertedStreak: Int = 0
 
         fun recordBgGateSkip() {
             bgSuppressed.incrementAndGet()
@@ -484,6 +494,7 @@ object QuotaCoreEngine {
             if (isReplay) networkReplays.incrementAndGet()
             if (bytesCount > 0L) networkBytes.addAndGet(bytesCount)
             evaluateHeartbeatCycleSurge(activeSessionTag.get(), "NET_TRANSFER", isCycleBoundary = false)
+            evaluateUsageTrendWindow(activeSessionTag.get(), "NET_TRANSFER")
         }
 
         fun recordTaskExecution(wallNs: Long, cpuNs: Long) {
@@ -491,6 +502,83 @@ object QuotaCoreEngine {
             if (wallNs > 0L) totalWallTimeNs.addAndGet(wallNs)
             if (cpuNs > 0L) totalCpuTimeNs.addAndGet(cpuNs)
             evaluateHeartbeatCycleSurge(activeSessionTag.get(), "FG_TASK", isCycleBoundary = false)
+            evaluateUsageTrendWindow(activeSessionTag.get(), "FG_TASK")
+        }
+
+        fun evaluateUsageTrendWindow(sessionTag: String, reason: String = "SAMPLE") {
+            val nowMs = System.currentTimeMillis()
+            val curScore = computeRawEnergyScoreRounded()
+            var streak = 0
+            var startScore = curScore
+            var shouldEmitWarn = false
+
+            synchronized(logLock) {
+                val cutoff = nowMs - TREND_WINDOW_MS
+                val iter = trendSamples.iterator()
+                while (iter.hasNext()) {
+                    if (iter.next().first < cutoff) iter.remove()
+                }
+                val last = trendSamples.lastOrNull()
+                if (last != null && last.second == curScore) {
+                    return
+                }
+                if (last != null && curScore < last.second) {
+                    lastTrendAlertedStreak = 0
+                }
+                trendSamples.add(Pair(nowMs, curScore))
+
+                var startIdx = trendSamples.size - 1
+                for (i in trendSamples.size - 1 downTo 1) {
+                    if (trendSamples[i].second > trendSamples[i - 1].second) {
+                        streak += 1
+                        startIdx = i - 1
+                    } else {
+                        break
+                    }
+                }
+                startScore = trendSamples[startIdx].second
+                if (streak >= TREND_MIN_CONSECUTIVE_INCREASES) {
+                    val delta = ((curScore - startScore) * 100.0).roundToInt() / 100.0
+                    highUsageTrendActive = true
+                    trendConsecutiveIncreases = streak
+                    trendStartScore = startScore
+                    trendCurrentScore = curScore
+                    trendWindowDelta = delta
+                    lastTrendAlertAtMs = nowMs
+                    if (streak > lastTrendAlertedStreak) {
+                        lastTrendAlertedStreak = streak
+                        shouldEmitWarn = true
+                        val warnMsg = "[High Usage Trend] $streak consecutive battery score increases in 5-min window: $startScore -> $curScore (+$delta pts, reason=$reason, session=$sessionTag)"
+                        if (ringLogs.size >= 30) ringLogs.removeAt(0)
+                        ringLogs.add("${formatTimestampMs(nowMs)} $warnMsg")
+                        warnLog(activeBridgeRef.get(), warnMsg)
+                    }
+                }
+            }
+
+            if (shouldEmitWarn) {
+                val ctx = appContext ?: return
+                val snap = computeSnapshot()
+                val delta = trendWindowDelta
+                QuotaSyncProvider.recordBatteryImpactEvent(
+                    context = ctx,
+                    sessionId = sessionTag,
+                    source = "EnergyImpactMonitor · High Usage Trend",
+                    summary = "High Usage Trend (${streak}x / 5m)",
+                    detailZh = "[High Usage Trend · 5分钟连续升温告警] 5 分钟滑动窗口内检测到连续 $streak 次 Battery Impact Score 上升：$startScore -> $curScore (+$delta 分 · $reason)",
+                    detailEn = "[High Usage Trend] Detected $streak consecutive Battery Impact Score increases within 5-minute window: $startScore -> $curScore (+$delta pts · $reason)",
+                    energyStatsJson = snap.toString(),
+                    eventCount = snap.optLong("fgDispatches", 0L).toInt()
+                )
+            }
+        }
+
+        private fun computeRawEnergyScoreRounded(): Double {
+            val fg = fgDispatches.get()
+            val netReq = networkReplays.get()
+            val cpuMs = (totalCpuTimeNs.get() / 1_000_000.0)
+            val score = minOf(100.0, (cpuMs / 50.0) + (netReq * 0.4) + (fg * 0.05))
+            return ((score * 100.0).roundToInt() / 100.0)
         }
 
         fun evaluateHeartbeatCycleSurge(
@@ -532,6 +620,7 @@ object QuotaCoreEngine {
             if (isCycleBoundary) {
                 lastHeartbeatScoreBaseline = curScore
                 surgeAlertedInCycle = false
+                evaluateUsageTrendWindow(sessionTag, reason)
             }
         }
 
@@ -602,6 +691,12 @@ object QuotaCoreEngine {
                 put("poolSize", poolSize)
                 put("lastSurgeDelta", lastSurgeDelta)
                 put("lastSurgeAtMs", lastSurgeAtMs)
+                put("highUsageTrendActive", highUsageTrendActive)
+                put("trendConsecutiveIncreases", trendConsecutiveIncreases)
+                put("trendStartScore", trendStartScore)
+                put("trendCurrentScore", trendCurrentScore)
+                put("trendWindowDelta", trendWindowDelta)
+                put("lastTrendAlertAtMs", lastTrendAlertAtMs)
                 put("updatedAtMs", System.currentTimeMillis())
             }
         }
@@ -664,6 +759,10 @@ object QuotaCoreEngine {
                 sb.append("累计 CPU / 墙钟耗时: ").append(snap.optDouble("cpuMs")).append(" ms / ").append(snap.optDouble("wallMs")).append(" ms\n")
                 sb.append("网络重放与拦截传输: ").append(snap.optLong("networkReplays")).append(" 次请求 / ").append(snap.optLong("networkBytes")).append(" Bytes\n")
                 sb.append("估算电池消耗: ~").append(snap.optDouble("estimatedMah")).append(" mAh | 设备电量快照: ").append(batStr).append('\n')
+                if (snap.optBoolean("highUsageTrendActive", false)) {
+                    sb.append("趋势告警: High Usage Trend (5分钟窗口连续上升 ").append(snap.optInt("trendConsecutiveIncreases")).append(" 次: ")
+                        .append(snap.optDouble("trendStartScore")).append(" -> ").append(snap.optDouble("trendCurrentScore")).append(")\n")
+                }
                 sb.append("\n--- 最近能耗事件日志 (").append(logsSnapshot.size).append(") ---\n")
             } else {
                 sb.append("=== Gemini-Eye Energy Impact Statistics Report ===\n")
@@ -676,6 +775,10 @@ object QuotaCoreEngine {
                 sb.append("Cumulative CPU / Wall Time: ").append(snap.optDouble("cpuMs")).append(" ms / ").append(snap.optDouble("wallMs")).append(" ms\n")
                 sb.append("Network Replays / Transferred: ").append(snap.optLong("networkReplays")).append(" reqs / ").append(snap.optLong("networkBytes")).append(" Bytes\n")
                 sb.append("Estimated Battery Draw: ~").append(snap.optDouble("estimatedMah")).append(" mAh | Device Battery: ").append(batStr).append('\n')
+                if (snap.optBoolean("highUsageTrendActive", false)) {
+                    sb.append("Trend Alert: High Usage Trend (").append(snap.optInt("trendConsecutiveIncreases")).append(" consecutive increases in 5m window: ")
+                        .append(snap.optDouble("trendStartScore")).append(" -> ").append(snap.optDouble("trendCurrentScore")).append(")\n")
+                }
                 sb.append("\n--- Recent Energy Impact Logs (").append(logsSnapshot.size).append(") ---\n")
             }
             if (logsSnapshot.isEmpty()) {
