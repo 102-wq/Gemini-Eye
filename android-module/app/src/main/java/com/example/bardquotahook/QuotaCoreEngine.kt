@@ -38,6 +38,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.util.Base64
 import dalvik.system.BaseDexClassLoader
@@ -264,6 +265,7 @@ object QuotaCoreEngine {
     private val latestSnapshot = AtomicReference(QuotaHudView.Snapshot())
     private val currentLang = AtomicReference(QuotaSyncProvider.defaultLangForDevice())
     private val currentTheme = AtomicReference(QuotaHudView.ThemeMode.MIUIX)
+    private val currentHudOpacity = AtomicInteger(QuotaSyncProvider.DEFAULT_HUD_OPACITY)
 
     // Strong account-switch tracking (never churns across different OAuth scopes on the same account)
     @Volatile private var confirmedIdentityKey: String? = null
@@ -462,8 +464,13 @@ object QuotaCoreEngine {
         private val networkBytes = AtomicLong(0L)
         private val totalWallTimeNs = AtomicLong(0L)
         private val totalCpuTimeNs = AtomicLong(0L)
+        private const val SURGE_DELTA_THRESHOLD = 15.0
         private val logLock = Any()
         private val ringLogs = ArrayList<String>(32)
+        @Volatile private var lastHeartbeatScoreBaseline: Double = 0.0
+        @Volatile private var surgeAlertedInCycle: Boolean = false
+        @Volatile private var lastSurgeDelta: Double = 0.0
+        @Volatile private var lastSurgeAtMs: Long = 0L
 
         fun recordBgGateSkip() {
             bgSuppressed.incrementAndGet()
@@ -476,12 +483,56 @@ object QuotaCoreEngine {
         fun recordNetworkTransfer(bytesCount: Long, isReplay: Boolean = false) {
             if (isReplay) networkReplays.incrementAndGet()
             if (bytesCount > 0L) networkBytes.addAndGet(bytesCount)
+            evaluateHeartbeatCycleSurge(activeSessionTag.get(), "NET_TRANSFER", isCycleBoundary = false)
         }
 
         fun recordTaskExecution(wallNs: Long, cpuNs: Long) {
             fgDispatches.incrementAndGet()
             if (wallNs > 0L) totalWallTimeNs.addAndGet(wallNs)
             if (cpuNs > 0L) totalCpuTimeNs.addAndGet(cpuNs)
+            evaluateHeartbeatCycleSurge(activeSessionTag.get(), "FG_TASK", isCycleBoundary = false)
+        }
+
+        fun evaluateHeartbeatCycleSurge(
+            sessionTag: String,
+            reason: String = "HEARTBEAT",
+            isCycleBoundary: Boolean = false
+        ) {
+            val snap = computeSnapshot()
+            val curScore = snap.optDouble("energyScore", 0.0)
+            val delta = ((curScore - lastHeartbeatScoreBaseline) * 100.0).roundToInt() / 100.0
+            if (delta > SURGE_DELTA_THRESHOLD && !surgeAlertedInCycle) {
+                surgeAlertedInCycle = true
+                lastSurgeDelta = delta
+                lastSurgeAtMs = System.currentTimeMillis()
+                val warnMsg = "[EnergyImpact WARN · Heartbeat Surge +$delta > $SURGE_DELTA_THRESHOLD] score=${lastHeartbeatScoreBaseline} -> $curScore (reason=$reason, session=$sessionTag)"
+                warnLog(activeBridgeRef.get(), warnMsg)
+                synchronized(logLock) {
+                    if (ringLogs.size >= 30) ringLogs.removeAt(0)
+                    ringLogs.add("${formatTimestampMs(lastSurgeAtMs)} $warnMsg")
+                }
+                val ctx = appContext
+                if (ctx != null) {
+                    val enriched = snap.apply {
+                        put("lastSurgeDelta", delta)
+                        put("lastSurgeAtMs", lastSurgeAtMs)
+                    }
+                    QuotaSyncProvider.recordBatteryImpactEvent(
+                        context = ctx,
+                        sessionId = sessionTag,
+                        source = "EnergyImpactMonitor · WARN",
+                        summary = "SURGE +$delta pts",
+                        detailZh = "[能耗突增告警 WARN · 单心跳周期飙升 +$delta 分] Score 由 $lastHeartbeatScoreBaseline 升至 $curScore (超过 +$SURGE_DELTA_THRESHOLD 阈值 · $reason)",
+                        detailEn = "[Energy Impact Surge WARN · +$delta pts in 1 Heartbeat Cycle] Score jumped $lastHeartbeatScoreBaseline -> $curScore (> +$SURGE_DELTA_THRESHOLD threshold · $reason)",
+                        energyStatsJson = enriched.toString(),
+                        eventCount = snap.optLong("fgDispatches", 0L).toInt()
+                    )
+                }
+            }
+            if (isCycleBoundary) {
+                lastHeartbeatScoreBaseline = curScore
+                surgeAlertedInCycle = false
+            }
         }
 
         private fun readPassiveBatterySnapshot(): Pair<Int, Boolean> {
@@ -549,6 +600,8 @@ object QuotaCoreEngine {
                 put("isCharging", isChg)
                 put("poolActive", poolActive)
                 put("poolSize", poolSize)
+                put("lastSurgeDelta", lastSurgeDelta)
+                put("lastSurgeAtMs", lastSurgeAtMs)
                 put("updatedAtMs", System.currentTimeMillis())
             }
         }
@@ -7052,6 +7105,7 @@ object QuotaCoreEngine {
             loadLearnedEndpoints(prefs)
             val langCode = prefs.getString("ui_lang", null)
             val themeCode = prefs.getString("ui_theme", null)
+            val savedOpacity = prefs.getInt("hud_opacity", QuotaSyncProvider.DEFAULT_HUD_OPACITY).coerceIn(20, 100)
             val savedSession = prefs.getString("session_id", null)
             val savedStrong = prefs.getBoolean("session_strong", false)
             if (langCode != null) {
@@ -7060,6 +7114,7 @@ object QuotaCoreEngine {
                 currentLang.set(QuotaSyncProvider.defaultLangForDevice())
             }
             if (themeCode != null) currentTheme.set(QuotaHudView.ThemeMode.fromCode(themeCode))
+            currentHudOpacity.set(savedOpacity)
             if (!savedSession.isNullOrBlank()) {
                 activeSessionTag.set(savedSession)
                 persistedSessionWasStrong = savedStrong
@@ -7119,6 +7174,7 @@ object QuotaCoreEngine {
                 .putBoolean("session_strong", isStrongCookieTag)
                 .putString("ui_lang", lang.code)
                 .putString("ui_theme", theme.code)
+                .putInt("hud_opacity", currentHudOpacity.get().coerceIn(20, 100))
                 .apply()
         } catch (_: Throwable) {
         }
@@ -7161,6 +7217,7 @@ object QuotaCoreEngine {
                     "QuotaSyncProvider IPC returned null — check module Autostart / Associated-Startup permission on MIUI/HyperOS/ColorOS"
                 )
             }
+            EnergyImpactMonitor.evaluateHeartbeatCycleSurge(sess, "HEARTBEAT_IPC", isCycleBoundary = true)
             applyUnifiedState(state)
         }
     }
@@ -7175,6 +7232,11 @@ object QuotaCoreEngine {
         }
         if (currentTheme.get() != state.theme) {
             currentTheme.set(state.theme)
+            uiChanged = true
+        }
+        val incomingOpacity = state.hudOpacity.coerceIn(20, 100)
+        if (currentHudOpacity.get() != incomingOpacity) {
+            currentHudOpacity.set(incomingOpacity)
             uiChanged = true
         }
 
@@ -7261,7 +7323,7 @@ object QuotaCoreEngine {
             if (hud != null && hud.isAttachedToWindow) {
                 hud.visibility = View.VISIBLE
                 hud.alpha = 1f
-                hud.applyPreferences(currentLang.get(), currentTheme.get())
+                hud.applyPreferences(currentLang.get(), currentTheme.get(), currentHudOpacity.get())
                 hud.updateSnapshot(latestSnapshot.get().sanitized())
                 hud.updateEnergyScore(EnergyImpactMonitor.computeSnapshot().optDouble("energyScore", 0.0))
                 hud.bringToFront()
@@ -7348,7 +7410,7 @@ object QuotaCoreEngine {
 
             hud.visibility = View.VISIBLE
             hud.alpha = 1f
-            hud.applyPreferences(currentLang.get(), currentTheme.get())
+            hud.applyPreferences(currentLang.get(), currentTheme.get(), currentHudOpacity.get())
             hud.updateSnapshot(latestSnapshot.get().sanitized())
             hud.updateEnergyScore(EnergyImpactMonitor.computeSnapshot().optDouble("energyScore", 0.0))
             hud.bringToFront()
@@ -7434,6 +7496,54 @@ object QuotaCoreEngine {
                         topMargin = QuotaHudView.dp(activity, 8f)
                     }
                     addView(traceTv)
+                }
+
+                val opacityHeaderTv = TextView(activity).apply {
+                    setTextColor(Color.parseColor("#38BDF8"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    val curPct = currentHudOpacity.get().coerceIn(20, 100)
+                    val blurPx = (4 + ((curPct - 20) / 80f) * 28f).roundToInt()
+                    text = if (zh) {
+                        "HUD 设置 (HUD Settings) · 不透明度 ${curPct}% (MIUIX 模糊 ${blurPx}px)"
+                    } else {
+                        "HUD Settings · Opacity ${curPct}% (MIUIX Blur ${blurPx}px)"
+                    }
+                }
+
+                val opacitySeekBar = SeekBar(activity).apply {
+                    max = 80
+                    progress = (currentHudOpacity.get().coerceIn(20, 100) - 20)
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        topMargin = QuotaHudView.dp(activity, 4f)
+                        bottomMargin = QuotaHudView.dp(activity, 8f)
+                    }
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                            val pct = (progress + 20).coerceIn(20, 100)
+                            val blurPx = (4 + ((pct - 20) / 80f) * 28f).roundToInt()
+                            currentHudOpacity.set(pct)
+                            opacityHeaderTv.text = if (zh) {
+                                "HUD 设置 (HUD Settings) · 不透明度 ${pct}% (MIUIX 模糊 ${blurPx}px)"
+                            } else {
+                                "HUD Settings · Opacity ${pct}% (MIUIX Blur ${blurPx}px)"
+                            }
+                            activeHudRef.get().get()?.setHudOpacity(pct)
+                        }
+
+                        override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                        override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                            val pct = currentHudOpacity.get().coerceIn(20, 100)
+                            saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get(), activeSessionTag.get())
+                            submitForegroundWork {
+                                QuotaSyncProvider.updatePreferences(activity, hudOpacity = pct)
+                            }
+                        }
+                    })
                 }
 
                 val forceScanBtn = Button(activity).apply {
@@ -7593,6 +7703,8 @@ object QuotaCoreEngine {
 
                 root.addView(titleTv)
                 root.addView(quotaTv)
+                root.addView(opacityHeaderTv)
+                root.addView(opacitySeekBar)
                 root.addView(energyStatsTv)
                 root.addView(forceScanBtn)
                 root.addView(energyBtnRow)

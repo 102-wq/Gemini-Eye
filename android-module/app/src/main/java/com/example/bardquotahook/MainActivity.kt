@@ -21,6 +21,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -39,6 +40,9 @@ class MainActivity : Activity() {
     private var langEnBtn: Button? = null
     private var themeMiuixBtn: Button? = null
     private var themeMd3Btn: Button? = null
+    private var hudOpacityLabelView: TextView? = null
+    private var hudOpacitySeekBar: SeekBar? = null
+    private var isUpdatingOpacitySeekBar = false
 
     private var hookStatusView: TextView? = null
     private var quotaPreviewView: TextView? = null
@@ -168,9 +172,22 @@ class MainActivity : Activity() {
         }
         val eScore = energyObj.optDouble("energyScore", 0.0)
 
-        liveCapsulePreview?.applyPreferences(state.lang, state.theme)
+        liveCapsulePreview?.applyPreferences(state.lang, state.theme, state.hudOpacity)
         liveCapsulePreview?.updateSnapshot(snap)
         liveCapsulePreview?.updateEnergyScore(eScore)
+
+        val opacityPct = state.hudOpacity.coerceIn(20, 100)
+        val blurPx = (4 + ((opacityPct - 20) / 80f) * 28f).toInt()
+        hudOpacityLabelView?.text = if (zh) {
+            "HUD 不透明度 & MIUIX 模糊强度: ${opacityPct}% (Blur ${blurPx}px)"
+        } else {
+            "HUD Opacity & MIUIX Blur Intensity: ${opacityPct}% (Blur ${blurPx}px)"
+        }
+        if (hudOpacitySeekBar != null && hudOpacitySeekBar?.progress != (opacityPct - 20)) {
+            isUpdatingOpacitySeekBar = true
+            hudOpacitySeekBar?.progress = opacityPct - 20
+            isUpdatingOpacitySeekBar = false
+        }
 
         settingsSectionTitle?.text = loc.getString(R.string.settings_appearance_title)
 
@@ -288,6 +305,16 @@ class MainActivity : Activity() {
         val eBatStr = if (eBatPct >= 0) "$eBatPct%" else "--"
         val ePoolAct = energyObj.optInt("poolActive", 0)
         val ePoolSize = energyObj.optInt("poolSize", 0)
+        val eSurgeDelta = energyObj.optDouble("lastSurgeDelta", 0.0)
+        val surgeLine = if (eSurgeDelta > 15.0) {
+            if (zh) {
+                "\n⚠ 能耗突增告警: 单心跳周期上升 +$eSurgeDelta 分 (>15)"
+            } else {
+                "\n⚠ Energy Surge WARN: +$eSurgeDelta pts in 1 Heartbeat Cycle (>15)"
+            }
+        } else {
+            ""
+        }
 
         energyCardTitleView?.text = if (zh) "电池消耗影响 (Battery Impact)" else "Battery Impact & Energy Statistics"
         energyToggleBtn?.apply {
@@ -306,12 +333,12 @@ class MainActivity : Activity() {
                 "能耗评级: $eRating (Score=$eScore) | 估算耗电: ~${eMah} mAh (电量 $eBatStr)\n" +
                     "后台唤醒: 0 次 (1ns 门控拦截: $eBgSkip 次) | 线程池: ${ePoolAct}/${ePoolSize} 线程\n" +
                     "前台按需派发: $eFg 次 | Hook 事件: $eHooks | CPU/墙钟: ${eCpuMs}ms / ${eWallMs}ms\n" +
-                    "网络重放与拦截传输: $eNetReq 次 / $eNetBytes Bytes | 日志条目: $batteryCount"
+                    "网络重放与拦截传输: $eNetReq 次 / $eNetBytes Bytes | 日志条目: $batteryCount$surgeLine"
             } else {
                 "Energy Rating: $eRating (Score=$eScore) | Est. Draw: ~${eMah} mAh (Bat $eBatStr)\n" +
                     "BG Wakeups: 0 (1ns Gated: $eBgSkip) | Thread Pool: ${ePoolAct}/${ePoolSize} threads\n" +
                     "FG Dispatches: $eFg | Hook Events: $eHooks | CPU/Wall: ${eCpuMs}ms / ${eWallMs}ms\n" +
-                    "Network Replays/Bytes: $eNetReq reqs / $eNetBytes B | Log Entries: $batteryCount"
+                    "Network Replays/Bytes: $eNetReq reqs / $eNetBytes B | Log Entries: $batteryCount$surgeLine"
             }
         }
         energyExportReportView?.visibility =
@@ -540,9 +567,38 @@ class MainActivity : Activity() {
         themeRow.addView(btnMiuix)
         themeRow.addView(btnMd3)
 
+        val opacityLabelTv = TextView(this).apply {
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(10f), 0, dp(4f))
+        }
+        hudOpacityLabelView = opacityLabelTv
+
+        val opacitySlider = SeekBar(this).apply {
+            max = 80
+            progress = QuotaSyncProvider.DEFAULT_HUD_OPACITY - 20
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (isUpdatingOpacitySeekBar || !fromUser) return
+                    val pct = (progress + 20).coerceIn(20, 100)
+                    liveCapsulePreview?.setHudOpacity(pct)
+                    QuotaSyncProvider.updatePreferences(this@MainActivity, hudOpacity = pct)
+                    refreshAllUi()
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+        hudOpacitySeekBar = opacitySlider
+
         prefCard.addView(prefTitle)
         prefCard.addView(langRow)
         prefCard.addView(themeRow)
+        prefCard.addView(opacityLabelTv)
+        prefCard.addView(opacitySlider)
 
         // 2. Zero-Background Dynamic Session Telemetry Card
         val diagCard = LinearLayout(this).apply {

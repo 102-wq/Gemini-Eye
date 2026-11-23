@@ -15,6 +15,7 @@ object HookTelemetryReceiver {
     data class AppUiPrefs(
         val lang: QuotaHudView.Lang = QuotaSyncProvider.defaultLangForDevice(),
         val theme: QuotaHudView.ThemeMode = QuotaHudView.ThemeMode.MIUIX,
+        val hudOpacity: Int = QuotaSyncProvider.DEFAULT_HUD_OPACITY,
         val sessionId: String = "",
         val xposedBound: Boolean = false,
         val isApi102: Boolean = false,
@@ -39,6 +40,7 @@ object HookTelemetryReceiver {
             AppUiPrefs(
                 lang = st.lang,
                 theme = st.theme,
+                hudOpacity = st.hudOpacity,
                 sessionId = st.sessionId,
                 xposedBound = st.isActivelyBound,
                 isApi102 = st.isApi102,

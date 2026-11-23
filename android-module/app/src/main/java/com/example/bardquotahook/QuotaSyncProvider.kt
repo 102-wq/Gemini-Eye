@@ -44,6 +44,7 @@ class QuotaSyncProvider : ContentProvider() {
         val sessionId: String = "",
         val lang: QuotaHudView.Lang = defaultLangForDevice(),
         val theme: QuotaHudView.ThemeMode = QuotaHudView.ThemeMode.MIUIX,
+        val hudOpacity: Int = DEFAULT_HUD_OPACITY,
         val xposedBound: Boolean = false,
         val isApi102: Boolean = false,
         val lastHeartbeatMs: Long = 0L,
@@ -75,6 +76,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putString(KEY_SESSION_ID, sessionId)
                 putString(KEY_LANG, lang.code)
                 putString(KEY_THEME, theme.code)
+                putInt(KEY_HUD_OPACITY, hudOpacity.coerceIn(20, 100))
                 putBoolean(KEY_XPOSED_BOUND, isActivelyBound)
                 putBoolean(KEY_API_102, isApi102)
                 putLong(KEY_LAST_HB_MS, lastHeartbeatMs)
@@ -107,6 +109,7 @@ class QuotaSyncProvider : ContentProvider() {
                     sessionId = bundle.getString(KEY_SESSION_ID, "") ?: "",
                     lang = bundle.getString(KEY_LANG, null)?.let { QuotaHudView.Lang.fromCode(it) } ?: defaultLangForDevice(),
                     theme = QuotaHudView.ThemeMode.fromCode(bundle.getString(KEY_THEME, "MIUIX")),
+                    hudOpacity = bundle.getInt(KEY_HUD_OPACITY, DEFAULT_HUD_OPACITY).coerceIn(20, 100),
                     xposedBound = bundle.getBoolean(KEY_XPOSED_BOUND, false),
                     isApi102 = bundle.getBoolean(KEY_API_102, false),
                     lastHeartbeatMs = bundle.getLong(KEY_LAST_HB_MS, 0L),
@@ -162,10 +165,16 @@ class QuotaSyncProvider : ContentProvider() {
                 METHOD_PUT_PREFS -> {
                     val lang = extras?.getString(KEY_LANG)?.let { QuotaHudView.Lang.fromCode(it) }
                     val theme = extras?.getString(KEY_THEME)?.let { QuotaHudView.ThemeMode.fromCode(it) }
+                    val hudOpacity = if (extras?.containsKey(KEY_HUD_OPACITY) == true) {
+                        extras.getInt(KEY_HUD_OPACITY, DEFAULT_HUD_OPACITY).coerceIn(20, 100)
+                    } else {
+                        null
+                    }
                     val updated = mutateLocalStore(
                         appCtx = appCtx,
                         lang = lang,
-                        theme = theme
+                        theme = theme,
+                        hudOpacity = hudOpacity
                     )
                     dispatchForegroundNotifications(appCtx, updated)
                     updated.toBundle()
@@ -322,6 +331,8 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_REPLACE_SESSION = "replace_session"
         const val KEY_LANG = "ui_lang"
         const val KEY_THEME = "ui_theme"
+        const val KEY_HUD_OPACITY = "hud_opacity"
+        const val DEFAULT_HUD_OPACITY = 85
         const val KEY_XPOSED_BOUND = "xposed_bound"
         const val KEY_API_102 = "api_102_bound"
         const val KEY_LAST_HB_MS = "last_hb_ms"
@@ -386,6 +397,7 @@ class QuotaSyncProvider : ContentProvider() {
                     sessionId = prefs.getString(KEY_SESSION_ID, "") ?: "",
                     lang = prefs.getString(KEY_LANG, null)?.let { QuotaHudView.Lang.fromCode(it) } ?: defaultLangForDevice(),
                     theme = QuotaHudView.ThemeMode.fromCode(prefs.getString(KEY_THEME, "MIUIX")),
+                    hudOpacity = prefs.getInt(KEY_HUD_OPACITY, DEFAULT_HUD_OPACITY).coerceIn(20, 100),
                     xposedBound = prefs.getBoolean(KEY_XPOSED_BOUND, false),
                     isApi102 = prefs.getBoolean(KEY_API_102, false),
                     lastHeartbeatMs = prefs.getLong(KEY_LAST_HB_MS, 0L),
@@ -413,6 +425,7 @@ class QuotaSyncProvider : ContentProvider() {
             replaceSession: Boolean = false,
             lang: QuotaHudView.Lang? = null,
             theme: QuotaHudView.ThemeMode? = null,
+            hudOpacity: Int? = null,
             pkg: String? = null,
             proc: String? = null,
             bridge: String? = null,
@@ -461,6 +474,7 @@ class QuotaSyncProvider : ContentProvider() {
                 sessionId = nextSessionId,
                 lang = lang ?: prev.lang,
                 theme = theme ?: prev.theme,
+                hudOpacity = hudOpacity?.coerceIn(20, 100) ?: prev.hudOpacity,
                 xposedBound = nextBound,
                 isApi102 = isApi102 ?: prev.isApi102,
                 lastHeartbeatMs = nextHbMs,
@@ -485,6 +499,7 @@ class QuotaSyncProvider : ContentProvider() {
                     .putString(KEY_SESSION_ID, next.sessionId)
                     .putString(KEY_LANG, next.lang.code)
                     .putString(KEY_THEME, next.theme.code)
+                    .putInt(KEY_HUD_OPACITY, next.hudOpacity)
                     .putBoolean(KEY_XPOSED_BOUND, next.xposedBound)
                     .putBoolean(KEY_API_102, next.isApi102)
                     .putLong(KEY_LAST_HB_MS, next.lastHeartbeatMs)
@@ -614,6 +629,7 @@ class QuotaSyncProvider : ContentProvider() {
             context: Context,
             lang: QuotaHudView.Lang? = null,
             theme: QuotaHudView.ThemeMode? = null,
+            hudOpacity: Int? = null,
             overlayEnabled: Boolean? = null
         ): UnifiedState? {
             return try {
@@ -622,7 +638,8 @@ class QuotaSyncProvider : ContentProvider() {
                     val updated = mutateLocalStore(
                         appCtx = appCtx,
                         lang = lang,
-                        theme = theme
+                        theme = theme,
+                        hudOpacity = hudOpacity
                     )
                     dispatchForegroundNotifications(appCtx, updated)
                     updated
@@ -630,6 +647,7 @@ class QuotaSyncProvider : ContentProvider() {
                     val extras = Bundle().apply {
                         if (lang != null) putString(KEY_LANG, lang.code)
                         if (theme != null) putString(KEY_THEME, theme.code)
+                        if (hudOpacity != null) putInt(KEY_HUD_OPACITY, hudOpacity.coerceIn(20, 100))
                     }
                     val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_PUT_PREFS, null, extras)
                     UnifiedState.fromBundle(reply)

@@ -155,10 +155,21 @@ class QuotaHudView(
         private set
     var currentTheme: ThemeMode = ThemeMode.MIUIX
         private set
+    var currentOpacityPct: Int = QuotaSyncProvider.DEFAULT_HUD_OPACITY
+        private set
     private var currentEnergyScore: Double = 0.0
 
     private var miuixBlurAnimator: ValueAnimator? = null
     private var miuixBlurPhase: Float = 0f
+    private var tapRippleAnimator: ValueAnimator? = null
+    private var tapRippleProgress: Float = 0f
+    private var tapRippleActive: Boolean = false
+    private var tapRippleX: Float = 0f
+    private var tapRippleY: Float = 0f
+    private val tapRipplePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val pillClipPath = Path()
     private val backdropGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
@@ -308,6 +319,7 @@ class QuotaHudView(
             contentDescription = "Refresh Quota"
             layoutParams = LayoutParams(dp(context, 22f), dp(context, 22f))
             setOnClickListener {
+                startTapRipple(left + width / 2f, top + height / 2f)
                 spinOnce()
                 onRefreshClick?.invoke()
             }
@@ -378,10 +390,20 @@ class QuotaHudView(
         renderAll()
     }
 
-    fun applyPreferences(lang: Lang, themeMode: ThemeMode) {
+    fun applyPreferences(lang: Lang, themeMode: ThemeMode, opacityPct: Int = currentOpacityPct) {
         currentLang = lang
         currentTheme = themeMode
+        currentOpacityPct = opacityPct.coerceIn(20, 100)
         renderAll()
+    }
+
+    fun setHudOpacity(opacityPct: Int) {
+        val clamped = opacityPct.coerceIn(20, 100)
+        if (currentOpacityPct != clamped) {
+            currentOpacityPct = clamped
+            renderAll()
+            invalidate()
+        }
     }
 
     fun updateEnergyScore(score: Double) {
@@ -405,6 +427,7 @@ class QuotaHudView(
 
     override fun onDetachedFromWindow() {
         stopMiuixBlurAnimation()
+        stopTapRipple()
         super.onDetachedFromWindow()
     }
 
@@ -414,9 +437,14 @@ class QuotaHudView(
         val safeSnap = currentSnapshot.sanitized()
         val stale = safeSnap.isStaleOffline
 
+        val bgAlphaTop = (currentOpacityPct.coerceIn(20, 100) * 255 / 100).coerceIn(51, 255)
+        val bgAlphaBottom = (bgAlphaTop - 12).coerceIn(45, 255)
         val bgDrawable = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(palette.bgTop, palette.bgBottom)
+            intArrayOf(
+                withAlpha(palette.bgTop, bgAlphaTop),
+                withAlpha(palette.bgBottom, bgAlphaBottom)
+            )
         ).apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = palette.cornerPx
@@ -572,8 +600,10 @@ class QuotaHudView(
         val bg = activeBgDrawable ?: return
         if (currentTheme != ThemeMode.MIUIX || !isHighBatteryImpact()) return
         val dark = isHostDark(context)
-        val topAlpha = if (dark) (204 + (phase * 28f).toInt()) else (224 + (phase * 24f).toInt())
-        val botAlpha = if (dark) (192 + (phase * 32f).toInt()) else (210 + (phase * 26f).toInt())
+        val baseAlpha = (currentOpacityPct.coerceIn(20, 100) * 255 / 100).coerceIn(51, 255)
+        val pulseBoost = (phase * 26f).toInt()
+        val topAlpha = (baseAlpha + pulseBoost).coerceIn(51, 255)
+        val botAlpha = (baseAlpha - 12 + pulseBoost).coerceIn(45, 255)
         bg.colors = intArrayOf(withAlpha(pal.bgTop, topAlpha), withAlpha(pal.bgBottom, botAlpha))
         val rimTint = if (dark) {
             withAlpha(Color.parseColor("#5EEAD4"), (55 + (phase * 90f).toInt()))
@@ -583,31 +613,82 @@ class QuotaHudView(
         bg.setStroke(maxOf(1, dp(context, 0.9f + phase * 0.45f)), rimTint)
     }
 
+    private fun startTapRipple(localX: Float, localY: Float) {
+        stopTapRipple()
+        tapRippleX = if (width > 0) localX.coerceIn(0f, width.toFloat()) else localX
+        tapRippleY = if (height > 0) localY.coerceIn(0f, height.toFloat()) else localY
+        tapRippleProgress = 0f
+        tapRippleActive = true
+        tapRippleAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 560L
+            addUpdateListener { anim ->
+                val p = (anim.animatedValue as? Float) ?: 0f
+                tapRippleProgress = p
+                if (p >= 0.999f) {
+                    tapRippleActive = false
+                }
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    private fun stopTapRipple() {
+        try {
+            tapRippleAnimator?.cancel()
+        } catch (_: Throwable) {
+        }
+        tapRippleAnimator = null
+        tapRippleActive = false
+        tapRippleProgress = 0f
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (currentTheme == ThemeMode.MIUIX && isHighBatteryImpact()) {
-            val w = width.toFloat()
-            val h = height.toFloat()
-            if (w > 0f && h > 0f) {
-                val r = h / 2f
-                val dark = isHostDark(context)
-                val breathe = miuixBlurPhase
-                backdropRect.set(dpF(context, 1.5f), dpF(context, 1.5f), w - dpF(context, 1.5f), h - dpF(context, 1.5f))
-                backdropGlowPaint.color = if (dark) {
-                    withAlpha(Color.parseColor("#2DD4BF"), (10 + (breathe * 18f).toInt()))
-                } else {
-                    withAlpha(Color.parseColor("#14B8A6"), (8 + (breathe * 16f).toInt()))
-                }
-                canvas.drawRoundRect(backdropRect, r, r, backdropGlowPaint)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val r = h / 2f
 
-                backdropRimPaint.strokeWidth = dpF(context, 1.1f)
-                backdropRimPaint.color = if (dark) {
-                    withAlpha(Color.WHITE, (20 + (breathe * 34f).toInt()))
-                } else {
-                    withAlpha(Color.WHITE, (70 + (breathe * 80f).toInt()))
-                }
-                canvas.drawRoundRect(backdropRect, r, r, backdropRimPaint)
+        if (currentTheme == ThemeMode.MIUIX && isHighBatteryImpact()) {
+            val dark = isHostDark(context)
+            val breathe = miuixBlurPhase
+            backdropRect.set(dpF(context, 1.5f), dpF(context, 1.5f), w - dpF(context, 1.5f), h - dpF(context, 1.5f))
+            backdropGlowPaint.color = if (dark) {
+                withAlpha(Color.parseColor("#2DD4BF"), (10 + (breathe * 18f).toInt()))
+            } else {
+                withAlpha(Color.parseColor("#14B8A6"), (8 + (breathe * 16f).toInt()))
             }
+            canvas.drawRoundRect(backdropRect, r, r, backdropGlowPaint)
+
+            backdropRimPaint.strokeWidth = dpF(context, 1.1f)
+            backdropRimPaint.color = if (dark) {
+                withAlpha(Color.WHITE, (20 + (breathe * 34f).toInt()))
+            } else {
+                withAlpha(Color.WHITE, (70 + (breathe * 80f).toInt()))
+            }
+            canvas.drawRoundRect(backdropRect, r, r, backdropRimPaint)
+        }
+
+        if (tapRippleActive) {
+            val dark = isHostDark(context)
+            val baseColor = when (currentTheme) {
+                ThemeMode.MD3 -> if (dark) Color.parseColor("#D0BCFF") else Color.parseColor("#6750A4")
+                ThemeMode.MIUIX -> if (dark) Color.parseColor("#38BDF8") else Color.parseColor("#0EA5E9")
+            }
+            val eased = 1f - (1f - tapRippleProgress) * (1f - tapRippleProgress)
+            val alpha = ((1f - tapRippleProgress) * 115f).toInt().coerceIn(0, 120)
+            tapRipplePaint.color = withAlpha(baseColor, alpha)
+            val maxRadius = maxOf(w, h) * 1.15f
+            val curRadius = maxRadius * eased
+
+            pillClipPath.reset()
+            backdropRect.set(0f, 0f, w, h)
+            pillClipPath.addRoundRect(backdropRect, r, r, Path.Direction.CW)
+            val saveCount = canvas.save()
+            canvas.clipPath(pillClipPath)
+            canvas.drawCircle(tapRippleX, tapRippleY, curRadius, tapRipplePaint)
+            canvas.restoreToCount(saveCount)
         }
     }
 
@@ -759,9 +840,14 @@ class QuotaHudView(
                 val wasDragging = isDraggingCapsule
                 isDraggingCapsule = false
                 if (!wasDragging) {
+                    startTapRipple(ev.x, ev.y)
                     if (currentDockedEdge != DockEdge.NONE) {
                         // Tap the floating orb -> expand smoothly back into full capsule
                         setDockedEdge(DockEdge.NONE, animateMargin = true)
+                    } else if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                        // Tap the HUD capsule body -> visual ripple + manual refresh
+                        refreshIconBtn.spinOnce()
+                        onRefreshClick?.invoke()
                     }
                     return true
                 }
