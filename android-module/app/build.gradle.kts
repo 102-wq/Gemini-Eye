@@ -83,4 +83,8 @@ dependencies {
     compileOnly("androidx.annotation:annotation:1.8.0")
     // Legacy Xposed Bridge API (82 is the latest version in https://api.xposed.info/)
     compileOnly("de.robv.android.xposed:api:82")
+
+    // Local JVM unit testing dependencies
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

@@ -1,20 +1,29 @@
 package com.example.bardquotahook
 
+import android.accounts.Account
+import android.accounts.AccountManager
 import android.app.Activity
 import android.app.Application
 import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentCallbacks2
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.database.ContentObserver
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Debug
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -233,9 +242,11 @@ object QuotaCoreEngine {
     private enum class IdentityStrength(val rank: Int) {
         NONE(0),
         BEARER_ONLY(1),
-        INTENT(2),
-        AUTH_USER(3),
-        COOKIE_SID(4)
+        BEARER_PRIMARY(2),
+        INTENT(3),
+        AUTH_USER(4),
+        GOOGLE_ACCOUNT(5),
+        COOKIE_SID(5)
     }
 
     private data class LearnedEndpoint(
@@ -257,7 +268,13 @@ object QuotaCoreEngine {
     // Strong account-switch tracking (never churns across different OAuth scopes on the same account)
     @Volatile private var confirmedIdentityKey: String? = null
     @Volatile private var confirmedIdentityStrength: IdentityStrength = IdentityStrength.NONE
+    @Volatile private var confirmedCookieKey: String? = null
+    @Volatile private var confirmedAccountKey: String? = null
+    @Volatile private var confirmedAuthUserIdx: String? = null
+    @Volatile private var confirmedBearerPrimaryKey: String? = null
+    @Volatile private var confirmedIntentKey: String? = null
     @Volatile private var persistedSessionWasStrong: Boolean = false
+    @Volatile private var allowCookieManagerFallback: Boolean = true
     @Volatile private var cachedXsrfToken: String? = null
     @Volatile private var cachedFsidToken: String? = null
     @Volatile private var cachedBuildLabel: String? = null
@@ -278,6 +295,27 @@ object QuotaCoreEngine {
     private val cachedNonZeroTimestamps = HashMap<String, Long>()
     private val pbZeroDebounceHits = HashMap<String, Int>()
     private val lastPbZeroWarnAtMs = HashMap<String, Long>()
+
+    // Ephemeral in-memory per-account credential cache (cleared on wipeCredentials; NEVER persisted to disk)
+    private data class SessionCredentials(
+        var authorizationHeader: String? = null,
+        var cookieHeader: String? = null,
+        var authUserHeader: String? = null,
+        var xsrfToken: String? = null,
+        var fsidToken: String? = null,
+        var buildLabel: String? = null,
+        val perHostAuthorizations: ConcurrentHashMap<String, String> = ConcurrentHashMap(),
+        var allowCookieManagerFallback: Boolean = true,
+        var updatedAtMs: Long = 0L
+    )
+
+    private val sessionCredentialsLock = Any()
+    private val perSessionCredentials = object : LinkedHashMap<String, SessionCredentials>(MAX_TRACKED_ACCOUNTS, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SessionCredentials>?): Boolean {
+            return size > MAX_TRACKED_ACCOUNTS
+        }
+    }
+    private val tokenToAccountKey = ConcurrentHashMap<String, String>()
 
     // Bounded learned quota endpoints discovered during foreground inspection (persisted without credentials)
     private val learnedEndpointsLock = Any()
@@ -318,6 +356,7 @@ object QuotaCoreEngine {
     )
 
     private data class GrpcReplayTarget(
+        val sessionTag: String,
         val fullMethod: String,
         val channelRef: WeakReference<Any>,
         val methodDescRef: WeakReference<Any>,
@@ -391,22 +430,224 @@ object QuotaCoreEngine {
     private val lastHandledForceScanSeq = AtomicLong(0L)
     @Volatile private var activeSettingsTraceRef: WeakReference<TextView> = WeakReference(null)
     @Volatile private var activeSettingsQuotaRef: WeakReference<TextView> = WeakReference(null)
+    @Volatile private var showEnergyImpactStatsInDialog: Boolean = true
+
+    // Pipeline hook telemetry counters (diagnoses why quota isn't resolved on specific Gemini APKs)
+    private val hookCronetReqCount = AtomicLong(0L)
+    private val hookCronetRespCount = AtomicLong(0L)
+    private val hookCronetHeaderHitCount = AtomicLong(0L)
+    private val hookGrpcCallCount = AtomicLong(0L)
+    private val hookGrpcMsgCount = AtomicLong(0L)
+    private val hookOkHttpCount = AtomicLong(0L)
+    private val hookWebViewCount = AtomicLong(0L)
+    private val hookStateFlowCount = AtomicLong(0L)
+    @Volatile private var lastFetchDiagSummary: String = "idle (awaiting foreground network)"
 
     private val lastRefreshMs = AtomicLong(0L)
     private val lastFullProtocolScanMs = AtomicLong(0L)
     private val lastQueryEventMs = AtomicLong(0L)
     private val lastHttpFetchMs = AtomicLong(0L)
-    private val rollingQueryTimestamps = Collections.synchronizedList(ArrayList<Long>(64))
+    private val rollingQueryTimestampsBySession = ConcurrentHashMap<String, MutableList<Long>>()
 
-    private fun recordUserQueryInRollingWindow(now: Long) {
+    /**
+     * Zero-Background Battery & Energy Impact Monitor (`EnergyImpactMonitor`):
+     * Measures lightweight hook CPU/wall execution time, foreground task dispatches, background gate skips,
+     * network replay payload bytes, and passive on-demand `BatteryManager` status without any wakeups or receivers.
+     */
+    private object EnergyImpactMonitor {
+        private val fgDispatches = AtomicLong(0L)
+        private val bgSuppressed = AtomicLong(0L)
+        private val hookEvents = AtomicLong(0L)
+        private val networkReplays = AtomicLong(0L)
+        private val networkBytes = AtomicLong(0L)
+        private val totalWallTimeNs = AtomicLong(0L)
+        private val totalCpuTimeNs = AtomicLong(0L)
+        private val logLock = Any()
+        private val ringLogs = ArrayList<String>(32)
+
+        fun recordBgGateSkip() {
+            bgSuppressed.incrementAndGet()
+        }
+
+        fun recordHookEvent() {
+            hookEvents.incrementAndGet()
+        }
+
+        fun recordNetworkTransfer(bytesCount: Long, isReplay: Boolean = false) {
+            if (isReplay) networkReplays.incrementAndGet()
+            if (bytesCount > 0L) networkBytes.addAndGet(bytesCount)
+        }
+
+        fun recordTaskExecution(wallNs: Long, cpuNs: Long) {
+            fgDispatches.incrementAndGet()
+            if (wallNs > 0L) totalWallTimeNs.addAndGet(wallNs)
+            if (cpuNs > 0L) totalCpuTimeNs.addAndGet(cpuNs)
+        }
+
+        private fun readPassiveBatterySnapshot(): Pair<Int, Boolean> {
+            val ctx = appContext ?: return Pair(-1, false)
+            var pct = -1
+            var charging = false
+            try {
+                val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+                if (bm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    val cap = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                    if (cap in 0..100) pct = cap
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        charging = bm.isCharging
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            if (pct < 0) {
+                try {
+                    val intent = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                    if (intent != null) {
+                        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                        if (level >= 0 && scale > 0) pct = ((level * 100f) / scale).roundToInt()
+                        val st = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                        charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            return Pair(pct, charging)
+        }
+
+        fun computeSnapshot(): JSONObject {
+            val fg = fgDispatches.get()
+            val bgSkip = bgSuppressed.get()
+            val hooks = hookEvents.get()
+            val netReq = networkReplays.get()
+            val bytes = networkBytes.get()
+            val cpuMs = (totalCpuTimeNs.get() / 1_000_000.0)
+            val wallMs = (totalWallTimeNs.get() / 1_000_000.0)
+            val estMah = (cpuMs * 0.00018) + (netReq * 0.012) + (bytes / 1_048_576.0 * 0.05)
+            val score = minOf(100.0, (cpuMs / 50.0) + (netReq * 0.4) + (fg * 0.05))
+            val rating = when {
+                score < 5.0 -> "Minimal"
+                score < 20.0 -> "Low"
+                else -> "Moderate"
+            }
+            val (batPct, isChg) = readPassiveBatterySnapshot()
+            val poolActive = try { onDemandExecutor.activeCount } catch (_: Throwable) { 0 }
+            val poolSize = try { onDemandExecutor.poolSize } catch (_: Throwable) { 0 }
+            return JSONObject().apply {
+                put("rating", rating)
+                put("energyScore", ((score * 100.0).roundToInt() / 100.0))
+                put("fgDispatches", fg)
+                put("bgWakeups", 0)
+                put("bgSuppressed", bgSkip)
+                put("hookEvents", hooks)
+                put("networkReplays", netReq)
+                put("networkBytes", bytes)
+                put("cpuMs", ((cpuMs * 10.0).roundToInt() / 10.0))
+                put("wallMs", ((wallMs * 10.0).roundToInt() / 10.0))
+                put("estimatedMah", ((estMah * 10000.0).roundToInt() / 10000.0))
+                put("batteryPct", batPct)
+                put("isCharging", isChg)
+                put("poolActive", poolActive)
+                put("poolSize", poolSize)
+                put("updatedAtMs", System.currentTimeMillis())
+            }
+        }
+
+        fun appendMilestoneLog(reason: String, sessionTag: String, emitToProvider: Boolean = true) {
+            val snap = computeSnapshot()
+            val ts = formatTimestampMs(System.currentTimeMillis())
+            val rating = snap.optString("rating", "Minimal")
+            val cpuMs = snap.optDouble("cpuMs", 0.0)
+            val fg = snap.optLong("fgDispatches", 0L)
+            val bgSkip = snap.optLong("bgSuppressed", 0L)
+            val netReq = snap.optLong("networkReplays", 0L)
+            val bytes = snap.optLong("networkBytes", 0L)
+            val mah = snap.optDouble("estimatedMah", 0.0)
+            val batPct = snap.optInt("batteryPct", -1)
+            val poolActive = snap.optInt("poolActive", 0)
+
+            val line = "$ts [EnergyImpact · $reason] rating=$rating cpu=${cpuMs}ms fg=$fg bgWakeups=0 bgSkip=$bgSkip net=${netReq}/${bytes}B est=${mah}mAh bat=${if (batPct >= 0) "$batPct%" else "--"} pool=${poolActive}t"
+            synchronized(logLock) {
+                if (ringLogs.size >= 30) ringLogs.removeAt(0)
+                ringLogs.add(line)
+            }
+            safeLog(activeBridgeRef.get(), line)
+
+            if (emitToProvider) {
+                val ctx = appContext
+                if (ctx != null) {
+                    val jsonStr = snap.toString()
+                    val summary = "$rating · ${cpuMs}ms · ${mah}mAh"
+                    val detailZh = "[$reason] 能耗评级=$rating | 后台唤醒=0 (拦截=$bgSkip) | 前台派发=$fg | CPU=${cpuMs}ms | 网络=${netReq}次/${bytes}B | 估算功耗=${mah}mAh"
+                    val detailEn = "[$reason] Rating=$rating | BG Wakeups=0 (Gated=$bgSkip) | FG Dispatches=$fg | CPU=${cpuMs}ms | Net=${netReq}reqs/${bytes}B | Est=${mah}mAh"
+                    QuotaSyncProvider.recordBatteryImpactEvent(
+                        context = ctx,
+                        sessionId = sessionTag,
+                        source = "EnergyImpactMonitor",
+                        summary = summary,
+                        detailZh = detailZh,
+                        detailEn = detailEn,
+                        energyStatsJson = jsonStr,
+                        eventCount = fg.toInt()
+                    )
+                }
+            }
+        }
+
+        fun buildTextReport(zh: Boolean): String {
+            val snap = computeSnapshot()
+            val sess = activeSessionTag.get()
+            val logsSnapshot: List<String> = synchronized(logLock) { ArrayList(ringLogs) }
+            val batStr = snap.optInt("batteryPct", -1).let { if (it >= 0) "$it%" else "--" }
+            val sb = StringBuilder(1024)
+            if (zh) {
+                sb.append("=== Gemini-Eye 能耗统计报告 (Energy Impact Report) ===\n")
+                sb.append("生成时间: ").append(formatTimestampMs(System.currentTimeMillis())).append('\n')
+                sb.append("当前会话: ").append(sess).append(" | 前台活跃: ").append(isForegroundActive.get()).append('\n')
+                sb.append("能耗评级: ").append(snap.optString("rating")).append(" (Score=").append(snap.optDouble("energyScore")).append(")\n")
+                sb.append("后台唤醒: 0 次 (1ns 门控拦截: ").append(snap.optLong("bgSuppressed")).append(" 次) | 当前线程池: ")
+                    .append(snap.optInt("poolActive")).append('/').append(snap.optInt("poolSize")).append(" 线程\n")
+                sb.append("前台按需派发: ").append(snap.optLong("fgDispatches")).append(" 次 | Hook 事件: ").append(snap.optLong("hookEvents")).append('\n')
+                sb.append("累计 CPU / 墙钟耗时: ").append(snap.optDouble("cpuMs")).append(" ms / ").append(snap.optDouble("wallMs")).append(" ms\n")
+                sb.append("网络重放与拦截传输: ").append(snap.optLong("networkReplays")).append(" 次请求 / ").append(snap.optLong("networkBytes")).append(" Bytes\n")
+                sb.append("估算电池消耗: ~").append(snap.optDouble("estimatedMah")).append(" mAh | 设备电量快照: ").append(batStr).append('\n')
+                sb.append("\n--- 最近能耗事件日志 (").append(logsSnapshot.size).append(") ---\n")
+            } else {
+                sb.append("=== Gemini-Eye Energy Impact Statistics Report ===\n")
+                sb.append("Generated: ").append(formatTimestampMs(System.currentTimeMillis())).append('\n')
+                sb.append("Session: ").append(sess).append(" | ForegroundActive: ").append(isForegroundActive.get()).append('\n')
+                sb.append("Energy Rating: ").append(snap.optString("rating")).append(" (Score=").append(snap.optDouble("energyScore")).append(")\n")
+                sb.append("BG Wakeups: 0 (1ns Gate Suppressed: ").append(snap.optLong("bgSuppressed")).append(") | Pool Active/Size: ")
+                    .append(snap.optInt("poolActive")).append('/').append(snap.optInt("poolSize")).append(" threads\n")
+                sb.append("FG On-Demand Dispatches: ").append(snap.optLong("fgDispatches")).append(" | Hook Events: ").append(snap.optLong("hookEvents")).append('\n')
+                sb.append("Cumulative CPU / Wall Time: ").append(snap.optDouble("cpuMs")).append(" ms / ").append(snap.optDouble("wallMs")).append(" ms\n")
+                sb.append("Network Replays / Transferred: ").append(snap.optLong("networkReplays")).append(" reqs / ").append(snap.optLong("networkBytes")).append(" Bytes\n")
+                sb.append("Estimated Battery Draw: ~").append(snap.optDouble("estimatedMah")).append(" mAh | Device Battery: ").append(batStr).append('\n')
+                sb.append("\n--- Recent Energy Impact Logs (").append(logsSnapshot.size).append(") ---\n")
+            }
+            if (logsSnapshot.isEmpty()) {
+                sb.append(if (zh) "  (当前暂无后台休眠或阈值里程碑日志；数据已在内存中实时累加)\n" else "  (No milestone logs flushed yet; live counters above are up-to-date)\n")
+            } else {
+                for (l in logsSnapshot.asReversed()) {
+                    sb.append("  ").append(l).append('\n')
+                }
+            }
+            return sb.toString().trim()
+        }
+    }
+
+    private fun recordUserQueryInRollingWindow(now: Long, sessionTag: String = activeSessionTag.get()) {
         try {
-            synchronized(rollingQueryTimestamps) {
+            val list = rollingQueryTimestampsBySession.getOrPut(sessionTag) {
+                Collections.synchronizedList(ArrayList<Long>(32))
+            }
+            synchronized(list) {
                 val cutoff = now - 5L * 3600L * 1000L
-                val it = rollingQueryTimestamps.iterator()
+                val it = list.iterator()
                 while (it.hasNext()) {
                     if (it.next() < cutoff) it.remove()
                 }
-                rollingQueryTimestamps.add(now)
+                list.add(now)
             }
         } catch (_: Throwable) {
         }
@@ -592,11 +833,37 @@ object QuotaCoreEngine {
     // =========================================================================
 
     private fun submitForegroundWork(block: () -> Unit) {
-        if (!isForegroundActive.get()) return
+        if (!isForegroundActive.get()) {
+            EnergyImpactMonitor.recordBgGateSkip()
+            return
+        }
         try {
             onDemandExecutor.execute {
-                if (!isForegroundActive.get()) return@execute
-                withReentrancyGuard(block)
+                if (!isForegroundActive.get()) {
+                    EnergyImpactMonitor.recordBgGateSkip()
+                    return@execute
+                }
+                val wallStart = SystemClock.elapsedRealtimeNanos()
+                val cpuStart = try {
+                    Debug.threadCpuTimeNanos()
+                } catch (_: Throwable) {
+                    -1L
+                }
+                try {
+                    withReentrancyGuard(block)
+                } finally {
+                    val wallDelta = maxOf(0L, SystemClock.elapsedRealtimeNanos() - wallStart)
+                    val cpuDelta = if (cpuStart >= 0L) {
+                        try {
+                            maxOf(0L, Debug.threadCpuTimeNanos() - cpuStart)
+                        } catch (_: Throwable) {
+                            wallDelta
+                        }
+                    } else {
+                        wallDelta
+                    }
+                    EnergyImpactMonitor.recordTaskExecution(wallDelta, cpuDelta)
+                }
             }
         } catch (_: Throwable) {
         }
@@ -713,6 +980,19 @@ object QuotaCoreEngine {
                     isForegroundActive.set(true)
                     inspectActivityAccountIntent(activity)
                     bindHooksForClassLoader(activity.classLoader, bridge)
+                }
+            }
+        )
+
+        hookMethodSafe(
+            bridge = bridge,
+            clazz = Activity::class.java,
+            name = "onNewIntent",
+            paramTypes = arrayOf(Intent::class.java),
+            after = cb@{ thisObj, args, _ ->
+                val activity = thisObj as? Activity ?: return@cb
+                if (shouldDisplayHudInActivity(activity)) {
+                    inspectActivityAccountIntent(activity, args.firstOrNull() as? Intent)
                 }
             }
         )
@@ -1005,6 +1285,8 @@ object QuotaCoreEngine {
         activeActivityRef.set(WeakReference(null))
 
         clearTransientBuffers()
+        val sleepSess = activeSessionTag.get()
+        EnergyImpactMonitor.appendMilestoneLog("BG_SLEEP", sleepSess, emitToProvider = ctx != null)
         safeLog(activeBridgeRef.get(), "Entered zero-background sleep (0 active threads / HUD detached)")
     }
 
@@ -1039,7 +1321,20 @@ object QuotaCoreEngine {
                 cachedXsrfToken = null
                 cachedFsidToken = null
                 cachedBuildLabel = null
+                confirmedIdentityKey = null
+                confirmedIdentityStrength = IdentityStrength.NONE
+                confirmedCookieKey = null
+                confirmedAccountKey = null
+                confirmedAuthUserIdx = null
+                confirmedBearerPrimaryKey = null
+                confirmedIntentKey = null
+                allowCookieManagerFallback = true
                 perHostAuthorizations.clear()
+                tokenToAccountKey.clear()
+                learnedGrpcTargets.clear()
+                synchronized(sessionCredentialsLock) {
+                    perSessionCredentials.clear()
+                }
                 val cur = activeDynamicSession.get()
                 activeDynamicSession.set(
                     ActiveDynamicSessionState(
@@ -1202,34 +1497,99 @@ object QuotaCoreEngine {
     private data class ComputedIdentity(
         val sessionTag: String,
         val strength: IdentityStrength,
-        val canonicalKey: String
+        val canonicalKey: String,
+        val authUserIdx: String? = null
     )
 
+    private fun normalizeAuthUser(raw: String?): String? {
+        val clean = raw?.trim() ?: return null
+        if (clean.isEmpty() || clean.length > 3) return null
+        for (ch in clean) {
+            if (!ch.isDigit()) return null
+        }
+        return clean.toIntOrNull()?.takeIf { it in 0..50 }?.toString()
+    }
+
+    private fun extractAuthUserFromUrl(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        val uMatch = Regex("""/u/(\d{1,2})(?:/|\?|$)""").find(url)
+        if (uMatch != null) {
+            return normalizeAuthUser(uMatch.groupValues.getOrNull(1))
+        }
+        val qMatch = Regex("""[?&]authuser=(\d{1,2})(?:&|$)""", RegexOption.IGNORE_CASE).find(url)
+        return qMatch?.groupValues?.getOrNull(1)?.let { normalizeAuthUser(it) }
+    }
+
+    private fun isPrimaryGeminiApiHost(hostOrUrl: String?): Boolean {
+        val host = extractHostKey(hostOrUrl) ?: return false
+        return host == "gemini.google.com" ||
+            host == "bard.google.com" ||
+            host == "robinandroid-pa.googleapis.com" ||
+            host == "assistant-s3.pa.googleapis.com" ||
+            (host.contains("robin") && host.endsWith(".googleapis.com")) ||
+            (host == "grpc" && (hostOrUrl?.contains("robin", ignoreCase = true) == true ||
+                hostOrUrl?.contains("bard", ignoreCase = true) == true))
+    }
+
+    private fun extractBearerBody(authorization: String?): String? {
+        val clean = authorization?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return when {
+            clean.startsWith("Bearer ", ignoreCase = true) -> clean.substring(7).trim()
+            else -> clean
+        }.takeIf { it.length >= 12 }
+    }
+
     private fun computeIdentityDescriptor(
+        url: String?,
         authorization: String?,
         cookie: String?,
         authUser: String?,
         @Suppress("UNUSED_PARAMETER") pageId: String?
     ): ComputedIdentity? {
-        // Anchor ONLY on the single highest-priority stable cookie token (`__Secure-1PSID` > etc.)
-        // and omit optional per-endpoint `X-Goog-PageId` so different Google subdomains on the
-        // same account never produce different session hashes and falsely wipe quota to "--".
+        // Incorporate Google multi-login `X-Goog-AuthUser` / `/u/<idx>/` into cookie identity so
+        // accounts sharing the root `__Secure-1PSID` cookie still map to distinct `sessionTag`s,
+        // and resolve native `GoogleAuthUtil` / `AccountManager` / primary-host OAuth tokens cleanly.
         val stableCookieToken = extractStableGoogleSessionCookie(cookie)
-        val cleanAuthUser = authUser?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanBearer = authorization?.trim()?.takeIf { it.isNotEmpty() }
+        val explicitAuthUser = normalizeAuthUser(authUser) ?: extractAuthUserFromUrl(url)
+        val cleanBearer = extractBearerBody(authorization)
+        val mappedAccountKey = cleanBearer?.let { tokenToAccountKey[sha256Short(it)] }
 
         return when {
             stableCookieToken != null -> {
-                val key = "cookie:$stableCookieToken"
-                ComputedIdentity(sha256SessionTag(key), IdentityStrength.COOKIE_SID, key)
+                val keepPrevIdx = if (explicitAuthUser == null &&
+                    confirmedAuthUserIdx != null &&
+                    confirmedCookieKey?.startsWith("cookie:$stableCookieToken") == true
+                ) {
+                    confirmedAuthUserIdx
+                } else {
+                    null
+                }
+                val resolvedIdx = explicitAuthUser ?: keepPrevIdx ?: "0"
+                val key = if (resolvedIdx != "0") {
+                    "cookie:$stableCookieToken:u$resolvedIdx"
+                } else {
+                    "cookie:$stableCookieToken"
+                }
+                ComputedIdentity(sha256SessionTag(key), IdentityStrength.COOKIE_SID, key, resolvedIdx)
             }
-            cleanAuthUser != null -> {
-                val key = "authuser:$cleanAuthUser"
-                ComputedIdentity(sha256SessionTag(key), IdentityStrength.AUTH_USER, key)
+            mappedAccountKey != null -> {
+                ComputedIdentity(
+                    sessionTag = sha256SessionTag(mappedAccountKey),
+                    strength = IdentityStrength.GOOGLE_ACCOUNT,
+                    canonicalKey = mappedAccountKey,
+                    authUserIdx = explicitAuthUser
+                )
+            }
+            explicitAuthUser != null -> {
+                val key = "authuser:$explicitAuthUser"
+                ComputedIdentity(sha256SessionTag(key), IdentityStrength.AUTH_USER, key, explicitAuthUser)
+            }
+            cleanBearer != null && isPrimaryGeminiApiHost(url) -> {
+                val key = "bearer_primary:${sha256Short(cleanBearer)}"
+                ComputedIdentity(sha256SessionTag(key), IdentityStrength.BEARER_PRIMARY, key)
             }
             cleanBearer != null -> {
-                // OAuth2 Bearer tokens vary per API scope on the SAME Google account and rotate hourly;
-                // never treat different Bearer strings on the same account as an account switch!
+                // Non-primary Google APIs use per-scope Bearer tokens; do not churn on auxiliary telemetry scopes.
                 val key = "bearer:active"
                 ComputedIdentity(sha256SessionTag(key), IdentityStrength.BEARER_ONLY, key)
             }
@@ -1275,13 +1635,37 @@ object QuotaCoreEngine {
         return fallback
     }
 
+    private fun saveCredentialsForSessionLocked(sessionTag: String, dyn: ActiveDynamicSessionState) {
+        if (sessionTag.isBlank() || sessionTag == DEFAULT_SESSION_TAG) return
+        val existing = perSessionCredentials[sessionTag] ?: SessionCredentials()
+        existing.authorizationHeader = dyn.authorizationHeader ?: existing.authorizationHeader
+        existing.cookieHeader = mergeCookieStrings(existing.cookieHeader, dyn.cookieHeader)
+        existing.authUserHeader = dyn.authUserHeader ?: existing.authUserHeader
+        existing.xsrfToken = cachedXsrfToken ?: existing.xsrfToken
+        existing.fsidToken = cachedFsidToken ?: existing.fsidToken
+        existing.buildLabel = cachedBuildLabel ?: existing.buildLabel
+        existing.allowCookieManagerFallback = allowCookieManagerFallback
+        existing.perHostAuthorizations.clear()
+        existing.perHostAuthorizations.putAll(perHostAuthorizations)
+        existing.updatedAtMs = System.currentTimeMillis()
+        perSessionCredentials[sessionTag] = existing
+    }
+
     private fun onDynamicHeadersIntercepted(
         headers: EphemeralSessionHeaders,
         transport: String
     ): String {
         if (isNonQuotaTelemetryUrl(headers.url)) return activeSessionTag.get()
 
+        // Ignore passive WebView CookieManager callbacks when we explicitly switched to a native OAuth/Intent
+        // account and haven't captured a matching cookie for that new account yet (prevents old WebView cookies
+        // from dragging the active HUD session back to the previous Google account).
+        if ((transport == "WebView" || transport == "CookieMgr") && !allowCookieManagerFallback) {
+            return activeSessionTag.get()
+        }
+
         val computed = computeIdentityDescriptor(
+            url = headers.url,
             authorization = headers.authorization,
             cookie = headers.cookie,
             authUser = headers.authUser,
@@ -1290,86 +1674,181 @@ object QuotaCoreEngine {
 
         val prevDyn = activeDynamicSession.get()
         val now = System.currentTimeMillis()
+        val curTag = activeSessionTag.get()
         val hadNoCredentialsBefore = prevDyn.cookieHeader.isNullOrBlank() && prevDyn.authorizationHeader.isNullOrBlank()
         val gainedNewCookie = prevDyn.cookieHeader.isNullOrBlank() && !headers.cookie.isNullOrBlank()
 
         val prevStrongKey = confirmedIdentityKey
         val prevStrongStrength = confirmedIdentityStrength
+        val explicitIncomingIdx = normalizeAuthUser(headers.authUser) ?: extractAuthUserFromUrl(headers.url)
 
-        // Only treat as a genuine Google account switch when the SAME anchor key type changes value
-        // (e.g., two different `__Secure-1PSID` values or two different `X-Goog-AuthUser` indices).
-        val prevAnchor = extractAnchorCookieName(prevStrongKey)
+        val prevAnchor = extractAnchorCookieName(confirmedCookieKey ?: prevStrongKey)
         val nextAnchor = extractAnchorCookieName(computed.canonicalKey)
         val sameCookieAnchorType = prevAnchor != null && prevAnchor == nextAnchor
 
+        val effectivePrevIdx = confirmedAuthUserIdx ?: if (prevStrongStrength == IdentityStrength.COOKIE_SID) "0" else null
+        val authUserChanged = explicitIncomingIdx != null &&
+            effectivePrevIdx != null &&
+            explicitIncomingIdx != effectivePrevIdx &&
+            (prevStrongStrength >= IdentityStrength.INTENT || confirmedAuthUserIdx != null)
+
         val isGenuineAccountSwitch = when {
             computed.strength == IdentityStrength.COOKIE_SID &&
-                prevStrongStrength == IdentityStrength.COOKIE_SID &&
-                prevStrongKey != null &&
+                confirmedCookieKey != null &&
                 sameCookieAnchorType &&
-                prevStrongKey != computed.canonicalKey -> true
-            computed.strength == IdentityStrength.AUTH_USER &&
-                prevStrongStrength == IdentityStrength.AUTH_USER &&
-                prevStrongKey != null &&
-                prevStrongKey != computed.canonicalKey -> true
+                confirmedCookieKey != computed.canonicalKey -> true
+            computed.strength == IdentityStrength.GOOGLE_ACCOUNT &&
+                confirmedAccountKey != null &&
+                confirmedAccountKey != computed.canonicalKey -> true
+            authUserChanged -> true
+            computed.strength == IdentityStrength.BEARER_PRIMARY &&
+                confirmedBearerPrimaryKey != null &&
+                confirmedBearerPrimaryKey != computed.canonicalKey &&
+                prevStrongStrength <= IdentityStrength.INTENT -> true
             else -> false
         }
 
-        if (isGenuineAccountSwitch) {
-            perHostAuthorizations.clear()
-        }
-
-        var gainedNewHostAuth = false
-        val incomingAuth = headers.authorization?.trim()?.takeIf { it.isNotEmpty() }
-        val hostKey = extractHostKey(headers.url)
-        if (incomingAuth != null && hostKey != null) {
-            if (perHostAuthorizations.size > 24 && !perHostAuthorizations.containsKey(hostKey)) {
-                perHostAuthorizations.clear()
-            }
-            val prevHostAuth = perHostAuthorizations.put(hostKey, incomingAuth)
-            if (prevHostAuth == null) gainedNewHostAuth = true
-        }
-
-        // Preserve existing complementary credentials (e.g. Cookie from Web/Cronet + Bearer from gRPC) on SAME account
-        val mergedAuth = headers.authorization ?: if (isGenuineAccountSwitch) null else prevDyn.authorizationHeader
-        val mergedCookie = mergeCookieStrings(
-            if (isGenuineAccountSwitch) null else prevDyn.cookieHeader,
-            headers.cookie
-        )
-        val mergedAuthUser = headers.authUser ?: if (isGenuineAccountSwitch) null else prevDyn.authUserHeader
-
-        // Decide which sessionTag stays active without churning on weak Bearer/AuthUser emissions
+        // Decide which sessionTag stays active without churning on weak auxiliary Bearer emissions
         val targetTag: String = when {
             isGenuineAccountSwitch -> {
                 confirmedIdentityKey = computed.canonicalKey
                 confirmedIdentityStrength = computed.strength
-                computed.sessionTag
-            }
-            computed.strength == IdentityStrength.COOKIE_SID -> {
-                confirmedIdentityKey = computed.canonicalKey
-                confirmedIdentityStrength = IdentityStrength.COOKIE_SID
-                computed.sessionTag
-            }
-            prevStrongStrength >= IdentityStrength.INTENT -> {
-                // Keep confirmed Cookie / Intent account tag even when per-scope Bearer or AuthUser arrives
-                activeSessionTag.get()
-            }
-            persistedSessionWasStrong && activeSessionTag.get() != DEFAULT_SESSION_TAG -> {
-                // Keep yesterday's confirmed session tag until a COOKIE_SID confirms whether it matches or switched
-                activeSessionTag.get()
-            }
-            computed.strength >= prevStrongStrength -> {
-                if (computed.strength >= IdentityStrength.AUTH_USER) {
-                    confirmedIdentityKey = computed.canonicalKey
-                    confirmedIdentityStrength = computed.strength
+                when (computed.strength) {
+                    IdentityStrength.COOKIE_SID -> {
+                        confirmedCookieKey = computed.canonicalKey
+                        confirmedAuthUserIdx = computed.authUserIdx ?: "0"
+                        confirmedAccountKey = null
+                        confirmedBearerPrimaryKey = null
+                    }
+                    IdentityStrength.GOOGLE_ACCOUNT -> {
+                        confirmedAccountKey = computed.canonicalKey
+                        confirmedCookieKey = null
+                        confirmedBearerPrimaryKey = null
+                        if (computed.authUserIdx != null) confirmedAuthUserIdx = computed.authUserIdx
+                    }
+                    IdentityStrength.AUTH_USER -> {
+                        confirmedAuthUserIdx = computed.authUserIdx
+                        if (!sameCookieAnchorType) confirmedCookieKey = null
+                        confirmedAccountKey = null
+                        confirmedBearerPrimaryKey = null
+                    }
+                    IdentityStrength.BEARER_PRIMARY -> {
+                        confirmedBearerPrimaryKey = computed.canonicalKey
+                        confirmedCookieKey = null
+                        confirmedAccountKey = null
+                    }
+                    else -> {}
                 }
                 computed.sessionTag
             }
-            else -> activeSessionTag.get()
+            computed.strength == IdentityStrength.COOKIE_SID -> {
+                val allowCookieTakeover = confirmedAccountKey == null ||
+                    (transport != "WebView" && transport != "CookieMgr")
+                if (allowCookieTakeover) {
+                    confirmedIdentityKey = computed.canonicalKey
+                    confirmedIdentityStrength = IdentityStrength.COOKIE_SID
+                    confirmedCookieKey = computed.canonicalKey
+                    confirmedAuthUserIdx = computed.authUserIdx ?: "0"
+                    computed.sessionTag
+                } else {
+                    curTag
+                }
+            }
+            computed.strength == IdentityStrength.GOOGLE_ACCOUNT -> {
+                confirmedIdentityKey = computed.canonicalKey
+                confirmedIdentityStrength = IdentityStrength.GOOGLE_ACCOUNT
+                confirmedAccountKey = computed.canonicalKey
+                if (computed.authUserIdx != null) confirmedAuthUserIdx = computed.authUserIdx
+                computed.sessionTag
+            }
+            prevStrongStrength >= IdentityStrength.INTENT -> {
+                // Keep confirmed Cookie / GoogleAccount / AuthUser / Intent session even when per-scope auxiliary Bearer arrives
+                curTag
+            }
+            persistedSessionWasStrong && curTag != DEFAULT_SESSION_TAG -> {
+                // Keep yesterday's confirmed session tag until a strong signal confirms whether it matches or switched
+                curTag
+            }
+            computed.strength >= prevStrongStrength -> {
+                when (computed.strength) {
+                    IdentityStrength.AUTH_USER -> {
+                        confirmedIdentityKey = computed.canonicalKey
+                        confirmedIdentityStrength = computed.strength
+                        confirmedAuthUserIdx = computed.authUserIdx
+                    }
+                    IdentityStrength.BEARER_PRIMARY -> {
+                        confirmedIdentityKey = computed.canonicalKey
+                        confirmedIdentityStrength = computed.strength
+                        confirmedBearerPrimaryKey = computed.canonicalKey
+                    }
+                    else -> {}
+                }
+                computed.sessionTag
+            }
+            else -> curTag
         }
 
-        activeDynamicSession.set(
-            ActiveDynamicSessionState(
+        val incomingAuth = headers.authorization?.trim()?.takeIf { it.isNotEmpty() }
+        val hostKey = extractHostKey(headers.url)
+        val tagChanged = targetTag != curTag
+        var gainedNewHostAuth = false
+
+        val canUseCookiesFromFallback = computed.strength == IdentityStrength.COOKIE_SID ||
+            (explicitIncomingIdx != null && explicitIncomingIdx != "0") ||
+            (!isGenuineAccountSwitch && allowCookieManagerFallback)
+
+        if (isGenuineAccountSwitch) {
+            allowCookieManagerFallback = canUseCookiesFromFallback
+            // Persist outgoing session credentials before swapping
+            synchronized(sessionCredentialsLock) {
+                saveCredentialsForSessionLocked(curTag, prevDyn)
+                val restoredCreds = perSessionCredentials[targetTag]
+                perHostAuthorizations.clear()
+                if (restoredCreds != null) {
+                    perHostAuthorizations.putAll(restoredCreds.perHostAuthorizations)
+                }
+                if (incomingAuth != null && hostKey != null) {
+                    val prevHostAuth = perHostAuthorizations.put(hostKey, incomingAuth)
+                    if (prevHostAuth == null || prevHostAuth != incomingAuth) gainedNewHostAuth = true
+                }
+                val newCreds = restoredCreds ?: SessionCredentials(allowCookieManagerFallback = allowCookieManagerFallback)
+                newCreds.authorizationHeader = incomingAuth ?: newCreds.authorizationHeader
+                newCreds.cookieHeader = mergeCookieStrings(newCreds.cookieHeader, headers.cookie)
+                newCreds.authUserHeader = explicitIncomingIdx ?: headers.authUser ?: newCreds.authUserHeader
+                newCreds.allowCookieManagerFallback = allowCookieManagerFallback
+                newCreds.updatedAtMs = now
+                perSessionCredentials[targetTag] = newCreds
+
+                activeDynamicSession.set(
+                    ActiveDynamicSessionState(
+                        sessionTag = targetTag,
+                        authorizationHeader = newCreds.authorizationHeader,
+                        cookieHeader = newCreds.cookieHeader,
+                        authUserHeader = newCreds.authUserHeader,
+                        transport = transport,
+                        updatedAtMs = now
+                    )
+                )
+            }
+        } else {
+            if (incomingAuth != null && hostKey != null) {
+                if (perHostAuthorizations.size > 24 && !perHostAuthorizations.containsKey(hostKey)) {
+                    perHostAuthorizations.clear()
+                }
+                val prevHostAuth = perHostAuthorizations.put(hostKey, incomingAuth)
+                if (prevHostAuth == null || prevHostAuth != incomingAuth) gainedNewHostAuth = true
+            }
+
+            if (computed.strength == IdentityStrength.COOKIE_SID || !headers.cookie.isNullOrBlank()) {
+                allowCookieManagerFallback = true
+            }
+
+            // Preserve existing complementary credentials (e.g. Cookie from Web/Cronet + Bearer from gRPC) on SAME account
+            val mergedAuth = incomingAuth ?: prevDyn.authorizationHeader
+            val mergedCookie = mergeCookieStrings(prevDyn.cookieHeader, headers.cookie)
+            val mergedAuthUser = explicitIncomingIdx ?: headers.authUser ?: prevDyn.authUserHeader
+
+            val updatedDyn = ActiveDynamicSessionState(
                 sessionTag = targetTag,
                 authorizationHeader = mergedAuth,
                 cookieHeader = mergedCookie,
@@ -1377,15 +1856,19 @@ object QuotaCoreEngine {
                 transport = transport,
                 updatedAtMs = now
             )
-        )
+            activeDynamicSession.set(updatedDyn)
+            synchronized(sessionCredentialsLock) {
+                saveCredentialsForSessionLocked(targetTag, updatedDyn)
+            }
+        }
 
-        val tagChanged = targetTag != activeSessionTag.get()
         if (tagChanged) {
             activateSessionTag(
                 newTag = targetTag,
                 sourceReason = "$transport-Header",
                 preserveUnconfirmedSnapshot = !isGenuineAccountSwitch &&
-                    (!persistedSessionWasStrong || prevStrongStrength < IdentityStrength.COOKIE_SID)
+                    (!persistedSessionWasStrong || prevStrongStrength < IdentityStrength.INTENT),
+                alreadySwappedCredentials = isGenuineAccountSwitch
             )
         } else if ((hadNoCredentialsBefore || gainedNewCookie || gainedNewHostAuth || !hasCompletedLiveFetchThisWake.get()) && isForegroundActive.get()) {
             val curSnap = latestSnapshot.get().sanitized()
@@ -1426,6 +1909,22 @@ object QuotaCoreEngine {
         return null
     }
 
+    private fun sha256Short(material: String): String {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(material.toByteArray(StandardCharsets.UTF_8))
+            val sb = StringBuilder(16)
+            for (i in 0 until 8) {
+                val b = digest[i].toInt() and 0xFF
+                if (b < 0x10) sb.append('0')
+                sb.append(Integer.toHexString(b))
+            }
+            sb.toString()
+        } catch (_: Throwable) {
+            Integer.toHexString(material.hashCode())
+        }
+    }
+
     private fun sha256SessionTag(material: String): String {
         return try {
             val digest = MessageDigest.getInstance("SHA-256")
@@ -1442,9 +1941,9 @@ object QuotaCoreEngine {
         }
     }
 
-    private fun inspectActivityAccountIntent(activity: Activity) {
+    private fun inspectActivityAccountIntent(activity: Activity, overrideIntent: Intent? = null) {
         try {
-            val extras = activity.intent?.extras ?: return
+            val extras = (overrideIntent ?: activity.intent)?.extras ?: return
             val candidateKeys = arrayOf(
                 "authAccount",
                 "account_name",
@@ -1457,31 +1956,78 @@ object QuotaCoreEngine {
                 @Suppress("DEPRECATION")
                 val raw = extras.get(key)?.toString()?.trim()
                 if (!raw.isNullOrEmpty() && raw != "-1") {
-                    val intentCanon = "intent_acct:$key:$raw"
+                    val normRaw = if (raw.contains('@')) raw.lowercase() else raw
+                    val isEmail = raw.contains('@')
+                    val intentCanon = if (isEmail) {
+                        "account:${sha256Short(normRaw)}"
+                    } else {
+                        "intent_acct:$key:${sha256Short(normRaw)}"
+                    }
                     val intentTag = sha256SessionTag(intentCanon)
-                    val prevKey = confirmedIdentityKey
-                    val isDifferentConfirmedIntent = confirmedIdentityStrength == IdentityStrength.INTENT &&
-                        prevKey != null &&
-                        prevKey != intentCanon
+                    val prevIntent = confirmedIntentKey
+                    val prevAcct = confirmedAccountKey
 
-                    if (confirmedIdentityStrength < IdentityStrength.COOKIE_SID &&
-                        (confirmedIdentityStrength < IdentityStrength.INTENT || isDifferentConfirmedIntent)
-                    ) {
+                    val isExplicitNewAccount = (isEmail && prevAcct != null && prevAcct != intentCanon) ||
+                        (!isEmail && prevIntent != null && prevIntent != intentCanon) ||
+                        (isEmail && confirmedIdentityStrength >= IdentityStrength.INTENT && prevAcct == null && activeSessionTag.get() != intentTag && confirmedIdentityStrength != IdentityStrength.COOKIE_SID)
+
+                    val shouldApply = isExplicitNewAccount ||
+                        (confirmedIdentityStrength < IdentityStrength.INTENT) ||
+                        (confirmedIdentityStrength == IdentityStrength.INTENT && prevIntent != intentCanon)
+
+                    if (shouldApply) {
+                        val isSwitchAwayFromConfirmed = isExplicitNewAccount ||
+                            (confirmedIdentityStrength >= IdentityStrength.INTENT && activeSessionTag.get() != DEFAULT_SESSION_TAG && activeSessionTag.get() != intentTag)
                         confirmedIdentityKey = intentCanon
-                        confirmedIdentityStrength = IdentityStrength.INTENT
-                        val curDyn = activeDynamicSession.get()
-                        activeDynamicSession.set(
-                            curDyn.copy(
-                                sessionTag = intentTag,
-                                transport = "ActivityIntent",
-                                updatedAtMs = System.currentTimeMillis()
+                        confirmedIdentityStrength = if (isEmail) IdentityStrength.GOOGLE_ACCOUNT else IdentityStrength.INTENT
+                        confirmedIntentKey = intentCanon
+                        if (isEmail) {
+                            confirmedAccountKey = intentCanon
+                        }
+                        if (isSwitchAwayFromConfirmed) {
+                            confirmedCookieKey = null
+                            confirmedAuthUserIdx = null
+                            confirmedBearerPrimaryKey = null
+                            allowCookieManagerFallback = false
+                        }
+                        val curTag = activeSessionTag.get()
+                        if (curTag != intentTag) {
+                            val prevDyn = activeDynamicSession.get()
+                            synchronized(sessionCredentialsLock) {
+                                if (isSwitchAwayFromConfirmed) {
+                                    saveCredentialsForSessionLocked(curTag, prevDyn)
+                                    val restored = perSessionCredentials[intentTag]
+                                    perHostAuthorizations.clear()
+                                    if (restored != null) {
+                                        perHostAuthorizations.putAll(restored.perHostAuthorizations)
+                                    }
+                                    activeDynamicSession.set(
+                                        ActiveDynamicSessionState(
+                                            sessionTag = intentTag,
+                                            authorizationHeader = restored?.authorizationHeader,
+                                            cookieHeader = restored?.cookieHeader,
+                                            authUserHeader = restored?.authUserHeader,
+                                            transport = "ActivityIntent",
+                                            updatedAtMs = System.currentTimeMillis()
+                                        )
+                                    )
+                                } else {
+                                    activeDynamicSession.set(
+                                        prevDyn.copy(
+                                            sessionTag = intentTag,
+                                            transport = "ActivityIntent",
+                                            updatedAtMs = System.currentTimeMillis()
+                                        )
+                                    )
+                                }
+                            }
+                            activateSessionTag(
+                                newTag = intentTag,
+                                sourceReason = "ActivityAccount",
+                                preserveUnconfirmedSnapshot = !isSwitchAwayFromConfirmed,
+                                alreadySwappedCredentials = isSwitchAwayFromConfirmed
                             )
-                        )
-                        activateSessionTag(
-                            newTag = intentTag,
-                            sourceReason = "ActivityAccount",
-                            preserveUnconfirmedSnapshot = !isDifferentConfirmedIntent
-                        )
+                        }
                     }
                     break
                 }
@@ -1492,25 +2038,29 @@ object QuotaCoreEngine {
 
     /**
      * Switches the active session cleanly whenever a new Google account session is detected:
-     * 1. Archives outgoing account's `Snapshot` under `prevTag`.
-     * 2. Restores incoming account's `Snapshot` (if cached in memory) OR preserves live startup
-     *    data when promoting from an unconfirmed startup slot, OR resets cleanly to `--` ONLY
-     *    when switching between two confirmed distinct Google accounts.
-     * 3. Updates `QuotaHudView` & `QuotaSyncProvider` and triggers a foreground refresh.
+     * 1. Archives outgoing account's `Snapshot` and ephemeral credentials under `prevTag`.
+     * 2. Restores incoming account's `Snapshot` & ephemeral credentials (if cached in memory)
+     *    OR preserves live startup data when promoting from an unconfirmed startup slot,
+     *    OR resets cleanly to `--` ONLY when switching between two confirmed distinct Google accounts.
+     * 3. Updates `QuotaHudView` & `QuotaSyncProvider` and forces an active foreground refresh.
      */
     private fun activateSessionTag(
         newTag: String,
         sourceReason: String,
-        preserveUnconfirmedSnapshot: Boolean = false
+        preserveUnconfirmedSnapshot: Boolean = false,
+        alreadySwappedCredentials: Boolean = false
     ) {
         if (newTag.isBlank() || newTag == DEFAULT_SESSION_TAG) return
         val prevTag = activeSessionTag.get()
         if (prevTag == newTag) return
 
-        var isGenuineAccountSwap = false
+        var isAccountSwitch = false
+        var hasNoCachedSnapshot = false
         synchronized(sessionSnapshotsLock) {
             val curPrev = activeSessionTag.get()
             if (curPrev == newTag) return
+
+            isAccountSwitch = curPrev != DEFAULT_SESSION_TAG && !preserveUnconfirmedSnapshot
 
             val prevSnap = latestSnapshot.get().sanitized()
             if (curPrev != DEFAULT_SESSION_TAG && prevSnap.hasLiveData) {
@@ -1521,8 +2071,50 @@ object QuotaCoreEngine {
                 }
             }
 
+            if (!alreadySwappedCredentials) {
+                synchronized(sessionCredentialsLock) {
+                    val prevDyn = activeDynamicSession.get()
+                    if (isAccountSwitch) {
+                        saveCredentialsForSessionLocked(curPrev, prevDyn)
+                        val restored = perSessionCredentials[newTag]
+                        perHostAuthorizations.clear()
+                        if (restored != null) {
+                            perHostAuthorizations.putAll(restored.perHostAuthorizations)
+                            cachedXsrfToken = restored.xsrfToken
+                            cachedFsidToken = restored.fsidToken
+                            cachedBuildLabel = restored.buildLabel
+                            allowCookieManagerFallback = restored.allowCookieManagerFallback
+                        } else {
+                            cachedXsrfToken = null
+                            cachedFsidToken = null
+                            cachedBuildLabel = null
+                        }
+                        activeDynamicSession.set(
+                            ActiveDynamicSessionState(
+                                sessionTag = newTag,
+                                authorizationHeader = restored?.authorizationHeader,
+                                cookieHeader = restored?.cookieHeader,
+                                authUserHeader = restored?.authUserHeader,
+                                transport = prevDyn.transport,
+                                updatedAtMs = System.currentTimeMillis()
+                            )
+                        )
+                    } else {
+                        saveCredentialsForSessionLocked(newTag, prevDyn.copy(sessionTag = newTag))
+                        activeDynamicSession.set(prevDyn.copy(sessionTag = newTag))
+                    }
+                }
+            } else if (isAccountSwitch) {
+                synchronized(sessionCredentialsLock) {
+                    val restored = perSessionCredentials[newTag]
+                    cachedXsrfToken = restored?.xsrfToken
+                    cachedFsidToken = restored?.fsidToken
+                    cachedBuildLabel = restored?.buildLabel
+                }
+            }
+
             activeSessionTag.set(newTag)
-            if (confirmedIdentityStrength >= IdentityStrength.COOKIE_SID) {
+            if (confirmedIdentityStrength >= IdentityStrength.INTENT) {
                 persistedSessionWasStrong = true
             }
 
@@ -1538,17 +2130,14 @@ object QuotaCoreEngine {
                     prevSnap
                 }
                 else -> {
-                    isGenuineAccountSwap = true
+                    hasNoCachedSnapshot = true
                     QuotaHudView.Snapshot(source = "AccountSwitch")
                 }
             }
 
-            if (isGenuineAccountSwap) {
+            if (isAccountSwitch || hasNoCachedSnapshot) {
                 hasCompletedLiveFetchThisWake.set(false)
                 localStorageScannedThisWake.set(false)
-                cachedXsrfToken = null
-                cachedFsidToken = null
-                cachedBuildLabel = null
             }
 
             latestSnapshot.set(nextSnap)
@@ -1557,11 +2146,14 @@ object QuotaCoreEngine {
                 currentLang.get(),
                 currentTheme.get(),
                 newTag,
-                isStrongCookieTag = confirmedIdentityStrength >= IdentityStrength.COOKIE_SID
+                isStrongCookieTag = confirmedIdentityStrength >= IdentityStrength.INTENT
             )
         }
 
-        safeLog(activeBridgeRef.get(), "Dynamic account session active -> $newTag ($sourceReason, swap=$isGenuineAccountSwap)")
+        safeLog(
+            activeBridgeRef.get(),
+            "Dynamic account session active -> $newTag ($sourceReason, switch=$isAccountSwitch, emptySlot=$hasNoCachedSnapshot)"
+        )
 
         if (isForegroundActive.get()) {
             refreshHudOnUiThread()
@@ -1573,16 +2165,16 @@ object QuotaCoreEngine {
                         context = ctx,
                         snapshot = snapNow,
                         sessionId = newTag,
-                        replaceSession = isGenuineAccountSwap
+                        replaceSession = isAccountSwitch || hasNoCachedSnapshot
                     )
                     applyUnifiedState(state)
                 }
             }
-            if (isGenuineAccountSwap || !latestSnapshot.get().hasLiveData || !hasCompletedLiveFetchThisWake.get()) {
+            if (isAccountSwitch || hasNoCachedSnapshot || !latestSnapshot.get().hasLiveData || !hasCompletedLiveFetchThisWake.get()) {
                 lastHttpFetchMs.set(0L)
                 triggerLightweightQuotaRefresh(
-                    reason = if (isGenuineAccountSwap) RefreshReason.ACCOUNT_SWITCH else RefreshReason.APP_OPEN,
-                    delayMs = 180L,
+                    reason = if (isAccountSwitch || hasNoCachedSnapshot) RefreshReason.ACCOUNT_SWITCH else RefreshReason.APP_OPEN,
+                    delayMs = 150L,
                     bypassThrottle = true
                 )
             }
@@ -1596,7 +2188,7 @@ object QuotaCoreEngine {
     private fun onUserQueryDispatched(transport: String) {
         if (!isForegroundActive.get()) return
         val now = System.currentTimeMillis()
-        recordUserQueryInRollingWindow(now)
+        recordUserQueryInRollingWindow(now, activeSessionTag.get())
         if (now - lastQueryEventMs.get() < 2_000L) return
         lastQueryEventMs.set(now)
 
@@ -1648,6 +2240,7 @@ object QuotaCoreEngine {
             }
             hookStructuredJsonPayloads(bridge)
             installHttpUrlConnectionHeaderHooks(bridge)
+            installAccountSwitchHooks(null, bridge)
         }
 
         if (classLoader != null) {
@@ -1659,6 +2252,63 @@ object QuotaCoreEngine {
                 bindHooksForClassLoader(ctxCl, bridge)
             }
         } catch (_: Throwable) {
+        }
+    }
+
+    private fun recordTokenAccountMapping(
+        token: String,
+        accountName: String
+    ) {
+        val cleanAcct = accountName.trim().lowercase()
+        val cleanTok = extractBearerBody(token) ?: return
+        if (cleanAcct.isEmpty() || !cleanAcct.contains('@')) return
+        if (tokenToAccountKey.size >= 64) {
+            tokenToAccountKey.clear()
+        }
+        tokenToAccountKey[sha256Short(cleanTok)] = "account:${sha256Short(cleanAcct)}"
+    }
+
+    private fun installAccountSwitchHooks(cl: ClassLoader?, bridge: HookBridge) {
+        // Framework AccountManager (never obfuscated): correlate OAuth token -> Android Account email
+        val amCls = findClassSafe("android.accounts.AccountManager", cl) ?: AccountManager::class.java
+        if (markDynamicHookOnce("acct_mgr", amCls)) {
+            bridge.hookAllMethodsByName(
+                clazz = amCls,
+                methodName = "blockingGetAuthToken",
+                after = cb@{ _, args, result ->
+                    if (!isForegroundActive.get()) return@cb
+                    val token = result as? String ?: return@cb
+                    val acct = args.firstOrNull { it is Account } as? Account ?: return@cb
+                    if (acct.type == "com.google" || acct.name.contains('@')) {
+                        recordTokenAccountMapping(token, acct.name)
+                    }
+                }
+            )
+        }
+
+        // GoogleAuthUtil / GoogleAuthUtilLight: map Google OAuth2 Bearer tokens to exact Account email
+        val gauCandidates = arrayOf(
+            "com.google.android.gms.auth.GoogleAuthUtil",
+            "com.google.android.gms.auth.GoogleAuthUtilLight"
+        )
+        for (clsName in gauCandidates) {
+            val gauCls = findClassSafe(clsName, cl) ?: continue
+            if (!markDynamicHookOnce("gau", gauCls)) continue
+            for (mName in arrayOf("getToken", "getTokenWithNotification")) {
+                bridge.hookAllMethodsByName(
+                    clazz = gauCls,
+                    methodName = mName,
+                    after = cb@{ _, args, result ->
+                        if (!isForegroundActive.get()) return@cb
+                        val token = result as? String ?: return@cb
+                        val acctObj = args.firstOrNull { it is Account } as? Account
+                        val acctName = acctObj?.name?.takeIf { it.isNotBlank() }
+                            ?: (args.firstOrNull { it is String && (it as String).contains('@') } as? String)
+                            ?: return@cb
+                        recordTokenAccountMapping(token, acctName)
+                    }
+                )
+            }
         }
     }
 
@@ -1675,6 +2325,7 @@ object QuotaCoreEngine {
         installGrpcSessionAndStreamHooks(classLoader, bridge)
         installOkHttpSessionAndBodyHooks(classLoader, bridge)
         installReactiveStateHooksInClassLoader(classLoader, bridge)
+        installAccountSwitchHooks(classLoader, bridge)
     }
 
     // -------------------------------------------------------------------------
@@ -1954,6 +2605,8 @@ object QuotaCoreEngine {
                     )
                 }
                 pruneRequestMapsIfNeeded()
+                hookCronetReqCount.incrementAndGet()
+                EnergyImpactMonitor.recordHookEvent()
                 requestContextMap[System.identityHashCode(result)] = BoundRequestContext(
                     urlOrMethod = url,
                     httpMethod = httpMethod,
@@ -2124,7 +2777,7 @@ object QuotaCoreEngine {
             after = cb@{ thisObj, _, _ ->
                 if (!isForegroundActive.get() || thisObj == null) return@cb
                 val ctx = requestContextMap[System.identityHashCode(thisObj)]
-                if (ctx != null && ctx.isQueryCandidate) {
+                if (ctx != null && (ctx.isQueryCandidate || (ctx.httpMethod == "POST" && isPrimaryGeminiApiHost(ctx.urlOrMethod) && (ctx.bodyBytes?.size ?: 0) >= 24 && !ctx.isQuotaEndpointCandidate))) {
                     onUserQueryDispatched("Cronet")
                 }
             }
@@ -2160,10 +2813,41 @@ object QuotaCoreEngine {
 
         bridge.hookAllMethodsByName(
             clazz = callbackCls,
+            methodName = "onResponseStarted",
+            after = cb@{ _, args, _ ->
+                if (!isForegroundActive.get()) return@cb
+                val reqObj = args.getOrNull(0) ?: return@cb
+                val infoObj = args.getOrNull(1) ?: return@cb
+                val urlHint = requestContextMap[System.identityHashCode(reqObj)]?.urlOrMethod
+                    ?: extractCronetUrlSafe(infoObj)
+                if (urlHint != null && isStaticAssetUrl(urlHint)) return@cb
+                val statusCode = extractCronetStatusCodeSafe(infoObj)
+                val headersMap = extractCronetAllHeadersSafe(infoObj)
+                val sess = requestContextMap[System.identityHashCode(reqObj)]?.sessionTag ?: activeSessionTag.get()
+                if (!headersMap.isNullOrEmpty() || statusCode == 429) {
+                    val parsedHdr = QuotaTextParser.parseRateLimitHeaders(
+                        headers = headersMap,
+                        prev = getBaseSnapshotForSession(sess),
+                        source = "Cronet-Hdr",
+                        httpStatusCode = statusCode
+                    )
+                    if (parsedHdr != null) {
+                        hookCronetHeaderHitCount.incrementAndGet()
+                        publishSnapshotForSession(parsedHdr, sess)
+                    }
+                }
+            }
+        )
+
+        bridge.hookAllMethodsByName(
+            clazz = callbackCls,
             methodName = "onReadCompleted",
             before = cb@{ _, args ->
                 // Zero-Background Gate: 1ns exit if Gemini is not in foreground
-                if (!isForegroundActive.get()) return@cb
+                if (!isForegroundActive.get()) {
+                    EnergyImpactMonitor.recordBgGateSkip()
+                    return@cb
+                }
                 val reqObj = args.getOrNull(0) ?: return@cb
                 val infoObj = args.getOrNull(1)
                 val byteBuf = args.firstOrNull { it is ByteBuffer } as? ByteBuffer ?: return@cb
@@ -2174,6 +2858,8 @@ object QuotaCoreEngine {
                 if (urlHint != null && isStaticAssetUrl(urlHint)) return@cb
 
                 val copied = copyCronetOnReadDelta(byteBuf) ?: return@cb
+                hookCronetRespCount.incrementAndGet()
+                EnergyImpactMonitor.recordNetworkTransfer(copied.size.toLong(), isReplay = false)
                 val reqSession = boundCtx?.sessionTag ?: activeSessionTag.get()
                 submitCronetChunk(reqId, urlHint, reqSession, copied)
             }
@@ -2266,6 +2952,25 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun extractCronetStatusCodeSafe(infoObj: Any?): Int {
+        if (infoObj == null) return 200
+        return try {
+            (infoObj.javaClass.getMethod("getHttpStatusCode").invoke(infoObj) as? Int) ?: 200
+        } catch (_: Throwable) {
+            200
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun extractCronetAllHeadersSafe(infoObj: Any?): Map<String, List<String>>? {
+        if (infoObj == null) return null
+        return try {
+            infoObj.javaClass.getMethod("getAllHeaders").invoke(infoObj) as? Map<String, List<String>>
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun isGoogleApiHost(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
         return try {
@@ -2284,9 +2989,12 @@ object QuotaCoreEngine {
         if (urlOrMethod.isNullOrBlank()) return false
         val u = urlOrMethod.lowercase()
         return u.contains("streamgenerate") ||
+            u.contains("generateresponse") ||
+            u.contains("generatecontent") ||
             u.contains("assistant.lamda") ||
             u.contains("aratea") ||
-            u.contains("generativelanguage")
+            u.contains("generativelanguage") ||
+            (u.contains("robin") && (u.contains("chat") || u.contains("query") || u.contains("converse")))
     }
 
     /**
@@ -2856,6 +3564,8 @@ object QuotaCoreEngine {
                         bodyBytes = existingCtx?.bodyBytes
                     )
                     val listenerId = System.identityHashCode(listener)
+                    hookGrpcCallCount.incrementAndGet()
+                    EnergyImpactMonitor.recordHookEvent()
                     if (callId != 0) {
                         requestContextMap[callId] = updatedCtx
                         requestContextMap[listenerId] = updatedCtx
@@ -2906,7 +3616,12 @@ object QuotaCoreEngine {
                             bodyBytes = reqBytes
                         )
                         if (meta?.first?.get() != null && meta.second?.get() != null && updated.urlOrMethod != null) {
-                            learnedGrpcTargets[updated.urlOrMethod] = GrpcReplayTarget(
+                            val grpcKey = "${updated.sessionTag}|${updated.urlOrMethod}"
+                            if (learnedGrpcTargets.size > 16 && !learnedGrpcTargets.containsKey(grpcKey)) {
+                                learnedGrpcTargets.clear()
+                            }
+                            learnedGrpcTargets[grpcKey] = GrpcReplayTarget(
+                                sessionTag = updated.sessionTag,
                                 fullMethod = updated.urlOrMethod,
                                 channelRef = meta.first!!,
                                 methodDescRef = meta.second!!,
@@ -2963,6 +3678,7 @@ object QuotaCoreEngine {
             after = cb@{ thisObj, args, _ ->
                 if (!isForegroundActive.get()) return@cb
                 val msg = args.firstOrNull() ?: return@cb
+                hookGrpcMsgCount.incrementAndGet()
                 val listenerId = if (thisObj != null) System.identityHashCode(thisObj) else 0
                 val listenerCtx = if (listenerId != 0) requestContextMap[listenerId] else null
                 inspectGrpcResponseMessageAsync(
@@ -3003,7 +3719,9 @@ object QuotaCoreEngine {
         val meta = if (listenerId != 0) grpcCallMetaMap[listenerId] else null
         val chRef = meta?.first
         val mdRef = meta?.second
-        val prevTarget = learnedGrpcTargets[rpcHint]
+        val targetSess = ctx?.sessionTag?.takeIf { it.isNotBlank() } ?: activeSessionTag.get()
+        val grpcKey = "$targetSess|$rpcHint"
+        val prevTarget = learnedGrpcTargets[grpcKey]
         val resolvedBodyBytes = ctx?.bodyBytes ?: prevTarget?.requestBytes
         val authority = extractAuthorityFromChannelSafe(chRef?.get())
             ?: prevTarget?.authorityHost
@@ -3012,10 +3730,11 @@ object QuotaCoreEngine {
             }
 
         if (chRef?.get() != null && mdRef?.get() != null) {
-            if (learnedGrpcTargets.size > 8 && !learnedGrpcTargets.containsKey(rpcHint)) {
+            if (learnedGrpcTargets.size > 16 && !learnedGrpcTargets.containsKey(grpcKey)) {
                 learnedGrpcTargets.clear()
             }
-            learnedGrpcTargets[rpcHint] = GrpcReplayTarget(
+            learnedGrpcTargets[grpcKey] = GrpcReplayTarget(
+                sessionTag = targetSess,
                 fullMethod = rpcHint,
                 channelRef = chRef,
                 methodDescRef = mdRef,
@@ -3262,8 +3981,11 @@ object QuotaCoreEngine {
                 after = cb@{ thisObj, _, result ->
                     if (!isForegroundActive.get() || thisObj == null || result == null) return@cb
                     val ctx = extractOkHttpResponseContextSafe(thisObj) ?: return@cb
+                    hookOkHttpCount.incrementAndGet()
+                    EnergyImpactMonitor.recordHookEvent()
                     pruneRequestMapsIfNeeded()
                     requestContextMap[System.identityHashCode(result)] = ctx
+                    inspectOkHttpResponseHeadersForQuota(thisObj, ctx.sessionTag)
                 }
             )
         }
@@ -3480,6 +4202,33 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun inspectOkHttpResponseHeadersForQuota(respObj: Any, sessionTag: String) {
+        try {
+            val code = (respObj.javaClass.getMethod("code").invoke(respObj) as? Int) ?: 200
+            val headersObj = respObj.javaClass.getMethod("headers").invoke(respObj) ?: return
+            val size = (headersObj.javaClass.getMethod("size").invoke(headersObj) as? Int) ?: 0
+            if (size <= 0 && code != 429) return
+            val flat = HashMap<String, String>(minOf(size, 24))
+            val nameM = headersObj.javaClass.getMethod("name", Int::class.javaPrimitiveType)
+            val valM = headersObj.javaClass.getMethod("value", Int::class.javaPrimitiveType)
+            for (i in 0 until minOf(size, 32)) {
+                val k = (nameM.invoke(headersObj, i) as? String)?.trim()?.lowercase() ?: continue
+                val v = (valM.invoke(headersObj, i) as? String)?.trim() ?: continue
+                flat[k] = v
+            }
+            val snap = QuotaTextParser.parseFlatRateLimitHeaders(
+                flatHeaders = flat,
+                prev = getBaseSnapshotForSession(sessionTag),
+                source = "OkHttp-Hdr",
+                httpStatusCode = code
+            )
+            if (snap != null) {
+                publishSnapshotForSession(snap, sessionTag)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun hookStructuredJsonPayloads(bridge: HookBridge) {
         hookConstructorSafe(
             bridge = bridge,
@@ -3553,6 +4302,7 @@ object QuotaCoreEngine {
                         if (!isForegroundActive.get()) return@cb
                         val emitted = if (args.size >= 2) args[1] else args.firstOrNull()
                         if (emitted != null && isFastQuotaModelCandidate(emitted)) {
+                            hookStateFlowCount.incrementAndGet()
                             inspectStateEmissionAsync(emitted, "StateFlow")
                         }
                     }
@@ -3747,9 +4497,18 @@ object QuotaCoreEngine {
             if (dexRepoScanCompleted.compareAndSet(false, true)) {
                 appContext?.classLoader?.let { scanDexClassesForRepositoriesSafe(it) }
             }
-            scanLocalHostStorageForCachedQuota(sess)
-            runForegroundViewModelAndRepoScan(sess)
-            fetchActiveQuotaOverHttp(sess, reason)
+            if (reason == RefreshReason.ACCOUNT_SWITCH) {
+                // On account switches, fetch fresh network quota first; avoid reading unscoped disk DataStore/prefs
+                // from the previous account, and only fall back to ViewModel graph if live fetch yielded nothing.
+                fetchActiveQuotaOverHttp(sess, reason)
+                if (!hasCompletedLiveFetchThisWake.get()) {
+                    runForegroundViewModelAndRepoScan(sess)
+                }
+            } else {
+                scanLocalHostStorageForCachedQuota(sess)
+                runForegroundViewModelAndRepoScan(sess)
+                fetchActiveQuotaOverHttp(sess, reason)
+            }
         }
     }
 
@@ -3779,16 +4538,30 @@ object QuotaCoreEngine {
         }
         val grpcCount = learnedGrpcTargets.size
         val grpcSummary = StringBuilder()
-        for ((method, target) in learnedGrpcTargets) {
+        for ((_, target) in learnedGrpcTargets) {
             if (grpcSummary.isNotEmpty()) grpcSummary.append('\n')
             val (hex5b, desc5b) = describeGrpc5bFrameHeader(target.requestBytes)
-            grpcSummary.append("  • [gRPC-RPC] ${target.authorityHost ?: "grpc"}/$method\n")
+            grpcSummary.append("  • [gRPC-RPC · ${target.sessionTag}] ${target.authorityHost ?: "grpc"}/${target.fullMethod}\n")
             grpcSummary.append("    HTTP/2 TE: trailers | gRPC-RPC 5B帧头: $hex5b ($desc5b)")
         }
 
-        val sb = StringBuilder(1024)
+        val dyn = activeDynamicSession.get()
+        val authMode = when {
+            !dyn.cookieHeader.isNullOrBlank() && !dyn.authorizationHeader.isNullOrBlank() -> "Cookie+Bearer"
+            !dyn.cookieHeader.isNullOrBlank() -> "WebCookie"
+            !dyn.authorizationHeader.isNullOrBlank() || perHostAuthorizations.isNotEmpty() -> "BearerOnly(NativeAPK)"
+            else -> "None"
+        }
+
+        val sb = StringBuilder(1400)
         sb.append("[runForegroundFullProtocolDiagnostic · $reasonTag] Session=$sess\n")
+        sb.append("AuthMode=$authMode | FetchDiag=$lastFetchDiagSummary\n")
+        sb.append("HookHits: CronetReq=${hookCronetReqCount.get()}, CronetResp=${hookCronetRespCount.get()}(Hdr=${hookCronetHeaderHitCount.get()}), gRPCCall=${hookGrpcCallCount.get()}/Msg=${hookGrpcMsgCount.get()}, OkHttp=${hookOkHttpCount.get()}, WebView=${hookWebViewCount.get()}, StateFlow=${hookStateFlowCount.get()}\n")
         sb.append("CronetEngines=${synchronized(activeCronetEngines) { activeCronetEngines.size }}, LearnedEndpoints=$learnedCount, gRPCTargets=$grpcCount, CapturedOutbound=${traces.size}\n")
+        if (showEnergyImpactStatsInDialog) {
+            val es = EnergyImpactMonitor.computeSnapshot()
+            sb.append("EnergyImpact: rating=${es.optString("rating")}, cpu=${es.optDouble("cpuMs")}ms, fgTasks=${es.optLong("fgDispatches")}, bgWakeups=0(gated=${es.optLong("bgSuppressed")}), net=${es.optLong("networkReplays")}reqs/${es.optLong("networkBytes")}B, est=${es.optDouble("estimatedMah")}mAh\n")
+        }
         sb.append("--- 出站 HTTP/2 TE: trailers & gRPC-RPC 5B 帧头明细 ---\n")
         if (traces.isEmpty() && learnedSummary.isEmpty() && grpcSummary.isEmpty()) {
             sb.append("  (当前进程暂无出站 H2/gRPC 记录；正在强扫 DataStore/Repo/WebView 并主动探测)\n")
@@ -4644,6 +5417,7 @@ object QuotaCoreEngine {
         if (!isForegroundActive.get()) return
         val lower = rawUrl.lowercase()
         if (!isGoogleApiHost(rawUrl) || isNonQuotaTelemetryUrl(rawUrl)) return
+        hookWebViewCount.incrementAndGet()
 
         try {
             val wvCookie = CookieManager.getInstance().getCookie(rawUrl)
@@ -5062,23 +5836,61 @@ object QuotaCoreEngine {
         }
     }
 
+    private fun adaptUrlForAuthUser(rawUrl: String, authUser: String): String {
+        if (authUser.isBlank()) return rawUrl
+        val lower = rawUrl.lowercase()
+        if (!lower.contains("gemini.google.com") && !lower.contains("bard.google.com")) {
+            return rawUrl
+        }
+        val existingRegex = Regex("""(/u/)(\d+)(?=/|\?|$)""")
+        if (existingRegex.containsMatchIn(rawUrl)) {
+            return existingRegex.replace(rawUrl, "$1$authUser")
+        }
+        if (authUser == "0") return rawUrl
+        val pathTargets = arrayOf("/usage", "/app", "/_/BardChatUi")
+        for (targetPath in pathTargets) {
+            val idx = rawUrl.indexOf(targetPath)
+            if (idx > 0) {
+                return rawUrl.substring(0, idx) + "/u/" + authUser + rawUrl.substring(idx)
+            }
+        }
+        return rawUrl
+    }
+
     private fun fetchActiveQuotaOverHttp(sessionTag: String, reason: RefreshReason) {
         if (!isForegroundActive.get()) return
+        if (sessionTag != activeSessionTag.get()) return
         val now = System.currentTimeMillis()
         val isManual = reason == RefreshReason.MANUAL_TAP || reason == RefreshReason.ACCOUNT_SWITCH
         val minInterval = if (isManual) 2_000L else 10_000L
         if (now - lastHttpFetchMs.get() < minInterval) return
 
         val dynState = activeDynamicSession.get()
+        val sessionCreds = synchronized(sessionCredentialsLock) { perSessionCredentials[sessionTag] }
         val authHeader = dynState.authorizationHeader
-        val authUser = dynState.authUserHeader?.takeIf { it.isNotBlank() } ?: "0"
-        val cookieHeader = collectCookiesForGoogle(dynState.cookieHeader)
+            ?: sessionCreds?.authorizationHeader
+        val authUser = dynState.authUserHeader?.takeIf { it.isNotBlank() }
+            ?: sessionCreds?.authUserHeader?.takeIf { it.isNotBlank() }
+            ?: confirmedAuthUserIdx?.takeIf { it.isNotBlank() }
+            ?: "0"
+        val baseCookie = dynState.cookieHeader ?: sessionCreds?.cookieHeader
 
-        // If cookie gained via CookieManager confirms or upgrades session identity, sync it seamlessly
-        if (!cookieHeader.isNullOrBlank() && dynState.cookieHeader.isNullOrBlank()) {
+        val canQueryCookieManager = !baseCookie.isNullOrBlank() ||
+            authUser != "0" ||
+            (allowCookieManagerFallback &&
+                confirmedIdentityStrength != IdentityStrength.GOOGLE_ACCOUNT &&
+                confirmedIdentityStrength != IdentityStrength.INTENT)
+        val cookieHeader = if (canQueryCookieManager) {
+            collectCookiesForGoogle(baseCookie)
+        } else {
+            baseCookie
+        }
+
+        // Only allow CookieManager to promote identity when fallback is explicitly allowed for this session
+        if (!cookieHeader.isNullOrBlank() && baseCookie.isNullOrBlank() && canQueryCookieManager && allowCookieManagerFallback) {
             onDynamicHeadersIntercepted(
                 EphemeralSessionHeaders(
-                    url = "https://gemini.google.com/app",
+                    url = if (authUser != "0") "https://gemini.google.com/u/$authUser/app" else "https://gemini.google.com/app",
                     authorization = authHeader,
                     cookie = cookieHeader,
                     authUser = authUser
@@ -5090,6 +5902,7 @@ object QuotaCoreEngine {
         // If neither cookie nor OAuth Bearer token is available yet, apply rolling estimation if queries exist
         // WITHOUT poisoning lastHttpFetchMs so subsequent requests carrying real headers trigger immediately.
         if (cookieHeader.isNullOrBlank() && authHeader.isNullOrBlank() && perHostAuthorizations.isEmpty()) {
+            lastFetchDiagSummary = "NoAuth(cookie=0,bearer=0)"
             applySessionQueryEstimationIfNeeded(sessionTag)
             return
         }
@@ -5097,7 +5910,48 @@ object QuotaCoreEngine {
         lastHttpFetchMs.set(now)
 
         var fetchedSnapshot: QuotaHudView.Snapshot? = null
+        val diagTrail = StringBuilder()
         val mobileUa = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
+        // 0a. Active gRPC Target Direct Replay (supports Bearer-only native Gemini APK endpoints)
+        if (fetchedSnapshot == null && isForegroundActive.get() && sessionTag == activeSessionTag.get()) {
+            for ((_, grpcTarget) in learnedGrpcTargets) {
+                if (grpcTarget.sessionTag != sessionTag && grpcTarget.sessionTag != DEFAULT_SESSION_TAG) continue
+                if (!isReplayableQuotaEndpoint("https://${grpcTarget.authorityHost ?: "grpc"}/${grpcTarget.fullMethod}", "GRPC")) continue
+                val channelObj = grpcTarget.channelRef.get() ?: continue
+                val methodDescObj = grpcTarget.methodDescRef.get() ?: continue
+                val reqBytes = grpcTarget.requestBytes ?: continue
+                val authorityUrl = grpcTarget.authorityHost?.let { "https://$it" }
+                val scopedAuth = resolveAuthForUrl(authorityUrl, authHeader)
+                try {
+                    EnergyImpactMonitor.recordNetworkTransfer(reqBytes.size.toLong(), isReplay = true)
+                    val respBytes = replayGrpcTargetInProcess(
+                        channel = channelObj,
+                        methodDesc = methodDescObj,
+                        callOptions = grpcTarget.callOptionsRef?.get(),
+                        reqBytes = reqBytes,
+                        scopedAuth = scopedAuth,
+                        authUser = authUser
+                    )
+                    if (respBytes != null && respBytes.isNotEmpty()) {
+                        EnergyImpactMonitor.recordNetworkTransfer(respBytes.size.toLong(), isReplay = false)
+                        val parsed = QuotaTextParser.scanProtoBufBytes(
+                            rawBytes = respBytes,
+                            length = respBytes.size,
+                            prev = getBaseSnapshotForSession(sessionTag),
+                            source = "gRPC-Replay-PB",
+                            rpcMethodHint = grpcTarget.fullMethod
+                        )
+                        if (parsed != null && parsed.hasLiveData) {
+                            fetchedSnapshot = parsed
+                            diagTrail.append("gRPCReplay=ok;")
+                            break
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
 
         // 0. If we have learned batchexecute POST endpoints and Cookies, ensure fresh SNlM0e XSRF token first when missing
         val learnedCopy: List<LearnedEndpoint> = synchronized(learnedEndpointsLock) {
@@ -5127,15 +5981,17 @@ object QuotaCoreEngine {
             if (ep.rpcHint == "WebView-DOM") 1 else 0
         }
         for (ep in sortedLearned) {
-            if (!isForegroundActive.get() || fetchedSnapshot != null) break
+            if (!isForegroundActive.get() || fetchedSnapshot != null || sessionTag != activeSessionTag.get()) break
             val isPost = ep.method.equals("POST", ignoreCase = true)
             if (!isPost && !ep.method.equals("GET", ignoreCase = true)) continue
-            if (isPost && ep.url.contains("batchexecute") && ep.bodyBase64 == null && cachedXsrfToken.isNullOrBlank()) continue
+            val targetUrl = adaptUrlForAuthUser(ep.url, authUser)
+            if (isPost && targetUrl.contains("batchexecute") && ep.bodyBase64 == null && cachedXsrfToken.isNullOrBlank()) continue
 
             val isGrpcOrGoogleApi = ep.contentType?.contains("grpc", ignoreCase = true) == true ||
-                ep.url.contains("/\$rpc/") ||
-                ep.url.contains("googleapis.com")
-            val scopedAuth = resolveAuthForUrl(ep.url, authHeader)
+                targetUrl.contains("/\$rpc/") ||
+                targetUrl.contains("googleapis.com")
+            val scopedAuth = resolveAuthForUrl(targetUrl, authHeader)
+            if (isGrpcOrGoogleApi && scopedAuth.isNullOrBlank() && cookieHeader.isNullOrBlank()) continue
 
             // Try Chromium HTTP/2 Cronet stack first for gRPC/Google APIs, then fall back to standard HttpURLConnection
             val useCronetVariants = if (isGrpcOrGoogleApi && synchronized(activeCronetEngines) { activeCronetEngines.isNotEmpty() }) {
@@ -5145,9 +6001,9 @@ object QuotaCoreEngine {
             }
 
             for (preferCronet in useCronetVariants) {
-                if (!isForegroundActive.get() || fetchedSnapshot != null) break
+                if (!isForegroundActive.get() || fetchedSnapshot != null || sessionTag != activeSessionTag.get()) break
                 try {
-                    val conn = openQuotaHttpConnection(ep.url, preferCronet = preferCronet) ?: continue
+                    val conn = openQuotaHttpConnection(targetUrl, preferCronet = preferCronet) ?: continue
                     conn.requestMethod = ep.method.uppercase()
                     conn.instanceFollowRedirects = true
                     conn.connectTimeout = 5_000
@@ -5180,12 +6036,12 @@ object QuotaCoreEngine {
                                 null
                             }
                         } ?: ByteArray(0)
-                        if (ep.url.contains("batchexecute") && bodyBytes.isNotEmpty()) {
+                        if (targetUrl.contains("batchexecute") && bodyBytes.isNotEmpty()) {
                             bodyBytes = refreshBatchexecuteAtToken(bodyBytes, cachedXsrfToken)
                         }
                         recordOutboundProtocolFrameTrace(
                             transport = if (preferCronet) "Replay-Cronet-H2" else "Replay-HUC-H2",
-                            target = ep.url,
+                            target = targetUrl,
                             teHeader = if (isGrpcOrGoogleApi) "trailers" else "trailers (H2)",
                             bodyBytes = bodyBytes,
                             extraHeaders = ep.extraHeaders + mapOf("content-type" to ct)
@@ -5197,25 +6053,42 @@ object QuotaCoreEngine {
                     } else {
                         recordOutboundProtocolFrameTrace(
                             transport = if (preferCronet) "Replay-Cronet-H2-GET" else "Replay-HUC-H2-GET",
-                            target = ep.url,
+                            target = targetUrl,
                             teHeader = if (isGrpcOrGoogleApi) "trailers" else "trailers (H2)",
                             bodyBytes = null,
                             extraHeaders = ep.extraHeaders
                         )
                     }
 
+                    val respCode = try { conn.responseCode } catch (_: Throwable) { -1 }
+                    val respHdrSnap = QuotaTextParser.parseRateLimitHeaders(
+                        headers = try { conn.headerFields } catch (_: Throwable) { null },
+                        prev = getBaseSnapshotForSession(sessionTag),
+                        source = "Learned-Hdr",
+                        httpStatusCode = respCode
+                    )
                     val bytes = readBoundedHttpBytes(conn, 262_144)
                     conn.disconnect()
+                    EnergyImpactMonitor.recordNetworkTransfer((bytes?.size ?: 0).toLong(), isReplay = true)
                     if (bytes != null && bytes.isNotEmpty()) {
                         val parsed = parseHttpResponseBytes(
-                            url = ep.url,
+                            url = targetUrl,
                             bytes = bytes,
                             sessionTag = sessionTag,
                             sourceTag = ep.rpcHint ?: "Learned-HTTP"
                         )
                         if (parsed != null && parsed.hasLiveData) {
                             fetchedSnapshot = parsed
+                            diagTrail.append("LearnedHTTP($respCode)=ok;")
+                        } else if (respHdrSnap != null) {
+                            fetchedSnapshot = respHdrSnap
+                            diagTrail.append("LearnedHdr($respCode)=ok;")
                         }
+                    } else if (respHdrSnap != null) {
+                        fetchedSnapshot = respHdrSnap
+                        diagTrail.append("LearnedHdr($respCode)=ok;")
+                    } else if (respCode > 0) {
+                        diagTrail.append("Learned($respCode)=empty;")
                     }
                 } catch (_: Throwable) {
                 }
@@ -5223,12 +6096,13 @@ object QuotaCoreEngine {
         }
 
         // 1. Fetch Gemini Web /usage & /app pages up to 1.5 MB: captures SNlM0e/FdrFJe/cfb2h & AF_initDataCallback blobs
-        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank() && isForegroundActive.get()) {
+        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank() && isForegroundActive.get() && sessionTag == activeSessionTag.get()) {
             val usagePrimary = if (authUser != "0") "https://gemini.google.com/u/$authUser/usage?hl=zh-CN" else "https://gemini.google.com/usage?hl=zh-CN"
             val appPrimary = if (authUser != "0") "https://gemini.google.com/u/$authUser/app?hl=zh-CN" else "https://gemini.google.com/app?hl=zh-CN"
-            val landingCandidates = arrayOf(usagePrimary, appPrimary, "https://gemini.google.com/app?hl=en")
+            val appEnFallback = if (authUser != "0") "https://gemini.google.com/u/$authUser/app?hl=en" else "https://gemini.google.com/app?hl=en"
+            val landingCandidates = arrayOf(usagePrimary, appPrimary, appEnFallback)
             for (pageUrl in landingCandidates) {
-                if (fetchedSnapshot != null || !isForegroundActive.get()) break
+                if (fetchedSnapshot != null || !isForegroundActive.get() || sessionTag != activeSessionTag.get()) break
                 try {
                     val conn = (URL(pageUrl).openConnection() as? HttpURLConnection) ?: continue
                     conn.instanceFollowRedirects = true
@@ -5242,8 +6116,10 @@ object QuotaCoreEngine {
                     conn.setRequestProperty("Cookie", cookieHeader)
                     if (!authHeader.isNullOrBlank()) conn.setRequestProperty("Authorization", authHeader)
 
+                    val respCode = try { conn.responseCode } catch (_: Throwable) { -1 }
                     val html = readBoundedHttpResponse(conn, 1_572_864)
                     conn.disconnect()
+                    EnergyImpactMonitor.recordNetworkTransfer((html?.length ?: 0).toLong(), isReplay = true)
                     if (!html.isNullOrBlank()) {
                         extractWizTokensFromHtml(html)
                         val isUsagePage = pageUrl.contains("/usage")
@@ -5254,21 +6130,27 @@ object QuotaCoreEngine {
                         )
                         if (parsed != null && parsed.hasLiveData) {
                             fetchedSnapshot = parsed
+                            diagTrail.append("Web($respCode)=ok;")
                             recordLearnedQuotaEndpoint(pageUrl, "GET", rpcHint = if (isUsagePage) "Active-Web-Usage" else "Active-Web", forceFromParsedResponse = true)
+                        } else {
+                            diagTrail.append("Web($respCode)=noQuotaField;")
                         }
                         if (cachedXsrfToken != null && fetchedSnapshot != null) break
+                    } else if (respCode > 0) {
+                        diagTrail.append("Web($respCode);")
                     }
                 } catch (t: Throwable) {
+                    diagTrail.append("WebErr=${t.javaClass.simpleName};")
                     safeLog(activeBridgeRef.get(), "Active Web fetch attempt: ${t.javaClass.simpleName} (${t.message})")
                 }
             }
         }
 
         // 2. If not fetched from landing HTML, invoke BardChatUi batchexecute RPCs with extracted SNlM0e XSRF token
-        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank() && isForegroundActive.get()) {
+        if (fetchedSnapshot == null && !cookieHeader.isNullOrBlank() && isForegroundActive.get() && sessionTag == activeSessionTag.get()) {
             val rpcGroups = arrayOf("hOoQ4d", "o4g7id", "MaZiqc")
             for (rpcId in rpcGroups) {
-                if (fetchedSnapshot != null || !isForegroundActive.get()) break
+                if (fetchedSnapshot != null || !isForegroundActive.get() || sessionTag != activeSessionTag.get()) break
                 try {
                     val urlBuilder = StringBuilder("https://gemini.google.com")
                     if (authUser != "0") {
@@ -5277,7 +6159,8 @@ object QuotaCoreEngine {
                     urlBuilder.append("/_/BardChatUi/data/batchexecute?rpcids=").append(rpcId)
                     cachedFsidToken?.let { urlBuilder.append("&f.sid=").append(URLEncoder.encode(it, "UTF-8")) }
                     cachedBuildLabel?.let { urlBuilder.append("&bl=").append(URLEncoder.encode(it, "UTF-8")) }
-                    urlBuilder.append("&hl=zh-CN&source-path=%2Fapp&rt=c")
+                    val sourcePathEnc = if (authUser != "0") "%2Fu%2F$authUser%2Fapp" else "%2Fapp"
+                    urlBuilder.append("&hl=zh-CN&source-path=").append(sourcePathEnc).append("&rt=c")
 
                     val conn = (URL(urlBuilder.toString()).openConnection() as? HttpURLConnection) ?: continue
                     conn.requestMethod = "POST"
@@ -5287,7 +6170,8 @@ object QuotaCoreEngine {
                     conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
                     conn.setRequestProperty("User-Agent", mobileUa)
                     conn.setRequestProperty("Origin", "https://gemini.google.com")
-                    conn.setRequestProperty("Referer", "https://gemini.google.com/app")
+                    val refererUrl = if (authUser != "0") "https://gemini.google.com/u/$authUser/app" else "https://gemini.google.com/app"
+                    conn.setRequestProperty("Referer", refererUrl)
                     conn.setRequestProperty("X-Same-Domain", "1")
                     conn.setRequestProperty("X-Goog-AuthUser", authUser)
                     conn.setRequestProperty("Cookie", cookieHeader)
@@ -5324,17 +6208,137 @@ object QuotaCoreEngine {
             }
         }
 
+        // Persist updated WIZ XSRF/fsid/bl tokens into current session credentials if still active
+        if (sessionTag == activeSessionTag.get()) {
+            synchronized(sessionCredentialsLock) {
+                perSessionCredentials[sessionTag]?.let { creds ->
+                    creds.xsrfToken = cachedXsrfToken ?: creds.xsrfToken
+                    creds.fsidToken = cachedFsidToken ?: creds.fsidToken
+                    creds.buildLabel = cachedBuildLabel ?: creds.buildLabel
+                }
+            }
+        }
+
         if (fetchedSnapshot != null && fetchedSnapshot.hasLiveData) {
-            hasCompletedLiveFetchThisWake.set(true)
+            lastFetchDiagSummary = "Resolved(${fetchedSnapshot.source}) ${diagTrail}".trim()
+            if (sessionTag == activeSessionTag.get()) {
+                hasCompletedLiveFetchThisWake.set(true)
+            }
             safeLog(
                 activeBridgeRef.get(),
-                "Active HTTP quota resolved -> 5h=${fetchedSnapshot.fiveHourQuota} (${fetchedSnapshot.fiveHourReset}), Weekly=${fetchedSnapshot.weeklyLimit} (${fetchedSnapshot.weeklyReset})"
+                "Active HTTP quota resolved [$sessionTag] -> 5h=${fetchedSnapshot.fiveHourQuota} (${fetchedSnapshot.fiveHourReset}), Weekly=${fetchedSnapshot.weeklyLimit} (${fetchedSnapshot.weeklyReset})"
             )
             publishSnapshotForSession(fetchedSnapshot, sessionTag)
         } else {
+            lastFetchDiagSummary = when {
+                cookieHeader.isNullOrBlank() -> "NativeBearerOnly(NoWebCookie; ${diagTrail}Fallback=SessionEstimate)"
+                diagTrail.isNotEmpty() -> "NoQuotaInPayload(${diagTrail})"
+                else -> "Empty(NoLearnedEndpointOrBanner)"
+            }
             // Do not count speculative Web/batchexecute fallback misses as QuotaHealthMonitor errors,
             // otherwise native gRPC Gemini clients without Web cookies would self-wipe cached state.
             applySessionQueryEstimationIfNeeded(sessionTag)
+        }
+    }
+
+    /**
+     * Best-effort in-process gRPC replay via reflection over `io.grpc.Channel.newCall(MethodDescriptor, CallOptions)`.
+     * Allows refreshing Bearer-only native Android gRPC quota RPCs when Cronet/HttpURLConnection HTTP/2 fails.
+     */
+    private fun replayGrpcTargetInProcess(
+        channel: Any,
+        methodDesc: Any,
+        callOptions: Any?,
+        reqBytes: ByteArray,
+        scopedAuth: String?,
+        authUser: String
+    ): ByteArray? {
+        return try {
+            val cl = channel.javaClass.classLoader ?: methodDesc.javaClass.classLoader ?: return null
+            val mdCls = findClassSafe("io.grpc.MethodDescriptor", cl) ?: return null
+            val optCls = findClassSafe("io.grpc.CallOptions", cl) ?: return null
+            val listenerCls = findClassSafe("io.grpc.ClientCall\$Listener", cl) ?: return null
+            val metaCls = findClassSafe("io.grpc.Metadata", cl) ?: return null
+
+            val effectiveOpts = callOptions ?: try {
+                optCls.getField("DEFAULT").get(null)
+            } catch (_: Throwable) {
+                return null
+            }
+            val newCallM = channel.javaClass.methods.firstOrNull {
+                it.name == "newCall" && it.parameterCount == 2
+            } ?: return null
+            val clientCall = newCallM.invoke(channel, methodDesc, effectiveOpts) ?: return null
+
+            val metadata = metaCls.getDeclaredConstructor().newInstance()
+            val asciiMarshaller = try {
+                metaCls.getField("ASCII_STRING_MARSHALLER").get(null)
+            } catch (_: Throwable) {
+                null
+            }
+            val keyOfM = if (asciiMarshaller != null) {
+                metaCls.methods.firstOrNull { it.name == "of" && it.parameterCount == 2 }
+                    ?: findClassSafe("io.grpc.Metadata\$Key", cl)?.methods?.firstOrNull {
+                        it.name == "of" && it.parameterCount == 2
+                    }
+            } else {
+                null
+            }
+            val putM = metaCls.methods.firstOrNull { it.name == "put" && it.parameterCount == 2 }
+            if (keyOfM != null && putM != null && asciiMarshaller != null) {
+                if (!scopedAuth.isNullOrBlank()) {
+                    val authKey = keyOfM.invoke(null, "authorization", asciiMarshaller)
+                    putM.invoke(metadata, authKey, scopedAuth)
+                }
+                if (authUser.isNotBlank()) {
+                    val userKey = keyOfM.invoke(null, "x-goog-authuser", asciiMarshaller)
+                    putM.invoke(metadata, userKey, authUser)
+                }
+            }
+
+            // Parse request bytes via MethodDescriptor.parseRequest if possible
+            val parseReqM = mdCls.methods.firstOrNull { it.name == "parseRequest" && it.parameterCount == 1 }
+            val reqObj: Any = if (parseReqM != null) {
+                parseReqM.invoke(methodDesc, java.io.ByteArrayInputStream(reqBytes)) ?: return null
+            } else {
+                return null
+            }
+
+            // ClientCall.Listener is an abstract class rather than an interface, so use existing listener pattern only if interface
+            if (!listenerCls.isInterface) {
+                return null
+            }
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val resultRef = AtomicReference<ByteArray?>(null)
+            val listenerProxy = java.lang.reflect.Proxy.newProxyInstance(
+                cl,
+                arrayOf(listenerCls)
+            ) { _, method, args ->
+                when (method.name) {
+                    "onMessage" -> {
+                        val msg = args?.firstOrNull()
+                        if (msg != null) {
+                            resultRef.compareAndSet(null, trySerializeProtoLite(msg))
+                        }
+                    }
+                    "onClose" -> latch.countDown()
+                }
+                null
+            }
+
+            val startM = clientCall.javaClass.methods.firstOrNull { it.name == "start" && it.parameterCount == 2 } ?: return null
+            val requestM = clientCall.javaClass.methods.firstOrNull { it.name == "request" && it.parameterCount == 1 }
+            val sendM = clientCall.javaClass.methods.firstOrNull { it.name == "sendMessage" && it.parameterCount == 1 } ?: return null
+            val halfCloseM = clientCall.javaClass.methods.firstOrNull { it.name == "halfClose" && it.parameterCount == 0 }
+
+            startM.invoke(clientCall, listenerProxy, metadata)
+            requestM?.invoke(clientCall, 1)
+            sendM.invoke(clientCall, reqObj)
+            halfCloseM?.invoke(clientCall)
+            latch.await(4L, TimeUnit.SECONDS)
+            resultRef.get()
+        } catch (_: Throwable) {
+            null
         }
     }
 
@@ -5342,15 +6346,16 @@ object QuotaCoreEngine {
         val cur = getBaseSnapshotForSession(sessionTag)
         if (cur.hasLiveData && cur.source != "SessionEstimate") return
 
+        val list = rollingQueryTimestampsBySession[sessionTag] ?: return
         val now = System.currentTimeMillis()
         val queryTimes: List<Long>
-        synchronized(rollingQueryTimestamps) {
+        synchronized(list) {
             val cutoff = now - 5L * 3600L * 1000L
-            val it = rollingQueryTimestamps.iterator()
+            val it = list.iterator()
             while (it.hasNext()) {
                 if (it.next() < cutoff) it.remove()
             }
-            queryTimes = ArrayList(rollingQueryTimestamps)
+            queryTimes = ArrayList(list)
         }
 
         if (queryTimes.isEmpty()) return
@@ -5654,7 +6659,11 @@ object QuotaCoreEngine {
             // and temporarily hold the last cached non-zero numbers in HUD offline/gray mode.
             if (isProtobufSource(rawClean.source) && snapshotHasZeroRatio(rawClean)) {
                 val cachedFromSession = cachedNonZeroSnapshots[sessionTag]?.takeIf { hasNonZeroQuotaData(it) }
-                val cachedFromDefault = cachedNonZeroSnapshots[DEFAULT_SESSION_TAG]?.takeIf { hasNonZeroQuotaData(it) }
+                val cachedFromDefault = if (sessionTag == DEFAULT_SESSION_TAG || confirmedIdentityStrength < IdentityStrength.INTENT) {
+                    cachedNonZeroSnapshots[DEFAULT_SESSION_TAG]?.takeIf { hasNonZeroQuotaData(it) }
+                } else {
+                    null
+                }
                 val cachedNonZero = cachedFromSession
                     ?: cachedFromDefault
                     ?: prevForSession.takeIf { hasNonZeroQuotaData(it) }?.copy(isStaleOffline = false)
@@ -6450,6 +7459,91 @@ object QuotaCoreEngine {
                     }
                 }
 
+                val energyStatsTv = TextView(activity).apply {
+                    setTextColor(Color.parseColor("#5EEAD4"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+                    typeface = Typeface.MONOSPACE
+                    setPadding(0, QuotaHudView.dp(activity, 6f), 0, QuotaHudView.dp(activity, 6f))
+                    visibility = if (showEnergyImpactStatsInDialog) View.VISIBLE else View.GONE
+                    val es = EnergyImpactMonitor.computeSnapshot()
+                    text = if (zh) {
+                        "⚡ Energy Impact 能耗统计: 评级=${es.optString("rating")} | CPU=${es.optDouble("cpuMs")}ms | 前台派发=${es.optLong("fgDispatches")} | 后台唤醒=0 (门控拦截=${es.optLong("bgSuppressed")}) | 估算=~${es.optDouble("estimatedMah")}mAh"
+                    } else {
+                        "⚡ Energy Impact: ${es.optString("rating")} | CPU=${es.optDouble("cpuMs")}ms | FG=${es.optLong("fgDispatches")} | BG=0 (Gated=${es.optLong("bgSuppressed")}) | Est=~${es.optDouble("estimatedMah")}mAh"
+                    }
+                }
+
+                val toggleEnergyBtn = Button(activity).apply {
+                    isAllCaps = false
+                    text = if (zh) {
+                        if (showEnergyImpactStatsInDialog) "隐藏 Energy Impact 统计" else "显示 Energy Impact 统计"
+                    } else {
+                        if (showEnergyImpactStatsInDialog) "Hide Energy Impact Stats" else "Show Energy Impact Stats"
+                    }
+                    setTextColor(Color.parseColor("#99F6E4"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    background = GradientDrawable().apply {
+                        setColor(Color.parseColor("#134E4A"))
+                        cornerRadius = QuotaHudView.dp(activity, 10f).toFloat()
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                    ).apply {
+                        marginEnd = QuotaHudView.dp(activity, 6f)
+                    }
+                    setOnClickListener {
+                        showEnergyImpactStatsInDialog = !showEnergyImpactStatsInDialog
+                        energyStatsTv.visibility = if (showEnergyImpactStatsInDialog) View.VISIBLE else View.GONE
+                        text = if (zh) {
+                            if (showEnergyImpactStatsInDialog) "隐藏 Energy Impact 统计" else "显示 Energy Impact 统计"
+                        } else {
+                            if (showEnergyImpactStatsInDialog) "Hide Energy Impact Stats" else "Show Energy Impact Stats"
+                        }
+                        traceTv.text = buildOutboundProtocolDiagnosticReport("ENERGY_TOGGLE", activeSessionTag.get())
+                    }
+                }
+
+                val exportEnergyBtn = Button(activity).apply {
+                    isAllCaps = false
+                    text = if (zh) "Export Report (导出能耗报告)" else "Export Report"
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    background = GradientDrawable().apply {
+                        setColor(Color.parseColor("#0F766E"))
+                        cornerRadius = QuotaHudView.dp(activity, 10f).toFloat()
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                    )
+                    setOnClickListener {
+                        val report = EnergyImpactMonitor.buildTextReport(zh)
+                        EnergyImpactMonitor.appendMilestoneLog("EXPORT_REPORT", activeSessionTag.get(), emitToProvider = true)
+                        traceTv.text = report
+                        try {
+                            val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("GeminiEyeEnergyReport", report))
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+
+                val energyBtnRow = LinearLayout(activity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    weightSum = 2f
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        topMargin = QuotaHudView.dp(activity, 8f)
+                    }
+                    addView(toggleEnergyBtn)
+                    addView(exportEnergyBtn)
+                }
+
                 val btnRow = LinearLayout(activity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     weightSum = 2f
@@ -6497,7 +7591,9 @@ object QuotaCoreEngine {
 
                 root.addView(titleTv)
                 root.addView(quotaTv)
+                root.addView(energyStatsTv)
                 root.addView(forceScanBtn)
+                root.addView(energyBtnRow)
                 root.addView(traceScroll)
                 root.addView(btnRow)
 

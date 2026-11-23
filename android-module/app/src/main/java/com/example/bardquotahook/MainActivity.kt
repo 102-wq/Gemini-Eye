@@ -1,6 +1,8 @@
 package com.example.bardquotahook
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -15,10 +17,12 @@ import android.os.Bundle
 import android.os.LocaleList
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -43,12 +47,19 @@ class MainActivity : Activity() {
     private var devConsoleCountView: TextView? = null
     private var devConsoleClearBtn: Button? = null
     private var devConsoleLogsView: TextView? = null
+    private var energyCardTitleView: TextView? = null
+    private var energyToggleBtn: Button? = null
+    private var energyExportBtn: Button? = null
+    private var energyStatsView: TextView? = null
+    private var energyExportReportView: TextView? = null
     private var forceScanBtn: Button? = null
     private var launchGeminiBtn: Button? = null
 
     private var stateObserver: ContentObserver? = null
     private var bardInstalled = false
     private var gsaInstalled = false
+    private var showEnergyImpactStats = true
+    private var lastExportedBatteryReport: String = ""
 
     private fun formatLogTime(ms: Long): String {
         if (ms <= 0L) return "--"
@@ -206,18 +217,19 @@ class MainActivity : Activity() {
         val entries = QuotaSyncProvider.parseDevConsoleLogs(state.devLogsJson)
         val zeroCount = maxOf(state.zeroGuardCount, entries.count { it.eventType == "ZERO_GUARD" })
         val anomalyCount = maxOf(state.linkAnomalyCount, entries.count { it.eventType == "LINK_ANOMALY" })
+        val batteryCount = entries.count { it.eventType == "BATTERY_IMPACT" }
         devConsoleTitleView?.text = if (zh) "开发者控制台 (Dev Console)" else "Developer Console"
         devConsoleCountView?.text = if (zh) {
-            "归零防护: $zeroCount | 链路异常: $anomalyCount"
+            "归零防护: $zeroCount | 链路异常: $anomalyCount | 功耗: $batteryCount"
         } else {
-            "Zero-Guard: $zeroCount | Link Anomaly: $anomalyCount"
+            "Zero-Guard: $zeroCount | Anomaly: $anomalyCount | Energy: $batteryCount"
         }
         devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
         devConsoleLogsView?.text = if (entries.isEmpty()) {
             if (zh) {
-                "暂无「归零防护已触发」或「链路异常」事件记录。\n当触发 Protobuf 归零补偿、解析失败或连续 3 次空数据时，此处将输出诊断详情与清理记录。"
+                "暂无「归零防护已触发」、「链路异常」或「能耗监控」事件记录。\n当触发 Protobuf 归零补偿、解析失败、连续 3 次空数据或前台休眠里程碑时，此处将输出诊断详情。"
             } else {
-                "No ZERO_GUARD_TRIGGERED or LINK_ANOMALY events recorded yet.\nZero compensation, Protobuf parse failures, or 3 consecutive empty responses appear here."
+                "No ZERO_GUARD_TRIGGERED, LINK_ANOMALY, or BATTERY_IMPACT events recorded yet.\nZero compensation, parse failures, 3 consecutive empties, and energy milestones appear here."
             }
         } else {
             entries.joinToString("\n\n") { entry ->
@@ -236,6 +248,13 @@ class MainActivity : Activity() {
                     } else {
                         "$evtTs $evtTag [${entry.source}]\n${entry.detailEn}"
                     }
+                } else if (entry.eventType == "BATTERY_IMPACT") {
+                    val evtTag = if (zh) "[能耗监控]" else "[BATTERY_IMPACT]"
+                    if (zh) {
+                        "$evtTs $evtTag [${entry.source}]\n${entry.detailZh}"
+                    } else {
+                        "$evtTs $evtTag [${entry.source}]\n${entry.detailEn}"
+                    }
                 } else {
                     val evtTag = if (zh) "[归零防护已触发 #${entry.triggerCount}]" else "[ZERO_GUARD_TRIGGERED #${entry.triggerCount}]"
                     val cachedTs = formatLogTime(entry.cachedAtMs)
@@ -248,8 +267,111 @@ class MainActivity : Activity() {
             }
         }
 
+        val energyObj = try {
+            JSONObject(state.energyStatsJson.ifBlank { "{}" })
+        } catch (_: Throwable) {
+            JSONObject()
+        }
+        val eRating = energyObj.optString("rating", "Minimal")
+        val eScore = energyObj.optDouble("energyScore", 0.0)
+        val eFg = energyObj.optLong("fgDispatches", 0L)
+        val eBgSkip = energyObj.optLong("bgSuppressed", 0L)
+        val eHooks = energyObj.optLong("hookEvents", 0L)
+        val eNetReq = energyObj.optLong("networkReplays", 0L)
+        val eNetBytes = energyObj.optLong("networkBytes", 0L)
+        val eCpuMs = energyObj.optDouble("cpuMs", 0.0)
+        val eWallMs = energyObj.optDouble("wallMs", 0.0)
+        val eMah = energyObj.optDouble("estimatedMah", 0.0)
+        val eBatPct = energyObj.optInt("batteryPct", -1)
+        val eBatStr = if (eBatPct >= 0) "$eBatPct%" else "--"
+        val ePoolAct = energyObj.optInt("poolActive", 0)
+        val ePoolSize = energyObj.optInt("poolSize", 0)
+
+        energyCardTitleView?.text = if (zh) "电池消耗影响 (Battery Impact)" else "Battery Impact & Energy Statistics"
+        energyToggleBtn?.apply {
+            text = if (zh) {
+                if (showEnergyImpactStats) "Energy Impact: 开启" else "Energy Impact: 关闭"
+            } else {
+                if (showEnergyImpactStats) "Energy Impact: On" else "Energy Impact: Off"
+            }
+            background = if (showEnergyImpactStats) makeBtnDrawable("#0F766E") else makeBtnDrawable("#1E293B", "#475569")
+            setTextColor(if (showEnergyImpactStats) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+        energyExportBtn?.text = if (zh) "Export Report (导出报告)" else "Export Report"
+        energyStatsView?.apply {
+            visibility = if (showEnergyImpactStats) View.VISIBLE else View.GONE
+            text = if (zh) {
+                "能耗评级: $eRating (Score=$eScore) | 估算耗电: ~${eMah} mAh (电量 $eBatStr)\n" +
+                    "后台唤醒: 0 次 (1ns 门控拦截: $eBgSkip 次) | 线程池: ${ePoolAct}/${ePoolSize} 线程\n" +
+                    "前台按需派发: $eFg 次 | Hook 事件: $eHooks | CPU/墙钟: ${eCpuMs}ms / ${eWallMs}ms\n" +
+                    "网络重放与拦截传输: $eNetReq 次 / $eNetBytes Bytes | 日志条目: $batteryCount"
+            } else {
+                "Energy Rating: $eRating (Score=$eScore) | Est. Draw: ~${eMah} mAh (Bat $eBatStr)\n" +
+                    "BG Wakeups: 0 (1ns Gated: $eBgSkip) | Thread Pool: ${ePoolAct}/${ePoolSize} threads\n" +
+                    "FG Dispatches: $eFg | Hook Events: $eHooks | CPU/Wall: ${eCpuMs}ms / ${eWallMs}ms\n" +
+                    "Network Replays/Bytes: $eNetReq reqs / $eNetBytes B | Log Entries: $batteryCount"
+            }
+        }
+        energyExportReportView?.visibility =
+            if (lastExportedBatteryReport.isNotBlank()) View.VISIBLE else View.GONE
+
         forceScanBtn?.text = if (zh) "强制全量协议扫描 (TE: trailers + 5B帧头)" else "Force Full-Protocol Scan (TE: trailers + 5B Frame)"
         launchGeminiBtn?.text = loc.getString(R.string.settings_launch_gemini)
+    }
+
+    private fun buildBatteryImpactTextReport(state: QuotaSyncProvider.UnifiedState): String {
+        val zh = state.lang == QuotaHudView.Lang.ZH
+        val energyObj = try {
+            JSONObject(state.energyStatsJson.ifBlank { "{}" })
+        } catch (_: Throwable) {
+            JSONObject()
+        }
+        val entries = QuotaSyncProvider.parseDevConsoleLogs(state.devLogsJson)
+            .filter { it.eventType == "BATTERY_IMPACT" }
+        val eRating = energyObj.optString("rating", "Minimal")
+        val eScore = energyObj.optDouble("energyScore", 0.0)
+        val eFg = energyObj.optLong("fgDispatches", 0L)
+        val eBgSkip = energyObj.optLong("bgSuppressed", 0L)
+        val eHooks = energyObj.optLong("hookEvents", 0L)
+        val eNetReq = energyObj.optLong("networkReplays", 0L)
+        val eNetBytes = energyObj.optLong("networkBytes", 0L)
+        val eCpuMs = energyObj.optDouble("cpuMs", 0.0)
+        val eWallMs = energyObj.optDouble("wallMs", 0.0)
+        val eMah = energyObj.optDouble("estimatedMah", 0.0)
+        val eBatPct = energyObj.optInt("batteryPct", -1)
+        val eBatStr = if (eBatPct >= 0) "$eBatPct%" else "--"
+        val nowStr = formatLogTime(System.currentTimeMillis())
+
+        val sb = StringBuilder(1024)
+        if (zh) {
+            sb.append("=== Gemini-Eye 电池消耗影响报告 (Battery Impact Report) ===\n")
+            sb.append("生成时间: ").append(nowStr).append('\n')
+            sb.append("当前会话: ").append(state.sessionId.ifBlank { "sess_default" }).append('\n')
+            sb.append("Energy Impact 评级: ").append(eRating).append(" (Score=").append(eScore).append(")\n")
+            sb.append("后台唤醒: 0 次 (门控拦截: ").append(eBgSkip).append(") | 前台派发: ").append(eFg).append('\n')
+            sb.append("Hook 事件: ").append(eHooks).append(" | CPU/墙钟: ").append(eCpuMs).append("ms / ").append(eWallMs).append("ms\n")
+            sb.append("网络重放: ").append(eNetReq).append(" 次 / ").append(eNetBytes).append(" Bytes | 估算耗电: ~").append(eMah).append(" mAh (电量 ").append(eBatStr).append(")\n")
+            sb.append("\n--- 当前能耗事件日志 (").append(entries.size).append(") ---\n")
+        } else {
+            sb.append("=== Gemini-Eye Battery Impact Report ===\n")
+            sb.append("Generated: ").append(nowStr).append('\n')
+            sb.append("Session: ").append(state.sessionId.ifBlank { "sess_default" }).append('\n')
+            sb.append("Energy Rating: ").append(eRating).append(" (Score=").append(eScore).append(")\n")
+            sb.append("BG Wakeups: 0 (Gated: ").append(eBgSkip).append(") | FG Dispatches: ").append(eFg).append('\n')
+            sb.append("Hook Events: ").append(eHooks).append(" | CPU/Wall: ").append(eCpuMs).append("ms / ").append(eWallMs).append("ms\n")
+            sb.append("Network Replays: ").append(eNetReq).append(" reqs / ").append(eNetBytes).append(" Bytes | Est. Draw: ~").append(eMah).append(" mAh (Bat ").append(eBatStr).append(")\n")
+            sb.append("\n--- Current Energy Usage Log (").append(entries.size).append(") ---\n")
+        }
+        if (entries.isEmpty()) {
+            sb.append(if (zh) "  (暂无已记录的 BATTERY_IMPACT 日志)\n" else "  (No BATTERY_IMPACT entries recorded yet)\n")
+        } else {
+            for (e in entries) {
+                val ts = formatLogTime(e.eventTimeMs)
+                val msg = if (zh) e.detailZh else e.detailEn
+                sb.append("  ").append(ts).append(" [").append(e.sessionId).append("] ").append(msg).append('\n')
+            }
+        }
+        return sb.toString().trim()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -527,6 +649,111 @@ class MainActivity : Activity() {
         devCard.addView(devHeaderRow)
         devCard.addView(devLogsTv)
 
+        // 2.6 Battery Impact & Energy Statistics Card (Toggle + Export Report)
+        val energyCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = makeCardDrawable("#0F172A", "#134E4A")
+            val p = dp(14f)
+            setPadding(p, p, p, p)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(12f)
+            }
+        }
+
+        val energyHeaderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val energyTitle = TextView(this).apply {
+            setTextColor(Color.parseColor("#5EEAD4"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        energyCardTitleView = energyTitle
+
+        val energyToggle = Button(this).apply {
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setPadding(dp(8f), dp(4f), dp(8f), dp(4f))
+            minimumHeight = 0
+            minHeight = dp(28f)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginEnd = dp(6f)
+            }
+            setOnClickListener {
+                showEnergyImpactStats = !showEnergyImpactStats
+                refreshAllUi()
+            }
+        }
+        energyToggleBtn = energyToggle
+
+        val energyExport = Button(this).apply {
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            background = makeBtnDrawable("#0F766E")
+            setPadding(dp(10f), dp(4f), dp(10f), dp(4f))
+            minimumHeight = 0
+            minHeight = dp(28f)
+            setOnClickListener {
+                val st = QuotaSyncProvider.ensureLoaded(this@MainActivity)
+                val report = buildBatteryImpactTextReport(st)
+                lastExportedBatteryReport = report
+                energyExportReportView?.text = report
+                energyExportReportView?.visibility = View.VISIBLE
+                try {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    cm?.setPrimaryClip(ClipData.newPlainText("GeminiEyeBatteryReport", report))
+                } catch (_: Throwable) {
+                }
+                refreshAllUi()
+            }
+        }
+        energyExportBtn = energyExport
+
+        energyHeaderRow.addView(energyTitle)
+        energyHeaderRow.addView(energyToggle)
+        energyHeaderRow.addView(energyExport)
+
+        val energyStatsTv = TextView(this).apply {
+            setTextColor(Color.parseColor("#CCFBF1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            typeface = Typeface.MONOSPACE
+            setLineSpacing(dp(2f).toFloat(), 1.15f)
+            setPadding(0, dp(10f), 0, 0)
+        }
+        energyStatsView = energyStatsTv
+
+        val energyReportTv = TextView(this).apply {
+            setTextColor(Color.parseColor("#99F6E4"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            typeface = Typeface.MONOSPACE
+            setLineSpacing(dp(2f).toFloat(), 1.15f)
+            background = makeCardDrawable("#042F2E", "#115E59")
+            val rp = dp(10f)
+            setPadding(rp, rp, rp, rp)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(10f)
+            }
+            visibility = View.GONE
+        }
+        energyExportReportView = energyReportTv
+
+        energyCard.addView(energyHeaderRow)
+        energyCard.addView(energyStatsTv)
+        energyCard.addView(energyReportTv)
+
         // 2.8 Force Full-Protocol Diagnostic Scan Button
         val scanBtn = Button(this).apply {
             isAllCaps = false
@@ -581,6 +808,7 @@ class MainActivity : Activity() {
         container.addView(prefCard)
         container.addView(diagCard)
         container.addView(devCard)
+        container.addView(energyCard)
         container.addView(scanBtn)
         container.addView(launchBtn)
         scroll.addView(container)

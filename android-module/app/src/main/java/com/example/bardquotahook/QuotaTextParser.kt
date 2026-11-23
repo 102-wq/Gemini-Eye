@@ -115,7 +115,7 @@ object QuotaTextParser {
 
     private val exhaustedBannerRegex by lazy(LazyThreadSafetyMode.PUBLICATION) {
         Regex(
-            """.*(reached\s+your\s+(?:usage\s+)?limit|out\s+of\s+(?:prompts|capacity)|quota\s+exceeded|已达(?:到)?(?:用量|使用)?上限|额度已用尽).*""",
+            """.*(reached\s+your\s+(?:usage\s+|daily\s+|hourly\s+)?limit|you['’]?ve\s+reached\s+your\s+limit|hit\s+your\s+[\w\s]{0,16}limit|out\s+of\s+(?:prompts|capacity|quota)|quota\s+exceeded|too\s+many\s+requests|try\s+again\s+(?:in|after)\s+\d|已达(?:到)?(?:用量|使用|每日|每小时)?上限|额度已用尽|配额已满|请稍后再试).*""",
             RegexOption.IGNORE_CASE
         )
     }
@@ -1190,8 +1190,8 @@ object QuotaTextParser {
             }
         }
 
-        val tsSnapshot = detectedTs
-        if (tsSnapshot != null && (nums.isNotEmpty() || explicitTextMetric != null) && len <= 24) {
+        val localDetectedTs = detectedTs
+        if (localDetectedTs != null && (nums.isNotEmpty() || explicitTextMetric != null) && len <= 24) {
             var metric = "--"
             var conf = 1
             // Check non-zero (used, limit) pair first to avoid [0, pageSize, futureEpoch] false 0%
@@ -1223,12 +1223,12 @@ object QuotaTextParser {
                 }
             }
             if (metric != "--") {
-                out.add(DecodedProtoWindow(tsSnapshot.first, metric, tsSnapshot.second, conf))
+                out.add(DecodedProtoWindow(localDetectedTs.first, metric, localDetectedTs.second, conf))
             }
         }
 
         // Propagate pure [seconds] or [seconds, nanos] Timestamp array upward to its enclosing window
-        return if (tsSnapshot != null && len in 1..2 && explicitTextMetric == null) tsSnapshot else null
+        return if (localDetectedTs != null && len in 1..2 && explicitTextMetric == null) localDetectedTs else null
     }
 
     /**
@@ -1556,6 +1556,104 @@ object QuotaTextParser {
             }
         }
         return null
+    }
+
+    /**
+     * Extracts rate-limit & quota headers from HTTP/2 or Cronet responses:
+     * `retry-after`, `x-ratelimit-remaining`, `x-ratelimit-limit`, `x-ratelimit-reset`,
+     * and Google quota headers (`x-goog-quota-*`).
+     */
+    fun parseRateLimitHeaders(
+        headers: Map<String, List<String>>?,
+        prev: QuotaHudView.Snapshot,
+        source: String,
+        httpStatusCode: Int = 200
+    ): QuotaHudView.Snapshot? {
+        if (headers.isNullOrEmpty()) return null
+        val flat = HashMap<String, String>(headers.size)
+        for ((k, vals) in headers) {
+            val cleanKey = k.trim().lowercase()
+            val v = vals.firstOrNull { it.isNotBlank() }?.trim() ?: continue
+            flat[cleanKey] = v
+        }
+        return parseFlatRateLimitHeaders(flat, prev, source, httpStatusCode)
+    }
+
+    fun parseFlatRateLimitHeaders(
+        flatHeaders: Map<String, String>?,
+        prev: QuotaHudView.Snapshot,
+        source: String,
+        httpStatusCode: Int = 200
+    ): QuotaHudView.Snapshot? {
+        if (flatHeaders.isNullOrEmpty() && httpStatusCode != 429) return null
+        val base = sanitizeSnapshot(prev)
+        var fiveHour = base.fiveHourQuota
+        var fiveReset = base.fiveHourReset
+        var hit = false
+
+        val headers = flatHeaders ?: emptyMap()
+        var rlRemaining: Int? = null
+        var rlLimit: Int? = null
+
+        for ((rawK, rawV) in headers) {
+            val k = rawK.trim().lowercase()
+            val v = rawV.trim()
+            if (k.isEmpty() || v.isEmpty()) continue
+            when {
+                k == "retry-after" -> {
+                    val secs = v.toLongOrNull()
+                    if (secs != null && secs >= 30L) {
+                        val tok = formatDurationSeconds(minOf(secs, WEEKLY_MAX_WINDOW_SEC))
+                        if (tok != "--") {
+                            fiveReset = tok
+                            hit = true
+                        }
+                    }
+                }
+                k == "x-ratelimit-remaining" || k == "x-ratelimit-remaining-requests" || k == "x-goog-quota-remaining" -> {
+                    rlRemaining = v.toIntOrNull()
+                }
+                k == "x-ratelimit-limit" || k == "x-ratelimit-limit-requests" || k == "x-goog-quota-limit" -> {
+                    rlLimit = v.toIntOrNull()
+                }
+                k == "x-ratelimit-reset" || k == "x-ratelimit-reset-requests" -> {
+                    val lv = v.toLongOrNull()
+                    if (lv != null) {
+                        val ts = classifyFutureEpochTimestamp(lv)
+                        if (ts != null) {
+                            fiveReset = ts.second
+                            hit = true
+                        } else if (lv in 30L..FIVE_HOUR_MAX_WINDOW_SEC) {
+                            val tok = formatDurationSeconds(lv)
+                            if (tok != "--") {
+                                fiveReset = tok
+                                hit = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (rlRemaining != null && rlLimit != null && rlLimit > 0 && rlRemaining in 0..rlLimit) {
+            val usedPct = (((rlLimit - rlRemaining).toDouble() / rlLimit.toDouble()) * 100.0).roundToInt().coerceIn(0, 100)
+            val pctStr = sanitizeQuotaMetric("$usedPct%")
+            if (pctStr != "--") {
+                fiveHour = pctStr
+                hit = true
+            }
+        } else if (httpStatusCode == 429) {
+            fiveHour = "100%"
+            hit = true
+        }
+
+        if (!hit) return null
+        val next = base.copy(
+            fiveHourQuota = fiveHour,
+            fiveHourReset = fiveReset,
+            source = source
+        ).sanitized()
+        return if (next != base && next.hasLiveData) next else null
     }
 
     fun normalizeFieldCandidate(raw: String, kind: MetricKind): String {

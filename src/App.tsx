@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  BatteryCharging,
   Check,
   ChevronDown,
   ChevronRight,
@@ -9,6 +10,7 @@ import {
   Download,
   ExternalLink,
   FileCode,
+  FileText,
   FolderGit2,
   Moon,
   RefreshCw,
@@ -185,7 +187,7 @@ export default function App() {
   const [usageSheetOpen, setUsageSheetOpen] = useState<boolean>(false);
   const [lastSyncNote, setLastSyncNote] = useState<string>('');
   const [lastDiagTraceSummary, setLastDiagTraceSummary] = useState<string>('');
-  const [devConsoleOpen, setDevConsoleOpen] = useState<boolean>(false);
+  const [devConsoleOpen, setDevConsoleOpen] = useState<boolean>(true);
   const [isStaleOffline, setIsStaleOffline] = useState<boolean>(false);
   const [lastCachedTimestamp, setLastCachedTimestamp] = useState<string>('');
   const [isSessionDeepCleaned, setIsSessionDeepCleaned] = useState<boolean>(false);
@@ -196,6 +198,15 @@ export default function App() {
   const [activePoolThreads, setActivePoolThreads] = useState<number>(0);
   const [poolStateLabel, setPoolStateLabel] = useState<'IDLE_ZERO_THREADS' | 'FG_ON_DEMAND_ACTIVE' | 'SLEEP_PURGED'>('IDLE_ZERO_THREADS');
   const [batteryImpactCount, setBatteryImpactCount] = useState<number>(1);
+  const [showEnergyImpactStats, setShowEnergyImpactStats] = useState<boolean>(true);
+  const [energyCpuMs, setEnergyCpuMs] = useState<number>(3.4);
+  const [energyWallMs, setEnergyWallMs] = useState<number>(18.2);
+  const [energyHookEvents, setEnergyHookEvents] = useState<number>(12);
+  const [energyNetReqs, setEnergyNetReqs] = useState<number>(1);
+  const [energyNetBytes, setEnergyNetBytes] = useState<number>(1420);
+  const [energyBgSuppressed, setEnergyBgSuppressed] = useState<number>(2);
+  const [exportedBatteryReport, setExportedBatteryReport] = useState<string>('');
+  const [batteryReportCopied, setBatteryReportCopied] = useState<boolean>(false);
   const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
   const bgWakeupCountRef = useRef<number>(0);
   const fgDispatchCountRef = useRef<number>(1);
@@ -401,6 +412,11 @@ export default function App() {
       const nextFg = fgDispatchCountRef.current + 1;
       fgDispatchCountRef.current = nextFg;
       setFgDispatchCount(nextFg);
+      setEnergyCpuMs((v) => Math.round((v + (phase === 'HEARTBEAT_REPLAY' ? 2.1 : 1.6)) * 10) / 10);
+      setEnergyWallMs((v) => Math.round((v + (phase === 'HEARTBEAT_REPLAY' ? 14.5 : 9.8)) * 10) / 10);
+      setEnergyHookEvents((v) => v + 6);
+      setEnergyNetReqs((v) => v + 1);
+      setEnergyNetBytes((v) => v + (phase === 'HEARTBEAT_REPLAY' ? 890 : 1240));
       const prevThreads = activePoolThreadsRef.current;
       const nextThreads = prevThreads + 1;
       activePoolThreadsRef.current = nextThreads;
@@ -419,6 +435,9 @@ export default function App() {
         nextThreads > 1 ? 'warn' : 'info'
       );
     } else if (phase === 'FG_SETTLE_IDLE') {
+      setEnergyCpuMs((v) => Math.round((v + 0.7) * 10) / 10);
+      setEnergyWallMs((v) => Math.round((v + 4.2) * 10) / 10);
+      setEnergyHookEvents((v) => v + 3);
       const prevThreads = activePoolThreadsRef.current;
       const nextThreads = Math.max(0, prevThreads - 1);
       activePoolThreadsRef.current = nextThreads;
@@ -442,6 +461,7 @@ export default function App() {
       activePoolThreadsRef.current = 0;
       setActivePoolThreads(0);
       setPoolStateLabel('SLEEP_PURGED');
+      setEnergyBgSuppressed((v) => v + 1);
       setBatteryImpactCount((c) => c + 1);
       logDevEvent(
         'BATTERY_IMPACT',
@@ -451,6 +471,91 @@ export default function App() {
         'success'
       );
     }
+  };
+
+  const estimatedEnergyMah = useMemo(() => {
+    const val = energyCpuMs * 0.00018 + energyNetReqs * 0.012 + (energyNetBytes / 1_048_576) * 0.05;
+    return Math.round(val * 10000) / 10000;
+  }, [energyCpuMs, energyNetReqs, energyNetBytes]);
+
+  const energyImpactScore = useMemo(() => {
+    return Math.min(
+      100,
+      Math.round((energyCpuMs / 50 + energyNetReqs * 0.4 + fgDispatchCount * 0.05) * 100) / 100
+    );
+  }, [energyCpuMs, energyNetReqs, fgDispatchCount]);
+
+  const energyImpactRating = useMemo(() => {
+    if (energyImpactScore < 5) return 'Minimal';
+    if (energyImpactScore < 20) return 'Low';
+    return 'Moderate';
+  }, [energyImpactScore]);
+
+  const handleExportBatteryReport = () => {
+    const batteryLogs = devLogs.filter((l) => l.eventType === 'BATTERY_IMPACT');
+    const nowStr = formatFullTimestampMs(new Date());
+    const headerLines = isZh
+      ? [
+          '=== Gemini-Eye 电池消耗影响报告 (Battery Impact Report · 模拟) ===',
+          `生成时间: ${nowStr}`,
+          `当前会话: ${activeSession.sessionTag} | 前台状态: ${isGeminiForeground}`,
+          `Energy Impact 评级: ${energyImpactRating} (Score=${energyImpactScore})`,
+          `后台唤醒: ${bgWakeupCount} 次 (1ns 门控拦截: ${energyBgSuppressed} 次) | 当前线程池: ${poolStateLabel} (${activePoolThreads} 线程)`,
+          `前台按需派发: ${fgDispatchCount} 次 | Hook 捕获事件: ${energyHookEvents} 次`,
+          `累计 CPU / 墙钟耗时: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
+          `网络重放与拦截传输: ${energyNetReqs} 次请求 / ${energyNetBytes} Bytes`,
+          `估算电池消耗: ~${estimatedEnergyMah.toFixed(4)} mAh`,
+          '',
+          `--- 当前能耗事件日志 (${batteryLogs.length} 条) ---`,
+        ]
+      : [
+          '=== Gemini-Eye Battery Impact Statistics Report (Simulated) ===',
+          `Generated: ${nowStr}`,
+          `Session: ${activeSession.sessionTag} | ForegroundActive: ${isGeminiForeground}`,
+          `Energy Rating: ${energyImpactRating} (Score=${energyImpactScore})`,
+          `BG Wakeups: ${bgWakeupCount} (1ns Gate Suppressed: ${energyBgSuppressed}) | Pool State: ${poolStateLabel} (${activePoolThreads} threads)`,
+          `FG On-Demand Dispatches: ${fgDispatchCount} | Hook Events: ${energyHookEvents}`,
+          `Cumulative CPU / Wall Time: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
+          `Network Replays / Transferred: ${energyNetReqs} reqs / ${energyNetBytes} Bytes`,
+          `Estimated Battery Draw: ~${estimatedEnergyMah.toFixed(4)} mAh`,
+          '',
+          `--- Current Energy Usage Log (${batteryLogs.length} entries) ---`,
+        ];
+
+    const bodyLines =
+      batteryLogs.length === 0
+        ? [
+            isZh
+              ? '  (当前暂无已记录的 BATTERY_IMPACT 日志；上方的实时统计指标已汇总当前会话)'
+              : '  (No BATTERY_IMPACT entries recorded yet; live counters above reflect the active session)',
+          ]
+        : batteryLogs.map(
+            (l) => `  ${l.timeMs} [${l.sessionTag}] ${isZh ? l.detailZh : l.detailEn}`
+          );
+
+    const reportText = [...headerLines, ...bodyLines].join('\n');
+    setExportedBatteryReport(reportText);
+    setDevConsoleOpen(true);
+  };
+
+  const handleCopyBatteryReport = async () => {
+    if (!exportedBatteryReport) return;
+    await navigator.clipboard.writeText(exportedBatteryReport);
+    setBatteryReportCopied(true);
+    window.setTimeout(() => setBatteryReportCopied(false), 1800);
+  };
+
+  const handleDownloadBatteryReportTxt = () => {
+    if (!exportedBatteryReport) return;
+    const blob = new Blob([exportedBatteryReport], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `gemini-eye-battery-impact-${activeSession.sessionTag}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   };
 
   const handleSimulateThreadBurst = () => {
@@ -1880,6 +1985,29 @@ export default function App() {
                           </div>
 
                           <div className="pt-1.5 border-t border-slate-200/60 dark:border-zinc-700/70 space-y-1.5">
+                            <div className="flex items-center justify-between gap-2 text-[11px]">
+                              <span className="font-medium">
+                                {isZh ? '显示 Energy Impact 统计' : 'Show Energy Impact Stats'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setShowEnergyImpactStats((v) => !v)}
+                                className={`px-2 py-0.5 rounded font-mono text-[10px] border transition-colors cursor-pointer ${
+                                  showEnergyImpactStats
+                                    ? 'bg-teal-600 border-teal-500 text-white'
+                                    : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-300'
+                                }`}
+                              >
+                                {showEnergyImpactStats ? 'ON' : 'OFF'}
+                              </button>
+                            </div>
+
+                            {showEnergyImpactStats && (
+                              <div className="p-2 rounded-lg bg-teal-950/80 border border-teal-800/70 text-teal-200 text-[10px] font-mono leading-snug">
+                                Energy Impact: {energyImpactRating} | CPU={energyCpuMs.toFixed(1)}ms | FG={fgDispatchCount} | BG={bgWakeupCount} | Est=~{estimatedEnergyMah.toFixed(4)}mAh
+                              </div>
+                            )}
+
                             <button
                               type="button"
                               onClick={handleForceFullProtocolScanFromSettings}
@@ -2265,6 +2393,13 @@ export default function App() {
                           setBatteryImpactCount(0);
                           setFgDispatchCount(0);
                           setBgWakeupCount(0);
+                          setEnergyCpuMs(0);
+                          setEnergyWallMs(0);
+                          setEnergyHookEvents(0);
+                          setEnergyNetReqs(0);
+                          setEnergyNetBytes(0);
+                          setEnergyBgSuppressed(0);
+                          setExportedBatteryReport('');
                           setIsStaleOffline(false);
                           setIsSessionDeepCleaned(false);
                         }}
@@ -2275,6 +2410,134 @@ export default function App() {
                         <span>{isZh ? '清空' : 'Clear'}</span>
                       </button>
                     </div>
+                  </div>
+
+                  {/* Battery Impact & Energy Statistics Section */}
+                  <div className="rounded-xl border border-teal-500/30 bg-teal-950/20 px-3.5 py-3 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <BatteryCharging className="w-4 h-4 text-teal-400" />
+                        <span className="text-xs font-semibold text-slate-100">
+                          {isZh ? '电池消耗影响 · Battery Impact' : 'Battery Impact'}
+                        </span>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
+                          Energy Impact: {energyImpactRating} ({energyImpactScore})
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setShowEnergyImpactStats((v) => !v)}
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] rounded border transition-colors cursor-pointer ${
+                            showEnergyImpactStats
+                              ? 'bg-teal-500/20 text-teal-200 border-teal-500/40 font-semibold'
+                              : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
+                          }`}
+                        >
+                          <span>
+                            {isZh
+                              ? showEnergyImpactStats
+                                ? '隐藏 Energy Impact 统计'
+                                : '显示 Energy Impact 统计'
+                              : showEnergyImpactStats
+                              ? 'Hide Energy Impact'
+                              : 'Show Energy Impact'}
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleExportBatteryReport}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded bg-teal-600 hover:bg-teal-500 text-white border border-teal-400/40 transition-colors cursor-pointer"
+                        >
+                          <FileText className="w-3 h-3" />
+                          <span>Export Report</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {showEnergyImpactStats && (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] font-mono">
+                        <div className="rounded-lg bg-slate-950/70 border border-slate-800 px-2.5 py-1.5">
+                          <div className="text-[10px] text-slate-400">
+                            {isZh ? '后台唤醒 / 门控拦截' : 'BG Wakeups / Gated'}
+                          </div>
+                          <div className="text-emerald-300 font-semibold mt-0.5">
+                            {bgWakeupCount} / {energyBgSuppressed} skipped
+                          </div>
+                        </div>
+
+                        <div className="rounded-lg bg-slate-950/70 border border-slate-800 px-2.5 py-1.5">
+                          <div className="text-[10px] text-slate-400">
+                            {isZh ? 'CPU / 墙钟耗时' : 'CPU / Wall Time'}
+                          </div>
+                          <div className="text-teal-200 font-semibold mt-0.5">
+                            {energyCpuMs.toFixed(1)}ms / {energyWallMs.toFixed(1)}ms
+                          </div>
+                        </div>
+
+                        <div className="rounded-lg bg-slate-950/70 border border-slate-800 px-2.5 py-1.5">
+                          <div className="text-[10px] text-slate-400">
+                            {isZh ? '前台派发 / Hook 事件' : 'FG Dispatch / Hooks'}
+                          </div>
+                          <div className="text-sky-300 font-semibold mt-0.5">
+                            {fgDispatchCount} / {energyHookEvents}
+                          </div>
+                        </div>
+
+                        <div className="rounded-lg bg-slate-950/70 border border-slate-800 px-2.5 py-1.5">
+                          <div className="text-[10px] text-slate-400">
+                            {isZh ? '网络负载 / 估算耗电' : 'Net Transfer / Est. Draw'}
+                          </div>
+                          <div className="text-amber-300 font-semibold mt-0.5">
+                            {energyNetReqs}r · ~{estimatedEnergyMah.toFixed(4)}mAh
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {exportedBatteryReport && (
+                      <div className="rounded-lg border border-teal-700/50 bg-slate-950 p-2.5 space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[11px] font-mono font-semibold text-teal-300">
+                            {isZh ? '能耗统计纯文本报告 (Battery Impact Report)' : 'Energy Usage Statistics Report (.txt)'}
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={handleCopyBatteryReport}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+                            >
+                              {batteryReportCopied ? (
+                                <Check className="w-3 h-3 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3 h-3" />
+                              )}
+                              <span>{batteryReportCopied ? (isZh ? '已复制' : 'Copied') : isZh ? '复制报告' : 'Copy'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleDownloadBatteryReportTxt}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded bg-teal-900/60 hover:bg-teal-800/70 text-teal-200 border border-teal-700/60 transition-colors cursor-pointer"
+                            >
+                              <Download className="w-3 h-3" />
+                              <span>.txt</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setExportedBatteryReport('')}
+                              className="px-2 py-0.5 text-[10px] rounded bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700 transition-colors cursor-pointer"
+                            >
+                              {isZh ? '关闭' : 'Close'}
+                            </button>
+                          </div>
+                        </div>
+                        <pre className="text-[10.5px] font-mono text-teal-100 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
+                          {exportedBatteryReport}
+                        </pre>
+                      </div>
+                    )}
                   </div>
 
                   {/* Real-Time Thread Pool Visualization Bar (0: Green, 1: Amber, >1: Red) */}

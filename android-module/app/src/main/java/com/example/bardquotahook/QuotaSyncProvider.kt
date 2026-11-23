@@ -55,7 +55,8 @@ class QuotaSyncProvider : ContentProvider() {
         val zeroGuardCount: Int = 0,
         val linkAnomalyCount: Int = 0,
         val forceScanSeq: Long = 0L,
-        val devLogsJson: String = "[]"
+        val devLogsJson: String = "[]",
+        val energyStatsJson: String = "{}"
     ) {
         val isActivelyBound: Boolean
             get() = xposedBound &&
@@ -86,6 +87,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putInt(KEY_LINK_ANOMALY_COUNT, linkAnomalyCount)
                 putLong(KEY_FORCE_SCAN_SEQ, forceScanSeq)
                 putString(KEY_DEV_LOGS_JSON, devLogsJson)
+                putString(KEY_ENERGY_STATS_JSON, energyStatsJson)
             }
         }
 
@@ -116,7 +118,8 @@ class QuotaSyncProvider : ContentProvider() {
                     zeroGuardCount = bundle.getInt(KEY_ZERO_GUARD_COUNT, 0),
                     linkAnomalyCount = bundle.getInt(KEY_LINK_ANOMALY_COUNT, 0),
                     forceScanSeq = bundle.getLong(KEY_FORCE_SCAN_SEQ, 0L),
-                    devLogsJson = bundle.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
+                    devLogsJson = bundle.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]",
+                    energyStatsJson = bundle.getString(KEY_ENERGY_STATS_JSON, "{}") ?: "{}"
                 )
             }
         }
@@ -220,6 +223,13 @@ class QuotaSyncProvider : ContentProvider() {
                     updated.toBundle()
                 }
 
+                METHOD_PUT_ENERGY_STATS -> {
+                    val energyJson = extras?.getString(KEY_ENERGY_STATS_JSON) ?: "{}"
+                    val updated = mutateLocalStore(appCtx = appCtx, energyStatsJson = energyJson)
+                    HookTelemetryReceiver.notifyUiListeners()
+                    updated.toBundle()
+                }
+
                 else -> ensureLoaded(appCtx).toBundle()
             }
         } catch (_: Throwable) {
@@ -300,6 +310,7 @@ class QuotaSyncProvider : ContentProvider() {
         const val METHOD_APPEND_DEV_EVENT = "append_dev_event"
         const val METHOD_CLEAR_DEV_EVENTS = "clear_dev_events"
         const val METHOD_REQUEST_FULL_SCAN = "request_full_scan"
+        const val METHOD_PUT_ENERGY_STATS = "put_energy_stats"
 
         const val KEY_FIVE = "five"
         const val KEY_FIVE_RESET = "five_reset"
@@ -324,6 +335,7 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_FORCE_SCAN_SEQ = "force_scan_seq"
         const val KEY_DEV_LOGS_JSON = "dev_logs_json"
         const val KEY_DEV_EVENT_JSON = "dev_event_json"
+        const val KEY_ENERGY_STATS_JSON = "energy_stats_json"
         const val KEY_INCREMENT_ZERO_GUARD = "increment_zero_guard"
         const val KEY_INCREMENT_LINK_ANOMALY = "increment_link_anomaly"
 
@@ -385,7 +397,8 @@ class QuotaSyncProvider : ContentProvider() {
                     zeroGuardCount = prefs.getInt(KEY_ZERO_GUARD_COUNT, 0),
                     linkAnomalyCount = prefs.getInt(KEY_LINK_ANOMALY_COUNT, 0),
                     forceScanSeq = prefs.getLong(KEY_FORCE_SCAN_SEQ, 0L),
-                    devLogsJson = prefs.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]"
+                    devLogsJson = prefs.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]",
+                    energyStatsJson = prefs.getString(KEY_ENERGY_STATS_JSON, "{}") ?: "{}"
                 )
                 cachedState.set(loaded)
                 return loaded
@@ -404,7 +417,8 @@ class QuotaSyncProvider : ContentProvider() {
             proc: String? = null,
             bridge: String? = null,
             isApi102: Boolean? = null,
-            markXposedBound: Boolean = false
+            markXposedBound: Boolean = false,
+            energyStatsJson: String? = null
         ): UnifiedState {
             val prev = ensureLoaded(appCtx)
             val now = System.currentTimeMillis()
@@ -454,7 +468,8 @@ class QuotaSyncProvider : ContentProvider() {
                 lastPkg = if (!pkg.isNullOrBlank()) pkg else prev.lastPkg,
                 lastProc = if (!proc.isNullOrBlank()) proc else prev.lastProc,
                 lastBridge = if (!bridge.isNullOrBlank()) bridge else prev.lastBridge,
-                overlayEnabled = false
+                overlayEnabled = false,
+                energyStatsJson = energyStatsJson?.takeIf { it.isNotBlank() } ?: prev.energyStatsJson
             )
 
             cachedState.set(next)
@@ -478,6 +493,7 @@ class QuotaSyncProvider : ContentProvider() {
                     .putString(KEY_LAST_PROC, next.lastProc)
                     .putString(KEY_LAST_BRIDGE, next.lastBridge)
                     .putBoolean(KEY_OVERLAY_ENABLED, false)
+                    .putString(KEY_ENERGY_STATS_JSON, next.energyStatsJson)
                     .apply()
             } catch (_: Throwable) {
             }
@@ -848,6 +864,65 @@ class QuotaSyncProvider : ContentProvider() {
                     put("source", source)
                     put("restoredQuota", summary)
                     put("triggerCount", scanCount)
+                    put("detailZh", detailZh)
+                    put("detailEn", detailEn)
+                }
+                if (isInModuleProcess(context)) {
+                    appendDevEventLocal(context.applicationContext ?: context, obj.toString(), false, false)
+                    HookTelemetryReceiver.notifyUiListeners()
+                } else {
+                    val extras = Bundle().apply {
+                        putString(KEY_DEV_EVENT_JSON, obj.toString())
+                    }
+                    context.contentResolver.call(AUTHORITY_URI, METHOD_APPEND_DEV_EVENT, null, extras)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun publishEnergyStats(context: Context, energyStatsJson: String): UnifiedState? {
+            return try {
+                if (isInModuleProcess(context)) {
+                    val updated = mutateLocalStore(
+                        appCtx = context.applicationContext ?: context,
+                        energyStatsJson = energyStatsJson
+                    )
+                    HookTelemetryReceiver.notifyUiListeners()
+                    updated
+                } else {
+                    val extras = Bundle().apply {
+                        putString(KEY_ENERGY_STATS_JSON, energyStatsJson)
+                    }
+                    val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_PUT_ENERGY_STATS, null, extras)
+                    UnifiedState.fromBundle(reply)
+                }
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        fun recordBatteryImpactEvent(
+            context: Context,
+            sessionId: String,
+            source: String,
+            summary: String,
+            detailZh: String,
+            detailEn: String,
+            energyStatsJson: String? = null,
+            eventCount: Int = 1
+        ) {
+            try {
+                if (!energyStatsJson.isNullOrBlank()) {
+                    publishEnergyStats(context, energyStatsJson)
+                }
+                val obj = JSONObject().apply {
+                    put("eventType", "BATTERY_IMPACT")
+                    put("eventTimeMs", System.currentTimeMillis())
+                    put("cachedAtMs", 0L)
+                    put("sessionId", sessionId)
+                    put("source", source)
+                    put("restoredQuota", summary)
+                    put("triggerCount", eventCount)
                     put("detailZh", detailZh)
                     put("detailEn", detailEn)
                 }
