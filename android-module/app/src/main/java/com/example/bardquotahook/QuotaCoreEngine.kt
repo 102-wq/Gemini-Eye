@@ -7263,6 +7263,7 @@ object QuotaCoreEngine {
                 hud.alpha = 1f
                 hud.applyPreferences(currentLang.get(), currentTheme.get())
                 hud.updateSnapshot(latestSnapshot.get().sanitized())
+                hud.updateEnergyScore(EnergyImpactMonitor.computeSnapshot().optDouble("energyScore", 0.0))
                 hud.bringToFront()
             } else {
                 val act = activeActivityRef.get().get()
@@ -7349,6 +7350,7 @@ object QuotaCoreEngine {
             hud.alpha = 1f
             hud.applyPreferences(currentLang.get(), currentTheme.get())
             hud.updateSnapshot(latestSnapshot.get().sanitized())
+            hud.updateEnergyScore(EnergyImpactMonitor.computeSnapshot().optDouble("energyScore", 0.0))
             hud.bringToFront()
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
                 hud.translationZ = QuotaHudView.dp(activity, 12f).toFloat()

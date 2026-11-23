@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   BatteryCharging,
@@ -27,6 +27,7 @@ import { buildZipBlob } from './zipBuilder';
 
 type UiLang = 'zh' | 'en';
 type HudTheme = 'MIUIX' | 'MD3';
+type HudDockEdge = 'NONE' | 'LEFT' | 'RIGHT';
 type ActiveView = 'simulator' | 'files' | 'spec';
 type DevEventType =
   | 'APP_OPEN'
@@ -328,6 +329,12 @@ export default function App() {
   const HUD_TOUCH_SAMPLE_WINDOW_MS = 8;
   const HUD_MAGNET_EDGE_THRESHOLD_PX = 40;
 
+  const [hudDockedEdge, setHudDockedEdge] = useState<HudDockEdge>('NONE');
+  const hudDockedEdgeRef = useRef<HudDockEdge>('NONE');
+  hudDockedEdgeRef.current = hudDockedEdge;
+  const prevHudDockEdgeRef = useRef<HudDockEdge>('NONE');
+  const hudPosInitializedRef = useRef<boolean>(false);
+
   const hudPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const hudAnimRafRef = useRef<number | null>(null);
   const dragRef = useRef<{
@@ -485,11 +492,40 @@ export default function App() {
     );
   }, [energyCpuMs, energyNetReqs, fgDispatchCount]);
 
+  const HIGH_BATTERY_IMPACT_THRESHOLD = 20;
+
   const energyImpactRating = useMemo(() => {
     if (energyImpactScore < 5) return 'Minimal';
-    if (energyImpactScore < 20) return 'Low';
+    if (energyImpactScore < HIGH_BATTERY_IMPACT_THRESHOLD) return 'Low';
     return 'Moderate';
   }, [energyImpactScore]);
+
+  const isHighBatteryImpact = energyImpactScore >= HIGH_BATTERY_IMPACT_THRESHOLD;
+
+  const handleSimulateHighBatteryImpact = () => {
+    setEnergyCpuMs((v) => Math.max(v + 380, 420.0));
+    setEnergyWallMs((v) => Math.max(v + 620, 840.0));
+    setEnergyNetReqs((v) => Math.max(v + 28, 32));
+    setEnergyNetBytes((v) => v + 64_500);
+    setEnergyHookEvents((v) => v + 45);
+    setFgDispatchCount((c) => c + 12);
+    setBatteryImpactCount((c) => c + 1);
+    logDevEvent(
+      'BATTERY_IMPACT',
+      activeSession.sessionTag,
+      `[高能耗阈值触发 · >=${HIGH_BATTERY_IMPACT_THRESHOLD}] 突发全量协议重放与 ProtoBuf 流解码导致 Energy Score 越过高阈值；${
+        hudTheme === 'MIUIX'
+          ? 'MIUIX 主题已自动激活柔和背景模糊呼吸动画 (backdrop-blur breathe)'
+          : '当前为 MD3 主题（切换至 MIUIX 可预览模糊呼吸动画）'
+      }`,
+      `[High Energy Threshold Crossed · >=${HIGH_BATTERY_IMPACT_THRESHOLD}] Burst full-protocol replay & ProtoBuf decoding pushed Energy Score above threshold; ${
+        hudTheme === 'MIUIX'
+          ? 'MIUIX HUD subtle backdrop-blur animation activated'
+          : 'switch HUD theme to MIUIX to preview backdrop-blur animation'
+      }`,
+      'warn'
+    );
+  };
 
   const handleExportBatteryReport = () => {
     const batteryLogs = devLogs.filter((l) => l.eventType === 'BATTERY_IMPACT');
@@ -585,12 +621,35 @@ export default function App() {
     if (settingsBarWeeklyRef.current) settingsBarWeeklyRef.current.style.width = wWk;
   }, [activeSession, activeView, isGeminiForeground, isStaleOffline, isSessionDeepCleaned]);
 
-  useEffect(() => {
-    if (isGeminiForeground && hudCapsuleRef.current) {
-      const { x, y } = hudPosRef.current;
-      hudCapsuleRef.current.style.transform = `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)`;
+  useLayoutEffect(() => {
+    const capsule = hudCapsuleRef.current;
+    const host = capsule?.parentElement;
+    if (!isGeminiForeground || !capsule || !host) return;
+
+    const hostW = host.clientWidth;
+    const elW = capsule.offsetWidth;
+    const prevEdge = prevHudDockEdgeRef.current;
+    prevHudDockEdgeRef.current = hudDockedEdge;
+
+    let nextX = hudPosRef.current.x;
+    if (!hudPosInitializedRef.current) {
+      nextX = Math.max(10, hostW - elW - 10);
+      hudPosInitializedRef.current = true;
+    } else if (hudDockedEdge === 'LEFT') {
+      nextX = 4;
+    } else if (hudDockedEdge === 'RIGHT') {
+      nextX = Math.max(4, hostW - elW - 4);
+    } else if (prevEdge === 'LEFT') {
+      nextX = 10;
+    } else if (prevEdge === 'RIGHT') {
+      nextX = Math.max(10, hostW - elW - 10);
+    } else {
+      nextX = Math.max(10, Math.min(Math.max(10, hostW - elW - 10), nextX));
     }
-  }, [isGeminiForeground]);
+
+    hudPosRef.current = { x: nextX, y: hudPosRef.current.y };
+    capsule.style.transform = `translate3d(${nextX.toFixed(2)}px, ${hudPosRef.current.y.toFixed(2)}px, 0)`;
+  }, [isGeminiForeground, hudDockedEdge, activeSession, hudLang, isStaleOffline, isSessionDeepCleaned, activeView]);
 
   useEffect(() => {
     return () => {
@@ -1073,16 +1132,16 @@ export default function App() {
     const capsule = hudCapsuleRef.current;
     const host = capsule?.parentElement;
     if (capsule && host) {
-      const maxLeftShift = Math.max(24, host.clientWidth - capsule.offsetWidth - 20);
+      const maxXShift = Math.max(24, host.clientWidth - capsule.offsetWidth - 4);
       const maxDownShift = Math.max(180, host.clientHeight - capsule.offsetHeight - 132);
       return {
-        minX: -maxLeftShift,
-        maxX: 4,
+        minX: 4,
+        maxX: maxXShift,
         minY: -6,
         maxY: maxDownShift,
       };
     }
-    return { minX: -64, maxX: 8, minY: -8, maxY: 260 };
+    return { minX: 4, maxX: 300, minY: -8, maxY: 260 };
   };
 
   const clampHudValue = (val: number, min: number, max: number) =>
@@ -1149,7 +1208,7 @@ export default function App() {
         return;
       }
 
-      // Release phase: inertial glide + smooth elastic settle + 40px edge Magnetism
+      // Release phase: inertial glide + smooth elastic settle + Left/Right 40px edge Magnetism -> Floating Orb
       const decay = Math.pow(0.9, frameScale);
       drag.vx *= decay;
       drag.vy *= decay;
@@ -1164,43 +1223,33 @@ export default function App() {
 
       const speed = Math.hypot(drag.vx, drag.vy);
       let magnetPending = false;
+      let targetDockAfterSettle: HudDockEdge | null = null;
       const capsule = hudCapsuleRef.current;
 
-      // Magnetism: when drag stops/settles and HUD center is within 40px of any usable screen edge,
-      // find the nearest boundary and smoothly interpolate drag.targetX/Y flush to that edge.
       if (capsule && speed < 0.18) {
-        const halfW = capsule.offsetWidth / 2;
-        const halfH = capsule.offsetHeight / 2;
-        const baseLeft = capsule.offsetLeft;
-        const baseTop = capsule.offsetTop;
+        const distLeftEdge = Math.abs(nextTargetX - bounds.minX);
+        const distRightEdge = Math.abs(bounds.maxX - nextTargetX);
+        const nearestEdgeXDist = Math.min(distLeftEdge, distRightEdge);
 
-        const centerX = baseLeft + nextTargetX + halfW;
-        const centerY = baseTop + nextTargetY + halfH;
-
-        const minCenterX = baseLeft + bounds.minX + halfW;
-        const maxCenterX = baseLeft + bounds.maxX + halfW;
-        const minCenterY = baseTop + bounds.minY + halfH;
-        const maxCenterY = baseTop + bounds.maxY + halfH;
-
-        const distLeft = Math.abs(centerX - minCenterX);
-        const distRight = Math.abs(maxCenterX - centerX);
-        const distTop = Math.abs(centerY - minCenterY);
-        const distBottom = Math.abs(maxCenterY - centerY);
-
-        const nearestEdgeXDist = Math.min(distLeft, distRight);
+        const distTop = Math.abs(nextTargetY - bounds.minY);
+        const distBottom = Math.abs(bounds.maxY - nextTargetY);
         const nearestEdgeYDist = Math.min(distTop, distBottom);
         const magnetAlpha = 1 - Math.pow(1 - 0.24, frameScale);
 
         if (nearestEdgeXDist <= HUD_MAGNET_EDGE_THRESHOLD_PX) {
-          const snapX = distLeft <= distRight ? bounds.minX : bounds.maxX;
+          const isLeft = distLeftEdge <= distRightEdge;
+          const snapX = isLeft ? bounds.minX : bounds.maxX;
+          targetDockAfterSettle = isLeft ? 'LEFT' : 'RIGHT';
           const deltaSnapX = snapX - nextTargetX;
-          if (Math.abs(deltaSnapX) < 0.12) {
+          if (Math.abs(deltaSnapX) < 0.15) {
             nextTargetX = snapX;
           } else {
             nextTargetX += deltaSnapX * magnetAlpha;
             drag.vx *= 0.6;
             magnetPending = true;
           }
+        } else {
+          targetDockAfterSettle = 'NONE';
         }
 
         if (nearestEdgeYDist <= HUD_MAGNET_EDGE_THRESHOLD_PX) {
@@ -1231,6 +1280,9 @@ export default function App() {
         drag.vy = 0;
         applyHudTransform(nextTargetX, nextTargetY);
         hudAnimRafRef.current = null;
+        if (targetDockAfterSettle !== null && targetDockAfterSettle !== hudDockedEdgeRef.current) {
+          setHudDockedEdge(targetDockAfterSettle);
+        }
         return;
       }
 
@@ -1340,6 +1392,9 @@ export default function App() {
         drag.vy = 0;
       }
       ensureHudAnimationLoop();
+    } else if (hudDockedEdgeRef.current !== 'NONE') {
+      // Tap the Floating Orb -> expand back into the full HUD capsule
+      setHudDockedEdge('NONE');
     }
   };
 
@@ -1364,12 +1419,17 @@ export default function App() {
         ? 'animate-high-load-shadow ring-1 ring-red-400/35'
         : 'animate-high-load-shadow ring-1 ring-red-500/30'
       : '';
+    const miuixEnergyBlurClass =
+      hudTheme === 'MIUIX' && isHighBatteryImpact && !isSessionDeepCleaned
+        ? 'animate-miuix-energy-blur'
+        : '';
 
     if (isStaleOffline) {
       if (hudTheme === 'MIUIX') {
-        return simDarkTheme
+        const base = simDarkTheme
           ? 'bg-zinc-900/80 backdrop-blur-xl border-slate-500/40 text-slate-400 shadow-lg shadow-black/40'
           : 'bg-white/85 backdrop-blur-xl border-slate-400/40 text-slate-500 shadow-lg shadow-slate-900/10';
+        return miuixEnergyBlurClass ? `${base} ${miuixEnergyBlurClass}` : base;
       }
       return simDarkTheme
         ? 'bg-[#292533]/95 border-gray-500/45 text-gray-400 shadow-md shadow-black/40'
@@ -1379,13 +1439,13 @@ export default function App() {
       const base = simDarkTheme
         ? 'bg-zinc-900/80 backdrop-blur-xl border-white/20 text-slate-50 shadow-lg shadow-black/40'
         : 'bg-white/85 backdrop-blur-xl border-slate-900/12 text-slate-900 shadow-lg shadow-slate-900/12';
-      return highLoadClass ? `${base} ${highLoadClass}` : base;
+      return [base, highLoadClass, miuixEnergyBlurClass].filter(Boolean).join(' ');
     }
     const base = simDarkTheme
       ? 'bg-[#292533]/95 border-[#938F99]/40 text-[#E6E1E5] shadow-md shadow-black/40'
       : 'bg-[#F5EFFB]/95 border-[#CAC4D0]/70 text-[#1D1B20] shadow-md shadow-indigo-950/10';
     return highLoadClass ? `${base} ${highLoadClass}` : base;
-  }, [hudTheme, simDarkTheme, isStaleOffline, isHighLoadQuota]);
+  }, [hudTheme, simDarkTheme, isStaleOffline, isHighLoadQuota, isHighBatteryImpact, isSessionDeepCleaned]);
 
   const capsuleLabelClass = useMemo(() => {
     if (isStaleOffline) {
@@ -1858,19 +1918,57 @@ export default function App() {
                   <span className="text-xs font-medium text-slate-600">
                     {isZh ? 'Gemini 宿主深浅色自适应测试' : 'Gemini Host Light / Dark Mode'}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => setSimDarkTheme((d) => !d)}
-                    className="px-3 py-1 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 transition-colors cursor-pointer"
-                  >
-                    {simDarkTheme
-                      ? isZh
-                        ? '当前：深色宿主 (切换浅色)'
-                        : 'Host: Dark (Switch to Light)'
-                      : isZh
-                      ? '当前：浅色宿主 (切换深色)'
-                      : 'Host: Light (Switch to Dark)'}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <div className="inline-flex items-center gap-1 p-0.5 bg-slate-200/80 rounded-lg text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setHudDockedEdge('LEFT')}
+                        className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
+                          hudDockedEdge === 'LEFT'
+                            ? 'bg-slate-900 text-white'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {isZh ? '左贴边球' : 'Left Orb'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setHudDockedEdge('NONE')}
+                        className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
+                          hudDockedEdge === 'NONE'
+                            ? 'bg-slate-900 text-white'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {isZh ? '展开胶囊' : 'Capsule'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setHudDockedEdge('RIGHT')}
+                        className={`px-2 py-0.5 rounded-md font-medium transition-colors cursor-pointer ${
+                          hudDockedEdge === 'RIGHT'
+                            ? 'bg-slate-900 text-white'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {isZh ? '右贴边球' : 'Right Orb'}
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setSimDarkTheme((d) => !d)}
+                      className="px-3 py-1 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 transition-colors cursor-pointer"
+                    >
+                      {simDarkTheme
+                        ? isZh
+                          ? '当前：深色宿主 (切换浅色)'
+                          : 'Host: Dark (Switch to Light)'
+                        : isZh
+                        ? '当前：浅色宿主 (切换深色)'
+                        : 'Host: Light (Switch to Dark)'}
+                    </button>
+                  </div>
                 </div>
 
                 <div
@@ -2070,7 +2168,7 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* EXACT SINGLE-LINE CAPSULE HUD (`QuotaHudView.kt` Spec — Foreground Only) */}
+                  {/* EXACT SINGLE-LINE CAPSULE / EDGE-DOCKED FLOATING ORB HUD (`QuotaHudView.kt` Spec — Foreground Only) */}
                   {isGeminiForeground && (
                     <div
                       ref={hudCapsuleRef}
@@ -2078,10 +2176,107 @@ export default function App() {
                       onPointerMove={onHudPointerMove}
                       onPointerUp={onHudPointerUp}
                       onPointerCancel={onHudPointerUp}
-                      className={`absolute top-12 right-2.5 max-w-[96%] inline-flex flex-col items-stretch rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${
-                        isStaleOffline ? 'px-3 py-1.5' : 'px-2.5 py-1.5'
+                      title={
+                        hudDockedEdge !== 'NONE'
+                          ? isZh
+                            ? '点击悬浮球展开胶囊，或拖拽至左右边缘贴边切换'
+                            : 'Tap floating orb to expand capsule, or drag to left/right edge'
+                          : isZh
+                          ? '拖拽胶囊贴近左右边缘自动收起为悬浮球'
+                          : 'Drag capsule to left or right edge to dock as a floating orb'
+                      }
+                      className={`absolute top-12 left-0 max-w-[96%] inline-flex flex-col items-stretch rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${
+                        hudDockedEdge !== 'NONE'
+                          ? 'w-11 h-11 p-1 items-center justify-center'
+                          : isStaleOffline
+                          ? 'px-3 py-1.5'
+                          : 'px-2.5 py-1.5'
                       } ${capsuleContainerClass}`}
                     >
+                      {hudDockedEdge !== 'NONE' ? (() => {
+                        const pct5 = isSessionDeepCleaned ? 0 : activeSession.parsed.fiveHourPct;
+                        const pctWk = isSessionDeepCleaned ? 0 : activeSession.parsed.weeklyPct;
+                        const rOuter = 16;
+                        const cOuter = 2 * Math.PI * rOuter;
+                        const rInner = 12;
+                        const cInner = 2 * Math.PI * rInner;
+                        const ringStrokeClass = isStaleOffline
+                          ? 'stroke-slate-400'
+                          : pct5 >= 90
+                          ? simDarkTheme
+                            ? 'stroke-red-400'
+                            : 'stroke-red-500'
+                          : pct5 >= 75
+                          ? simDarkTheme
+                            ? 'stroke-amber-400'
+                            : 'stroke-amber-500'
+                          : hudTheme === 'MD3'
+                          ? simDarkTheme
+                            ? 'stroke-violet-300'
+                            : 'stroke-violet-600'
+                          : simDarkTheme
+                          ? 'stroke-sky-400'
+                          : 'stroke-blue-500';
+                        const trackStrokeClass =
+                          hudTheme === 'MIUIX'
+                            ? simDarkTheme
+                              ? 'stroke-white/15'
+                              : 'stroke-slate-900/12'
+                            : simDarkTheme
+                            ? 'stroke-[#4A4458]'
+                            : 'stroke-[#E8DEF8]';
+                        return (
+                          <div className="relative w-9 h-9 flex items-center justify-center">
+                            <svg viewBox="0 0 38 38" className="w-9 h-9 -rotate-90">
+                              <circle
+                                cx="19"
+                                cy="19"
+                                r={rOuter}
+                                fill="none"
+                                strokeWidth="3"
+                                className={trackStrokeClass}
+                              />
+                              {pct5 > 0 && (
+                                <circle
+                                  cx="19"
+                                  cy="19"
+                                  r={rOuter}
+                                  fill="none"
+                                  strokeWidth="3"
+                                  strokeLinecap="round"
+                                  strokeDasharray={cOuter}
+                                  strokeDashoffset={cOuter * (1 - pct5 / 100)}
+                                  className={ringStrokeClass}
+                                />
+                              )}
+                              {pctWk > 0 && (
+                                <circle
+                                  cx="19"
+                                  cy="19"
+                                  r={rInner}
+                                  fill="none"
+                                  strokeWidth="1.5"
+                                  strokeLinecap="round"
+                                  strokeDasharray={cInner}
+                                  strokeDashoffset={cInner * (1 - pctWk / 100)}
+                                  className="stroke-teal-400/70"
+                                />
+                              )}
+                            </svg>
+                            <span className="absolute inset-0 flex items-center justify-center text-[9.5px] font-bold tabular-nums leading-none">
+                              {isSessionDeepCleaned ? '--' : activeSession.parsed.fiveHourQuota}
+                            </span>
+                            {isStaleOffline && (
+                              <span
+                                className={`absolute top-0 ${
+                                  hudDockedEdge === 'LEFT' ? 'right-0' : 'left-0'
+                                } w-2 h-2 rounded-full bg-orange-400 animate-pulse`}
+                              />
+                            )}
+                          </div>
+                        );
+                      })() : (
+                      <>
                       <div className="inline-flex items-center">
                         {isStaleOffline && (
                           <span
@@ -2230,6 +2425,8 @@ export default function App() {
                           </div>
                         );
                       })()}
+                      </>
+                      )}
                     </div>
                   )}
               </div>
@@ -2415,17 +2612,36 @@ export default function App() {
                   {/* Battery Impact & Energy Statistics Section */}
                   <div className="rounded-xl border border-teal-500/30 bg-teal-950/20 px-3.5 py-3 space-y-2.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <BatteryCharging className="w-4 h-4 text-teal-400" />
                         <span className="text-xs font-semibold text-slate-100">
                           {isZh ? '电池消耗影响 · Battery Impact' : 'Battery Impact'}
                         </span>
-                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
+                        <span
+                          className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                            isHighBatteryImpact
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                              : 'bg-teal-500/15 text-teal-300 border-teal-500/30'
+                          }`}
+                        >
                           Energy Impact: {energyImpactRating} ({energyImpactScore})
                         </span>
+                        {isHighBatteryImpact && hudTheme === 'MIUIX' && (
+                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 animate-pulse">
+                            {isZh ? 'MIUIX 毛玻璃呼吸动画已激活' : 'MIUIX Blur Animation Active'}
+                          </span>
+                        )}
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleSimulateHighBatteryImpact}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-amber-950/60 hover:bg-amber-900/60 text-amber-200 border border-amber-700/60 transition-colors cursor-pointer"
+                        >
+                          <span>{isZh ? '模拟高能耗 (>=20)' : 'Simulate High Load'}</span>
+                        </button>
+
                         <button
                           type="button"
                           onClick={() => setShowEnergyImpactStats((v) => !v)}

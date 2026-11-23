@@ -161,8 +161,16 @@ class MainActivity : Activity() {
 
         previewCaptionView?.text = loc.getString(R.string.settings_preview_caption)
 
+        val energyObj = try {
+            JSONObject(state.energyStatsJson.ifBlank { "{}" })
+        } catch (_: Throwable) {
+            JSONObject()
+        }
+        val eScore = energyObj.optDouble("energyScore", 0.0)
+
         liveCapsulePreview?.applyPreferences(state.lang, state.theme)
         liveCapsulePreview?.updateSnapshot(snap)
+        liveCapsulePreview?.updateEnergyScore(eScore)
 
         settingsSectionTitle?.text = loc.getString(R.string.settings_appearance_title)
 
@@ -267,13 +275,7 @@ class MainActivity : Activity() {
             }
         }
 
-        val energyObj = try {
-            JSONObject(state.energyStatsJson.ifBlank { "{}" })
-        } catch (_: Throwable) {
-            JSONObject()
-        }
         val eRating = energyObj.optString("rating", "Minimal")
-        val eScore = energyObj.optDouble("energyScore", 0.0)
         val eFg = energyObj.optLong("fgDispatches", 0L)
         val eBgSkip = energyObj.optLong("bgSuppressed", 0L)
         val eHooks = energyObj.optLong("hookEvents", 0L)

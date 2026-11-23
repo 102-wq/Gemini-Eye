@@ -71,6 +71,12 @@ class QuotaHudView(
         }
     }
 
+    enum class DockEdge {
+        NONE,
+        LEFT,
+        RIGHT
+    }
+
     data class Snapshot(
         val fiveHourQuota: String = "--",
         val fiveHourReset: String = "--",
@@ -149,6 +155,19 @@ class QuotaHudView(
         private set
     var currentTheme: ThemeMode = ThemeMode.MIUIX
         private set
+    private var currentEnergyScore: Double = 0.0
+
+    private var miuixBlurAnimator: ValueAnimator? = null
+    private var miuixBlurPhase: Float = 0f
+    private val backdropGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val backdropRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+    }
+    private val backdropRect = RectF()
+    private var activeBgDrawable: GradientDrawable? = null
+    private var activePalette: Palette? = null
 
     private val offlineDotView: OfflineDotView
     private val fiveHourLabelView: TextView
@@ -162,15 +181,20 @@ class QuotaHudView(
     private val dividerTwoView: View
     private val refreshIconBtn: HudActionIconView
     private val externalLinkBtn: HudActionIconView
+    private val floatingOrbView: FloatingOrbView
 
     private val touchSlopPx: Int = ViewConfiguration.get(context).scaledTouchSlop
     private var downRawX = 0f
     private var downRawY = 0f
     private var lastRawX = 0f
     private var lastRawY = 0f
-    private var startRightMargin = 0
+    private var startLeftMargin = 0
     private var startTopMargin = 0
+    private var lastParentWidth = 0
+    private var lastParentHeight = 0
     private var isDraggingCapsule = false
+    var currentDockedEdge: DockEdge = DockEdge.NONE
+        private set
 
     init {
         tag = HUD_VIEW_TAG
@@ -178,6 +202,7 @@ class QuotaHudView(
         gravity = Gravity.CENTER_VERTICAL
         isClickable = true
         clipToPadding = false
+        setWillNotDraw(false)
 
         val padStart = dp(context, 10f)
         val padEnd = dp(context, 7f)
@@ -304,6 +329,13 @@ class QuotaHudView(
             }
         }
 
+        floatingOrbView = FloatingOrbView(context).apply {
+            tag = "bard_quota_hud_orb"
+            val orbSize = dp(context, 36f)
+            layoutParams = LayoutParams(orbSize, orbSize)
+            visibility = View.GONE
+        }
+
         addView(offlineDotView)
         addView(fiveHourLabelView)
         addView(fiveHourBarView)
@@ -316,6 +348,7 @@ class QuotaHudView(
         addView(dividerTwoView)
         addView(refreshIconBtn)
         addView(externalLinkBtn)
+        addView(floatingOrbView)
 
         renderAll()
     }
@@ -351,6 +384,16 @@ class QuotaHudView(
         renderAll()
     }
 
+    fun updateEnergyScore(score: Double) {
+        val clamped = score.coerceIn(0.0, 100.0)
+        if (abs(clamped - currentEnergyScore) >= 0.05 || (clamped >= HIGH_BATTERY_IMPACT_THRESHOLD) != isHighBatteryImpact()) {
+            currentEnergyScore = clamped
+            renderAll()
+        }
+    }
+
+    fun isHighBatteryImpact(): Boolean = currentEnergyScore >= HIGH_BATTERY_IMPACT_THRESHOLD
+
     fun triggerRefreshSpin() {
         refreshIconBtn.spinOnce()
     }
@@ -360,13 +403,18 @@ class QuotaHudView(
         renderAll()
     }
 
+    override fun onDetachedFromWindow() {
+        stopMiuixBlurAnimation()
+        super.onDetachedFromWindow()
+    }
+
     private fun renderAll() {
         val palette = resolvePalette(context, currentTheme)
         val labels = resolveLocalizedHudLabels(context, currentLang)
         val safeSnap = currentSnapshot.sanitized()
         val stale = safeSnap.isStaleOffline
 
-        background = GradientDrawable(
+        val bgDrawable = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
             intArrayOf(palette.bgTop, palette.bgBottom)
         ).apply {
@@ -374,10 +422,19 @@ class QuotaHudView(
             cornerRadius = palette.cornerPx
             setStroke(maxOf(1, dp(context, 0.9f)), if (stale) palette.staleBorder else palette.border)
         }
+        activeBgDrawable = bgDrawable
+        activePalette = palette
+        background = bgDrawable
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             outlineSpotShadowColor = palette.shadowSpot
             outlineAmbientShadowColor = palette.shadowSpot
+        }
+
+        if (currentTheme == ThemeMode.MIUIX && isHighBatteryImpact() && isAttachedToWindow) {
+            startMiuixBlurAnimation()
+        } else {
+            stopMiuixBlurAnimation()
         }
 
         val activeLabelColor = if (stale) palette.staleText else palette.labelText
@@ -436,6 +493,122 @@ class QuotaHudView(
         externalLinkBtn.contentDescription = labels.openUsageDesc
         refreshIconBtn.updateColors(if (stale) palette.staleText else palette.iconColor, palette.iconPressedBg)
         externalLinkBtn.updateColors(if (stale) palette.staleText else palette.iconColor, palette.iconPressedBg)
+
+        val isOrb = currentDockedEdge != DockEdge.NONE
+        val capsuleVisibility = if (isOrb) View.GONE else View.VISIBLE
+        fiveHourLabelView.visibility = capsuleVisibility
+        fiveHourBarView.visibility = capsuleVisibility
+        fiveHourValueView.visibility = capsuleVisibility
+        dividerOneView.visibility = capsuleVisibility
+        weeklyLabelView.visibility = capsuleVisibility
+        weeklyBarView.visibility = capsuleVisibility
+        weeklyValueView.visibility = capsuleVisibility
+        dividerTwoView.visibility = capsuleVisibility
+        refreshIconBtn.visibility = capsuleVisibility
+        externalLinkBtn.visibility = capsuleVisibility
+        if (isOrb) {
+            offlineDotView.visibility = View.GONE
+            offlineTagView.visibility = View.GONE
+            val orbPad = dp(context, 4f)
+            setPadding(orbPad, orbPad, orbPad, orbPad)
+            val pctText = if (safeSnap.fiveHourQuota == "--") {
+                "--"
+            } else {
+                safeSnap.fiveHourQuota.trim()
+            }
+            floatingOrbView.update(
+                fiveHourFraction = p5,
+                weeklyFraction = pW,
+                centerText = pctText,
+                trackColor = palette.trackColor,
+                ringColor = if (stale) palette.staleBar else pickBarColor(p5, palette),
+                weeklyAccentColor = if (stale) palette.staleBar else pickBarColor(pW, palette),
+                textColor = if (stale) palette.staleText else palette.primaryText,
+                edge = currentDockedEdge,
+                isStale = stale,
+                staleDotColor = palette.offlineDot
+            )
+            floatingOrbView.visibility = View.VISIBLE
+        } else {
+            floatingOrbView.visibility = View.GONE
+            setPadding(dp(context, 10f), dp(context, 5.5f), dp(context, 7f), dp(context, 5.5f))
+        }
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (currentTheme == ThemeMode.MIUIX && isHighBatteryImpact()) {
+            startMiuixBlurAnimation()
+        }
+    }
+
+    private fun startMiuixBlurAnimation() {
+        if (miuixBlurAnimator?.isRunning == true) return
+        miuixBlurAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 2800L
+            repeatMode = ValueAnimator.REVERSE
+            repeatCount = ValueAnimator.INFINITE
+            addUpdateListener { anim ->
+                val phase = (anim.animatedValue as? Float) ?: 0f
+                miuixBlurPhase = phase
+                applyMiuixBlurFrame(phase)
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    private fun stopMiuixBlurAnimation() {
+        try {
+            miuixBlurAnimator?.cancel()
+        } catch (_: Throwable) {
+        }
+        miuixBlurAnimator = null
+        miuixBlurPhase = 0f
+    }
+
+    private fun applyMiuixBlurFrame(phase: Float) {
+        val pal = activePalette ?: return
+        val bg = activeBgDrawable ?: return
+        if (currentTheme != ThemeMode.MIUIX || !isHighBatteryImpact()) return
+        val dark = isHostDark(context)
+        val topAlpha = if (dark) (204 + (phase * 28f).toInt()) else (224 + (phase * 24f).toInt())
+        val botAlpha = if (dark) (192 + (phase * 32f).toInt()) else (210 + (phase * 26f).toInt())
+        bg.colors = intArrayOf(withAlpha(pal.bgTop, topAlpha), withAlpha(pal.bgBottom, botAlpha))
+        val rimTint = if (dark) {
+            withAlpha(Color.parseColor("#5EEAD4"), (55 + (phase * 90f).toInt()))
+        } else {
+            withAlpha(Color.parseColor("#0D9488"), (45 + (phase * 75f).toInt()))
+        }
+        bg.setStroke(maxOf(1, dp(context, 0.9f + phase * 0.45f)), rimTint)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (currentTheme == ThemeMode.MIUIX && isHighBatteryImpact()) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w > 0f && h > 0f) {
+                val r = h / 2f
+                val dark = isHostDark(context)
+                val breathe = miuixBlurPhase
+                backdropRect.set(dpF(context, 1.5f), dpF(context, 1.5f), w - dpF(context, 1.5f), h - dpF(context, 1.5f))
+                backdropGlowPaint.color = if (dark) {
+                    withAlpha(Color.parseColor("#2DD4BF"), (10 + (breathe * 18f).toInt()))
+                } else {
+                    withAlpha(Color.parseColor("#14B8A6"), (8 + (breathe * 16f).toInt()))
+                }
+                canvas.drawRoundRect(backdropRect, r, r, backdropGlowPaint)
+
+                backdropRimPaint.strokeWidth = dpF(context, 1.1f)
+                backdropRimPaint.color = if (dark) {
+                    withAlpha(Color.WHITE, (20 + (breathe * 34f).toInt()))
+                } else {
+                    withAlpha(Color.WHITE, (70 + (breathe * 80f).toInt()))
+                }
+                canvas.drawRoundRect(backdropRect, r, r, backdropRimPaint)
+            }
+        }
     }
 
     private fun pickBarColor(fraction: Float, palette: Palette): Int {
@@ -450,6 +623,45 @@ class QuotaHudView(
     // Capsule Drag vs Child Action Button Click Disambiguation
     // =========================================================================
 
+    fun setDockedEdge(edge: DockEdge, animateMargin: Boolean = true) {
+        if (currentDockedEdge == edge) return
+        currentDockedEdge = edge
+        renderAll()
+        if (animateMargin && draggableInFrame) {
+            post {
+                val parentView = parent as? View ?: return@post
+                val pw = parentView.width
+                val lp = layoutParams as? FrameLayout.LayoutParams ?: return@post
+                normalizeLayoutParamsToStart(lp, pw)
+                val edgePad = dp(context, 4f)
+                val viewW = if (width > 0) width else measuredWidth
+                when (edge) {
+                    DockEdge.LEFT -> lp.leftMargin = edgePad
+                    DockEdge.RIGHT -> lp.leftMargin = maxOf(edgePad, pw - viewW - edgePad)
+                    DockEdge.NONE -> {
+                        val safePad = dp(context, 10f)
+                        lp.leftMargin = lp.leftMargin.coerceIn(safePad, maxOf(safePad, pw - viewW - safePad))
+                    }
+                }
+                layoutParams = lp
+            }
+        }
+    }
+
+    private fun normalizeLayoutParamsToStart(lp: FrameLayout.LayoutParams, parentWidth: Int) {
+        if ((lp.gravity and Gravity.HORIZONTAL_GRAVITY_MASK) != Gravity.START) {
+            val resolvedLeft = if (left > 0 || width > 0) {
+                left
+            } else {
+                maxOf(0, parentWidth - lp.rightMargin - measuredWidth)
+            }
+            lp.gravity = Gravity.TOP or Gravity.START
+            lp.leftMargin = maxOf(0, resolvedLeft)
+            lp.rightMargin = 0
+            layoutParams = lp
+        }
+    }
+
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
         if (!draggableInFrame && onWindowDrag == null) {
             return super.onInterceptTouchEvent(ev)
@@ -461,9 +673,13 @@ class QuotaHudView(
                 lastRawX = ev.rawX
                 lastRawY = ev.rawY
                 isDraggingCapsule = false
+                val parentView = parent as? View
+                lastParentWidth = parentView?.width ?: 0
+                lastParentHeight = parentView?.height ?: 0
                 val lp = layoutParams as? FrameLayout.LayoutParams
-                if (lp != null) {
-                    startRightMargin = lp.rightMargin
+                if (lp != null && lastParentWidth > 0) {
+                    normalizeLayoutParamsToStart(lp, lastParentWidth)
+                    startLeftMargin = lp.leftMargin
                     startTopMargin = lp.topMargin
                 }
                 return false
@@ -498,9 +714,13 @@ class QuotaHudView(
                 lastRawX = ev.rawX
                 lastRawY = ev.rawY
                 isDraggingCapsule = false
+                val parentView = parent as? View
+                lastParentWidth = parentView?.width ?: 0
+                lastParentHeight = parentView?.height ?: 0
                 val lp = layoutParams as? FrameLayout.LayoutParams
-                if (lp != null) {
-                    startRightMargin = lp.rightMargin
+                if (lp != null && lastParentWidth > 0) {
+                    normalizeLayoutParamsToStart(lp, lastParentWidth)
+                    startLeftMargin = lp.leftMargin
                     startTopMargin = lp.topMargin
                 }
                 return true
@@ -523,8 +743,12 @@ class QuotaHudView(
                     } else if (draggableInFrame) {
                         val lp = layoutParams as? FrameLayout.LayoutParams
                         if (lp != null) {
-                            lp.rightMargin = maxOf(dp(context, 4f), startRightMargin - totalDx.toInt())
-                            lp.topMargin = maxOf(dp(context, 24f), startTopMargin + totalDy.toInt())
+                            val pw = lastParentWidth.takeIf { it > 0 } ?: (parent as? View)?.width ?: 0
+                            val ph = lastParentHeight.takeIf { it > 0 } ?: (parent as? View)?.height ?: 0
+                            val maxLeft = if (pw > 0) maxOf(0, pw - width) else Int.MAX_VALUE
+                            val maxTop = if (ph > 0) maxOf(dp(context, 24f), ph - height - dp(context, 16f)) else Int.MAX_VALUE
+                            lp.leftMargin = (startLeftMargin + totalDx.toInt()).coerceIn(0, maxLeft)
+                            lp.topMargin = (startTopMargin + totalDy.toInt()).coerceIn(dp(context, 24f), maxTop)
                             layoutParams = lp
                         }
                     }
@@ -532,7 +756,29 @@ class QuotaHudView(
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val wasDragging = isDraggingCapsule
                 isDraggingCapsule = false
+                if (!wasDragging) {
+                    if (currentDockedEdge != DockEdge.NONE) {
+                        // Tap the floating orb -> expand smoothly back into full capsule
+                        setDockedEdge(DockEdge.NONE, animateMargin = true)
+                    }
+                    return true
+                }
+                if (draggableInFrame && onWindowDrag == null) {
+                    val lp = layoutParams as? FrameLayout.LayoutParams
+                    val pw = lastParentWidth.takeIf { it > 0 } ?: (parent as? View)?.width ?: 0
+                    if (lp != null && pw > 0) {
+                        val distLeft = lp.leftMargin
+                        val distRight = maxOf(0, pw - width - lp.leftMargin)
+                        val dockThreshold = dp(context, 26f)
+                        when {
+                            distLeft <= dockThreshold && distLeft <= distRight -> setDockedEdge(DockEdge.LEFT, animateMargin = true)
+                            distRight <= dockThreshold -> setDockedEdge(DockEdge.RIGHT, animateMargin = true)
+                            else -> setDockedEdge(DockEdge.NONE, animateMargin = true)
+                        }
+                    }
+                }
                 return true
             }
         }
@@ -748,9 +994,99 @@ class QuotaHudView(
         }
     }
 
+    private class FloatingOrbView(context: Context) : View(context) {
+        private val ringTrackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(context, 2.8f)
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val ringProgressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(context, 2.8f)
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val weeklyArcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dpF(context, 1.5f)
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.CENTER
+            textSize = dpF(context, 9.5f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            fontFeatureSettings = "tnum"
+        }
+        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+        private val outerRect = RectF()
+        private val innerRect = RectF()
+        private var f5: Float = 0f
+        private var fW: Float = 0f
+        private var label: String = "--"
+        private var isStale: Boolean = false
+        private var staleDotColor: Int = Color.parseColor("#FB923C")
+        private var edge: DockEdge = DockEdge.NONE
+
+        fun update(
+            fiveHourFraction: Float,
+            weeklyFraction: Float,
+            centerText: String,
+            trackColor: Int,
+            ringColor: Int,
+            weeklyAccentColor: Int,
+            textColor: Int,
+            edge: DockEdge,
+            isStale: Boolean,
+            staleDotColor: Int
+        ) {
+            this.f5 = fiveHourFraction.coerceIn(0f, 1f)
+            this.fW = weeklyFraction.coerceIn(0f, 1f)
+            this.label = centerText
+            this.ringTrackPaint.color = trackColor
+            this.ringProgressPaint.color = ringColor
+            this.weeklyArcPaint.color = withAlpha(weeklyAccentColor, 185)
+            this.textPaint.color = textColor
+            this.edge = edge
+            this.isStale = isStale
+            this.staleDotColor = staleDotColor
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+            val cx = w / 2f
+            val cy = h / 2f
+            val inset = dpF(context, 3.2f)
+            outerRect.set(inset, inset, w - inset, h - inset)
+            canvas.drawArc(outerRect, 0f, 360f, false, ringTrackPaint)
+            if (f5 > 0.005f) {
+                canvas.drawArc(outerRect, -90f, 360f * f5, false, ringProgressPaint)
+            }
+            val innerInset = dpF(context, 6.4f)
+            innerRect.set(innerInset, innerInset, w - innerInset, h - innerInset)
+            if (fW > 0.005f) {
+                canvas.drawArc(innerRect, -90f, 360f * fW, false, weeklyArcPaint)
+            }
+            val fm = textPaint.fontMetrics
+            val baseline = cy - (fm.ascent + fm.descent) / 2f
+            canvas.drawText(label, cx, baseline, textPaint)
+
+            if (isStale) {
+                dotPaint.color = staleDotColor
+                val dotX = if (edge == DockEdge.LEFT) w - dpF(context, 4f) else dpF(context, 4f)
+                canvas.drawCircle(dotX, dpF(context, 4f), dpF(context, 2.2f), dotPaint)
+            }
+        }
+    }
+
     companion object {
         const val HUD_VIEW_TAG = "bard_quota_hud_capsule_v19"
         const val MODULE_PACKAGE = "com.example.bardquotahook"
+        const val HIGH_BATTERY_IMPACT_THRESHOLD = 20.0
 
         private fun resolveLocalizedHudLabels(context: Context, lang: Lang): LocalizedHudLabels {
             val isZh = lang == Lang.ZH
