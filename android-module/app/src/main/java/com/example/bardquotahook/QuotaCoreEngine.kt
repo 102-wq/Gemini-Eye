@@ -77,6 +77,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -266,6 +267,10 @@ object QuotaCoreEngine {
     private val currentLang = AtomicReference(QuotaSyncProvider.defaultLangForDevice())
     private val currentTheme = AtomicReference(QuotaHudView.ThemeMode.MIUIX)
     private val currentHudOpacity = AtomicInteger(QuotaSyncProvider.DEFAULT_HUD_OPACITY)
+    private val currentHighEnergyThreshold = AtomicInteger(QuotaSyncProvider.DEFAULT_HIGH_ENERGY_THRESHOLD)
+    private val currentTrendConsecutiveThreshold = AtomicInteger(QuotaSyncProvider.DEFAULT_TREND_CONSECUTIVE_THRESHOLD)
+    private val currentTrendAutoDismissEnabled = AtomicBoolean(QuotaSyncProvider.DEFAULT_TREND_AUTO_DISMISS_ENABLED)
+    private val currentTrendAutoDismissSec = AtomicInteger(QuotaSyncProvider.DEFAULT_TREND_AUTO_DISMISS_SEC)
 
     // Strong account-switch tracking (never churns across different OAuth scopes on the same account)
     @Volatile private var confirmedIdentityKey: String? = null
@@ -466,10 +471,34 @@ object QuotaCoreEngine {
         private val totalCpuTimeNs = AtomicLong(0L)
         private const val SURGE_DELTA_THRESHOLD = 15.0
         private const val TREND_WINDOW_MS = 5 * 60 * 1000L
-        private const val TREND_MIN_CONSECUTIVE_INCREASES = 3
+        private const val MA_WINDOW_SIZE = 4
+        private const val SPIKE_SENSITIVITY_DELTA = 5.0
+        private data class EnergyTimelineSample(
+            val index: Int,
+            val timestampMs: Long,
+            val sessionId: String,
+            val event: String,
+            val maWindowSize: Int,
+            val filteredScore: Double,
+            val rawScore: Double,
+            val scoreDelta: Double,
+            val spikeBypass: Boolean,
+            val aboveHighThreshold: Boolean,
+            val cpuMs: Double,
+            val wallMs: Double,
+            val fgDispatches: Long,
+            val netReqs: Long,
+            val estimatedMah: Double
+        )
+
+        private const val MAX_TIMELINE_ENTRIES = 5000
         private val logLock = Any()
         private val ringLogs = ArrayList<String>(32)
         private val trendSamples = ArrayList<Pair<Long, Double>>(32)
+        private val maWindow = ArrayList<Double>(MA_WINDOW_SIZE)
+        private val timelineHistory = ArrayList<EnergyTimelineSample>(256)
+        @Volatile private var smoothedEnergyScore: Double = 0.0
+        @Volatile private var spikeBypassActive: Boolean = false
         @Volatile private var lastHeartbeatScoreBaseline: Double = 0.0
         @Volatile private var surgeAlertedInCycle: Boolean = false
         @Volatile private var lastSurgeDelta: Double = 0.0
@@ -490,9 +519,66 @@ object QuotaCoreEngine {
             hookEvents.incrementAndGet()
         }
 
+        private fun updateMovingAverageSample(rawScore: Double, eventName: String = "SAMPLE") {
+            val nowMs = System.currentTimeMillis()
+            val fg = fgDispatches.get()
+            val netReq = networkReplays.get()
+            val bytes = networkBytes.get()
+            val cpuMsVal = ((totalCpuTimeNs.get() / 1_000_000.0) * 10.0).roundToInt() / 10.0
+            val wallMsVal = ((totalWallTimeNs.get() / 1_000_000.0) * 10.0).roundToInt() / 10.0
+            val estMahVal = (((cpuMsVal * 0.00018) + (netReq * 0.012) + (bytes / 1_048_576.0 * 0.05)) * 10000.0).roundToInt() / 10000.0
+            val sess = activeSessionTag.get().ifBlank { "sess_default" }
+            synchronized(logLock) {
+                val prevFiltered = if (maWindow.isNotEmpty()) {
+                    maWindow.sum() / maWindow.size
+                } else {
+                    rawScore
+                }
+                val highTh = currentHighEnergyThreshold.get().toDouble()
+                val prevRaw = timelineHistory.lastOrNull()?.rawScore ?: rawScore
+                val isSpike = abs(rawScore - prevFiltered) >= SPIKE_SENSITIVITY_DELTA ||
+                    (rawScore >= highTh && prevFiltered < highTh)
+                if (isSpike) {
+                    maWindow.clear()
+                } else if (maWindow.size >= MA_WINDOW_SIZE) {
+                    maWindow.removeAt(0)
+                }
+                maWindow.add(rawScore)
+                val avg = maWindow.sum() / maWindow.size
+                val roundedFiltered = ((avg * 100.0).roundToInt() / 100.0)
+                smoothedEnergyScore = roundedFiltered
+                spikeBypassActive = isSpike
+                val delta = ((rawScore - prevRaw) * 100.0).roundToInt() / 100.0
+                if (timelineHistory.size >= MAX_TIMELINE_ENTRIES) {
+                    timelineHistory.removeAt(0)
+                }
+                val nextIndex = (timelineHistory.lastOrNull()?.index ?: 0) + 1
+                timelineHistory.add(
+                    EnergyTimelineSample(
+                        index = nextIndex,
+                        timestampMs = nowMs,
+                        sessionId = sess,
+                        event = eventName,
+                        maWindowSize = MA_WINDOW_SIZE,
+                        filteredScore = roundedFiltered,
+                        rawScore = rawScore,
+                        scoreDelta = delta,
+                        spikeBypass = isSpike,
+                        aboveHighThreshold = rawScore >= highTh || roundedFiltered >= highTh,
+                        cpuMs = cpuMsVal,
+                        wallMs = wallMsVal,
+                        fgDispatches = fg,
+                        netReqs = netReq,
+                        estimatedMah = estMahVal
+                    )
+                )
+            }
+        }
+
         fun recordNetworkTransfer(bytesCount: Long, isReplay: Boolean = false) {
             if (isReplay) networkReplays.incrementAndGet()
             if (bytesCount > 0L) networkBytes.addAndGet(bytesCount)
+            updateMovingAverageSample(computeRawEnergyScoreRounded(), if (isReplay) "NET_REPLAY" else "NET_TRANSFER")
             evaluateHeartbeatCycleSurge(activeSessionTag.get(), "NET_TRANSFER", isCycleBoundary = false)
             evaluateUsageTrendWindow(activeSessionTag.get(), "NET_TRANSFER")
         }
@@ -501,6 +587,7 @@ object QuotaCoreEngine {
             fgDispatches.incrementAndGet()
             if (wallNs > 0L) totalWallTimeNs.addAndGet(wallNs)
             if (cpuNs > 0L) totalCpuTimeNs.addAndGet(cpuNs)
+            updateMovingAverageSample(computeRawEnergyScoreRounded(), "FG_TASK")
             evaluateHeartbeatCycleSurge(activeSessionTag.get(), "FG_TASK", isCycleBoundary = false)
             evaluateUsageTrendWindow(activeSessionTag.get(), "FG_TASK")
         }
@@ -537,7 +624,8 @@ object QuotaCoreEngine {
                     }
                 }
                 startScore = trendSamples[startIdx].second
-                if (streak >= TREND_MIN_CONSECUTIVE_INCREASES) {
+                val minConsecutive = currentTrendConsecutiveThreshold.get().coerceIn(2, 10)
+                if (streak >= minConsecutive) {
                     val delta = ((curScore - startScore) * 100.0).roundToInt() / 100.0
                     highUsageTrendActive = true
                     trendConsecutiveIncreases = streak
@@ -548,11 +636,18 @@ object QuotaCoreEngine {
                     if (streak > lastTrendAlertedStreak) {
                         lastTrendAlertedStreak = streak
                         shouldEmitWarn = true
-                        val warnMsg = "[High Usage Trend] $streak consecutive battery score increases in 5-min window: $startScore -> $curScore (+$delta pts, reason=$reason, session=$sessionTag)"
+                        val warnMsg = "[High Usage Trend] $streak consecutive battery score increases in 5-min window (threshold>=$minConsecutive): $startScore -> $curScore (+$delta pts, reason=$reason, session=$sessionTag)"
                         if (ringLogs.size >= 30) ringLogs.removeAt(0)
                         ringLogs.add("${formatTimestampMs(nowMs)} $warnMsg")
                         warnLog(activeBridgeRef.get(), warnMsg)
                     }
+                } else {
+                    highUsageTrendActive = false
+                    trendConsecutiveIncreases = streak
+                    trendStartScore = startScore
+                    trendCurrentScore = curScore
+                    trendWindowDelta = ((curScore - startScore) * 100.0).roundToInt() / 100.0
+                    lastTrendAlertedStreak = 0
                 }
             }
 
@@ -665,17 +760,71 @@ object QuotaCoreEngine {
             val wallMs = (totalWallTimeNs.get() / 1_000_000.0)
             val estMah = (cpuMs * 0.00018) + (netReq * 0.012) + (bytes / 1_048_576.0 * 0.05)
             val score = minOf(100.0, (cpuMs / 50.0) + (netReq * 0.4) + (fg * 0.05))
+            val highTh = currentHighEnergyThreshold.get().toDouble()
+            val minCutoff = minOf(5.0, maxOf(1.0, highTh * 0.25))
             val rating = when {
-                score < 5.0 -> "Minimal"
-                score < 20.0 -> "Low"
-                else -> "Moderate"
+                score < minCutoff -> "Minimal"
+                score < highTh -> "Low"
+                else -> "High"
             }
             val (batPct, isChg) = readPassiveBatterySnapshot()
             val poolActive = try { onDemandExecutor.activeCount } catch (_: Throwable) { 0 }
             val poolSize = try { onDemandExecutor.poolSize } catch (_: Throwable) { 0 }
+            val rawRounded = ((score * 100.0).roundToInt() / 100.0)
+            val maScore = if (smoothedEnergyScore > 0.0 || maWindow.isNotEmpty()) smoothedEnergyScore else rawRounded
+            val timelineJson = JSONArray()
+            val totalTimelineCount: Int
+            val totalSpikeBypassCount: Int
+            synchronized(logLock) {
+                totalTimelineCount = timelineHistory.size
+                totalSpikeBypassCount = timelineHistory.count { it.spikeBypass }
+                val startIdx = maxOf(0, timelineHistory.size - 250)
+                for (i in startIdx until timelineHistory.size) {
+                    val item = timelineHistory[i]
+                    timelineJson.put(
+                        JSONObject().apply {
+                            put("i", item.index)
+                            put("ts", item.timestampMs)
+                            put("sess", item.sessionId)
+                            put("evt", item.event)
+                            put("ma", item.filteredScore)
+                            put("raw", item.rawScore)
+                            put("d", item.scoreDelta)
+                            put("sb", item.spikeBypass)
+                            put("ht", item.aboveHighThreshold)
+                            put("cpu", item.cpuMs)
+                            put("wall", item.wallMs)
+                            put("fg", item.fgDispatches)
+                            put("net", item.netReqs)
+                            put("mah", item.estimatedMah)
+                        }
+                    )
+                }
+            }
             return JSONObject().apply {
                 put("rating", rating)
-                put("energyScore", ((score * 100.0).roundToInt() / 100.0))
+                put("energyScore", rawRounded)
+                put("smoothedEnergyScore", maScore)
+                put("maWindowSize", MA_WINDOW_SIZE)
+                val nowMs = System.currentTimeMillis()
+                val autoDismissEnabled = currentTrendAutoDismissEnabled.get()
+                val autoDismissSec = currentTrendAutoDismissSec.get().coerceIn(5, 60)
+                val trendStillVisible = highUsageTrendActive && (
+                    !autoDismissEnabled ||
+                        lastTrendAlertAtMs <= 0L ||
+                        (nowMs - lastTrendAlertAtMs) < autoDismissSec * 1000L
+                    )
+                if (highUsageTrendActive && !trendStillVisible) {
+                    highUsageTrendActive = false
+                }
+                put("highBatteryThreshold", highTh.toInt())
+                put("trendConsecutiveThreshold", currentTrendConsecutiveThreshold.get().coerceIn(2, 10))
+                put("trendAutoDismissEnabled", autoDismissEnabled)
+                put("trendAutoDismissSec", autoDismissSec)
+                put("spikeBypassActive", spikeBypassActive)
+                put("timelineCount", totalTimelineCount)
+                put("spikeBypassCount", totalSpikeBypassCount)
+                put("timelineSamples", timelineJson)
                 put("fgDispatches", fg)
                 put("bgWakeups", 0)
                 put("bgSuppressed", bgSkip)
@@ -691,13 +840,13 @@ object QuotaCoreEngine {
                 put("poolSize", poolSize)
                 put("lastSurgeDelta", lastSurgeDelta)
                 put("lastSurgeAtMs", lastSurgeAtMs)
-                put("highUsageTrendActive", highUsageTrendActive)
+                put("highUsageTrendActive", trendStillVisible)
                 put("trendConsecutiveIncreases", trendConsecutiveIncreases)
                 put("trendStartScore", trendStartScore)
                 put("trendCurrentScore", trendCurrentScore)
                 put("trendWindowDelta", trendWindowDelta)
                 put("lastTrendAlertAtMs", lastTrendAlertAtMs)
-                put("updatedAtMs", System.currentTimeMillis())
+                put("updatedAtMs", nowMs)
             }
         }
 
@@ -742,17 +891,98 @@ object QuotaCoreEngine {
             }
         }
 
+        private fun csvEscape(value: Any): String {
+            val s = value.toString()
+            return if (s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r')) {
+                "\"" + s.replace("\"", "\"\"") + "\""
+            } else {
+                s
+            }
+        }
+
+        private fun formatIsoUtc(ms: Long): String {
+            return try {
+                val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+                sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                sdf.format(Date(ms))
+            } catch (_: Throwable) {
+                ms.toString()
+            }
+        }
+
+        private fun formatHms(ms: Long): String {
+            return try {
+                SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(ms))
+            } catch (_: Throwable) {
+                ms.toString()
+            }
+        }
+
+        fun buildHistoricalImpactCsv(): String {
+            val samples: List<EnergyTimelineSample> = synchronized(logLock) {
+                if (timelineHistory.isNotEmpty()) {
+                    ArrayList(timelineHistory)
+                } else {
+                    val snap = computeSnapshot()
+                    val now = System.currentTimeMillis()
+                    listOf(
+                        EnergyTimelineSample(
+                            index = 1,
+                            timestampMs = now,
+                            sessionId = activeSessionTag.get().ifBlank { "sess_default" },
+                            event = "SNAPSHOT_BASELINE",
+                            maWindowSize = MA_WINDOW_SIZE,
+                            filteredScore = snap.optDouble("smoothedEnergyScore", 0.0),
+                            rawScore = snap.optDouble("energyScore", 0.0),
+                            scoreDelta = 0.0,
+                            spikeBypass = snap.optBoolean("spikeBypassActive", false),
+                            aboveHighThreshold = snap.optDouble("energyScore", 0.0) >= currentHighEnergyThreshold.get().toDouble(),
+                            cpuMs = snap.optDouble("cpuMs", 0.0),
+                            wallMs = snap.optDouble("wallMs", 0.0),
+                            fgDispatches = snap.optLong("fgDispatches", 0L),
+                            netReqs = snap.optLong("networkReplays", 0L),
+                            estimatedMah = snap.optDouble("estimatedMah", 0.0)
+                        )
+                    )
+                }
+            }
+            val sb = StringBuilder(maxOf(256, samples.size * 110))
+            sb.append("index,timestamp_iso,time_hms,session_id,event,ma_window_size,filtered_ma_score,raw_score,score_delta,spike_bypass,above_high_threshold,cpu_ms,wall_ms,fg_dispatches,net_reqs,estimated_mah\n")
+            for (s in samples) {
+                sb.append(s.index).append(',')
+                    .append(csvEscape(formatIsoUtc(s.timestampMs))).append(',')
+                    .append(csvEscape(formatHms(s.timestampMs))).append(',')
+                    .append(csvEscape(s.sessionId)).append(',')
+                    .append(csvEscape(s.event)).append(',')
+                    .append(s.maWindowSize).append(',')
+                    .append(s.filteredScore).append(',')
+                    .append(s.rawScore).append(',')
+                    .append(s.scoreDelta).append(',')
+                    .append(s.spikeBypass).append(',')
+                    .append(s.aboveHighThreshold).append(',')
+                    .append(s.cpuMs).append(',')
+                    .append(s.wallMs).append(',')
+                    .append(s.fgDispatches).append(',')
+                    .append(s.netReqs).append(',')
+                    .append(s.estimatedMah).append('\n')
+            }
+            return sb.toString().trimEnd('\n')
+        }
+
         fun buildTextReport(zh: Boolean): String {
             val snap = computeSnapshot()
             val sess = activeSessionTag.get()
             val logsSnapshot: List<String> = synchronized(logLock) { ArrayList(ringLogs) }
             val batStr = snap.optInt("batteryPct", -1).let { if (it >= 0) "$it%" else "--" }
+            val timelineCount = snap.optInt("timelineCount", 0)
+            val spikeCount = snap.optInt("spikeBypassCount", 0)
             val sb = StringBuilder(1024)
             if (zh) {
                 sb.append("=== Gemini-Eye 能耗统计报告 (Energy Impact Report) ===\n")
                 sb.append("生成时间: ").append(formatTimestampMs(System.currentTimeMillis())).append('\n')
                 sb.append("当前会话: ").append(sess).append(" | 前台活跃: ").append(isForegroundActive.get()).append('\n')
-                sb.append("能耗评级: ").append(snap.optString("rating")).append(" (Score=").append(snap.optDouble("energyScore")).append(")\n")
+                sb.append("能耗评级: ").append(snap.optString("rating")).append(" (MA(").append(snap.optInt("maWindowSize", MA_WINDOW_SIZE)).append(")=").append(snap.optDouble("smoothedEnergyScore")).append(" | Raw=").append(snap.optDouble("energyScore")).append(")\n")
+                sb.append("历史时间线样本: ").append(timelineCount).append(" 条 (Spike Bypass 尖峰直通: ").append(spikeCount).append(" 次 · 可导出 Historical Impact CSV)\n")
                 sb.append("后台唤醒: 0 次 (1ns 门控拦截: ").append(snap.optLong("bgSuppressed")).append(" 次) | 当前线程池: ")
                     .append(snap.optInt("poolActive")).append('/').append(snap.optInt("poolSize")).append(" 线程\n")
                 sb.append("前台按需派发: ").append(snap.optLong("fgDispatches")).append(" 次 | Hook 事件: ").append(snap.optLong("hookEvents")).append('\n')
@@ -768,7 +998,8 @@ object QuotaCoreEngine {
                 sb.append("=== Gemini-Eye Energy Impact Statistics Report ===\n")
                 sb.append("Generated: ").append(formatTimestampMs(System.currentTimeMillis())).append('\n')
                 sb.append("Session: ").append(sess).append(" | ForegroundActive: ").append(isForegroundActive.get()).append('\n')
-                sb.append("Energy Rating: ").append(snap.optString("rating")).append(" (Score=").append(snap.optDouble("energyScore")).append(")\n")
+                sb.append("Energy Rating: ").append(snap.optString("rating")).append(" (MA(").append(snap.optInt("maWindowSize", MA_WINDOW_SIZE)).append(")=").append(snap.optDouble("smoothedEnergyScore")).append(" | Raw=").append(snap.optDouble("energyScore")).append(")\n")
+                sb.append("Timeline History: ").append(timelineCount).append(" samples (Spike Bypass Events: ").append(spikeCount).append(" · Historical Impact CSV Ready)\n")
                 sb.append("BG Wakeups: 0 (1ns Gate Suppressed: ").append(snap.optLong("bgSuppressed")).append(") | Pool Active/Size: ")
                     .append(snap.optInt("poolActive")).append('/').append(snap.optInt("poolSize")).append(" threads\n")
                 sb.append("FG On-Demand Dispatches: ").append(snap.optLong("fgDispatches")).append(" | Hook Events: ").append(snap.optLong("hookEvents")).append('\n')
@@ -7209,6 +7440,10 @@ object QuotaCoreEngine {
             val langCode = prefs.getString("ui_lang", null)
             val themeCode = prefs.getString("ui_theme", null)
             val savedOpacity = prefs.getInt("hud_opacity", QuotaSyncProvider.DEFAULT_HUD_OPACITY).coerceIn(20, 100)
+            val savedThreshold = prefs.getInt("high_energy_threshold", QuotaSyncProvider.DEFAULT_HIGH_ENERGY_THRESHOLD).coerceIn(5, 60)
+            val savedTrendThreshold = prefs.getInt("trend_consecutive_threshold", QuotaSyncProvider.DEFAULT_TREND_CONSECUTIVE_THRESHOLD).coerceIn(2, 10)
+            val savedAutoDismissEnabled = prefs.getBoolean("trend_auto_dismiss_enabled", QuotaSyncProvider.DEFAULT_TREND_AUTO_DISMISS_ENABLED)
+            val savedAutoDismissSec = prefs.getInt("trend_auto_dismiss_sec", QuotaSyncProvider.DEFAULT_TREND_AUTO_DISMISS_SEC).coerceIn(5, 60)
             val savedSession = prefs.getString("session_id", null)
             val savedStrong = prefs.getBoolean("session_strong", false)
             if (langCode != null) {
@@ -7218,6 +7453,10 @@ object QuotaCoreEngine {
             }
             if (themeCode != null) currentTheme.set(QuotaHudView.ThemeMode.fromCode(themeCode))
             currentHudOpacity.set(savedOpacity)
+            currentHighEnergyThreshold.set(savedThreshold)
+            currentTrendConsecutiveThreshold.set(savedTrendThreshold)
+            currentTrendAutoDismissEnabled.set(savedAutoDismissEnabled)
+            currentTrendAutoDismissSec.set(savedAutoDismissSec)
             if (!savedSession.isNullOrBlank()) {
                 activeSessionTag.set(savedSession)
                 persistedSessionWasStrong = savedStrong
@@ -7278,6 +7517,10 @@ object QuotaCoreEngine {
                 .putString("ui_lang", lang.code)
                 .putString("ui_theme", theme.code)
                 .putInt("hud_opacity", currentHudOpacity.get().coerceIn(20, 100))
+                .putInt("high_energy_threshold", currentHighEnergyThreshold.get().coerceIn(5, 60))
+                .putInt("trend_consecutive_threshold", currentTrendConsecutiveThreshold.get().coerceIn(2, 10))
+                .putBoolean("trend_auto_dismiss_enabled", currentTrendAutoDismissEnabled.get())
+                .putInt("trend_auto_dismiss_sec", currentTrendAutoDismissSec.get().coerceIn(5, 60))
                 .apply()
         } catch (_: Throwable) {
         }
@@ -7340,6 +7583,26 @@ object QuotaCoreEngine {
         val incomingOpacity = state.hudOpacity.coerceIn(20, 100)
         if (currentHudOpacity.get() != incomingOpacity) {
             currentHudOpacity.set(incomingOpacity)
+            uiChanged = true
+        }
+        val incomingThreshold = state.highBatteryThreshold.coerceIn(5, 60)
+        if (currentHighEnergyThreshold.get() != incomingThreshold) {
+            currentHighEnergyThreshold.set(incomingThreshold)
+            uiChanged = true
+        }
+        val incomingTrendThreshold = state.trendConsecutiveThreshold.coerceIn(2, 10)
+        if (currentTrendConsecutiveThreshold.get() != incomingTrendThreshold) {
+            currentTrendConsecutiveThreshold.set(incomingTrendThreshold)
+            uiChanged = true
+        }
+        val incomingAutoDismissEnabled = state.trendAutoDismissEnabled
+        if (currentTrendAutoDismissEnabled.get() != incomingAutoDismissEnabled) {
+            currentTrendAutoDismissEnabled.set(incomingAutoDismissEnabled)
+            uiChanged = true
+        }
+        val incomingAutoDismissSec = state.trendAutoDismissSec.coerceIn(5, 60)
+        if (currentTrendAutoDismissSec.get() != incomingAutoDismissSec) {
+            currentTrendAutoDismissSec.set(incomingAutoDismissSec)
             uiChanged = true
         }
 
@@ -7426,7 +7689,12 @@ object QuotaCoreEngine {
             if (hud != null && hud.isAttachedToWindow) {
                 hud.visibility = View.VISIBLE
                 hud.alpha = 1f
-                hud.applyPreferences(currentLang.get(), currentTheme.get(), currentHudOpacity.get())
+                hud.applyPreferences(
+                    currentLang.get(),
+                    currentTheme.get(),
+                    currentHudOpacity.get(),
+                    currentHighEnergyThreshold.get().toDouble()
+                )
                 hud.updateSnapshot(latestSnapshot.get().sanitized())
                 hud.updateEnergyScore(EnergyImpactMonitor.computeSnapshot().optDouble("energyScore", 0.0))
                 hud.bringToFront()
@@ -7513,7 +7781,12 @@ object QuotaCoreEngine {
 
             hud.visibility = View.VISIBLE
             hud.alpha = 1f
-            hud.applyPreferences(currentLang.get(), currentTheme.get(), currentHudOpacity.get())
+            hud.applyPreferences(
+                currentLang.get(),
+                currentTheme.get(),
+                currentHudOpacity.get(),
+                currentHighEnergyThreshold.get().toDouble()
+            )
             hud.updateSnapshot(latestSnapshot.get().sanitized())
             hud.updateEnergyScore(EnergyImpactMonitor.computeSnapshot().optDouble("energyScore", 0.0))
             hud.bringToFront()
@@ -7682,9 +7955,172 @@ object QuotaCoreEngine {
                     visibility = if (showEnergyImpactStatsInDialog) View.VISIBLE else View.GONE
                     val es = EnergyImpactMonitor.computeSnapshot()
                     text = if (zh) {
-                        "⚡ Energy Impact 能耗统计: 评级=${es.optString("rating")} | CPU=${es.optDouble("cpuMs")}ms | 前台派发=${es.optLong("fgDispatches")} | 后台唤醒=0 (门控拦截=${es.optLong("bgSuppressed")}) | 估算=~${es.optDouble("estimatedMah")}mAh"
+                        "⚡ Energy Impact 能耗统计: 评级=${es.optString("rating")} (阈值>=${currentHighEnergyThreshold.get()}) | CPU=${es.optDouble("cpuMs")}ms | 前台=${es.optLong("fgDispatches")} | 后台=0 (拦截=${es.optLong("bgSuppressed")}) | 估算=~${es.optDouble("estimatedMah")}mAh"
                     } else {
-                        "⚡ Energy Impact: ${es.optString("rating")} | CPU=${es.optDouble("cpuMs")}ms | FG=${es.optLong("fgDispatches")} | BG=0 (Gated=${es.optLong("bgSuppressed")}) | Est=~${es.optDouble("estimatedMah")}mAh"
+                        "⚡ Energy Impact: ${es.optString("rating")} (Th>=${currentHighEnergyThreshold.get()}) | CPU=${es.optDouble("cpuMs")}ms | FG=${es.optLong("fgDispatches")} | BG=0 (Gated=${es.optLong("bgSuppressed")}) | Est=~${es.optDouble("estimatedMah")}mAh"
+                    }
+                }
+
+                val thresholdHeaderTv = TextView(activity).apply {
+                    val curTh = currentHighEnergyThreshold.get().coerceIn(5, 60)
+                    setTextColor(Color.parseColor("#FCD34D"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    text = if (zh) {
+                        "高能耗阈值 (High Battery Impact): >= ${curTh} pts"
+                    } else {
+                        "High Battery Impact Threshold: >= ${curTh} pts"
+                    }
+                    setPadding(0, QuotaHudView.dp(activity, 4f), 0, QuotaHudView.dp(activity, 2f))
+                }
+
+                val thresholdSeekBar = SeekBar(activity).apply {
+                    max = 55
+                    progress = currentHighEnergyThreshold.get().coerceIn(5, 60) - 5
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        bottomMargin = QuotaHudView.dp(activity, 6f)
+                    }
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                            val th = (progress + 5).coerceIn(5, 60)
+                            currentHighEnergyThreshold.set(th)
+                            thresholdHeaderTv.text = if (zh) {
+                                "高能耗阈值 (High Battery Impact): >= ${th} pts"
+                            } else {
+                                "High Battery Impact Threshold: >= ${th} pts"
+                            }
+                            activeHudRef.get().get()?.setHighBatteryThreshold(th.toDouble())
+                            val es = EnergyImpactMonitor.computeSnapshot()
+                            energyStatsTv.text = if (zh) {
+                                "⚡ Energy Impact 能耗统计: 评级=${es.optString("rating")} (阈值>=$th) | CPU=${es.optDouble("cpuMs")}ms | 前台=${es.optLong("fgDispatches")} | 后台=0 (拦截=${es.optLong("bgSuppressed")}) | 估算=~${es.optDouble("estimatedMah")}mAh"
+                            } else {
+                                "⚡ Energy Impact: ${es.optString("rating")} (Th>=$th) | CPU=${es.optDouble("cpuMs")}ms | FG=${es.optLong("fgDispatches")} | BG=0 (Gated=${es.optLong("bgSuppressed")}) | Est=~${es.optDouble("estimatedMah")}mAh"
+                            }
+                        }
+
+                        override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                        override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                            val th = currentHighEnergyThreshold.get().coerceIn(5, 60)
+                            saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get(), activeSessionTag.get())
+                            submitForegroundWork {
+                                QuotaSyncProvider.updatePreferences(activity, highBatteryThreshold = th)
+                            }
+                        }
+                    })
+                }
+
+                val trendThresholdHeaderTv = TextView(activity).apply {
+                    val curTrend = currentTrendConsecutiveThreshold.get().coerceIn(2, 10)
+                    setTextColor(Color.parseColor("#FDA4AF"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    text = if (zh) {
+                        "High Usage Trend 灵敏度 (连续上升次数): >= ${curTrend}x / 5m"
+                    } else {
+                        "High Usage Trend Sensitivity: >= ${curTrend}x / 5m"
+                    }
+                    setPadding(0, QuotaHudView.dp(activity, 2f), 0, QuotaHudView.dp(activity, 2f))
+                }
+
+                val trendThresholdSeekBar = SeekBar(activity).apply {
+                    max = 8
+                    progress = currentTrendConsecutiveThreshold.get().coerceIn(2, 10) - 2
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        bottomMargin = QuotaHudView.dp(activity, 6f)
+                    }
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                            val t = (progress + 2).coerceIn(2, 10)
+                            currentTrendConsecutiveThreshold.set(t)
+                            trendThresholdHeaderTv.text = if (zh) {
+                                "High Usage Trend 灵敏度 (连续上升次数): >= ${t}x / 5m"
+                            } else {
+                                "High Usage Trend Sensitivity: >= ${t}x / 5m"
+                            }
+                        }
+
+                        override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                        override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                            val t = currentTrendConsecutiveThreshold.get().coerceIn(2, 10)
+                            saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get(), activeSessionTag.get())
+                            submitForegroundWork {
+                                QuotaSyncProvider.updatePreferences(activity, trendConsecutiveThreshold = t)
+                            }
+                        }
+                    })
+                }
+
+                val trendAutoDismissHeaderTv = TextView(activity).apply {
+                    val enAuto = currentTrendAutoDismissEnabled.get()
+                    val sec = currentTrendAutoDismissSec.get().coerceIn(5, 60)
+                    setTextColor(Color.parseColor("#FBBF24"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    text = if (zh) {
+                        if (enAuto) "Trend 通知自动消失计时: ${sec}s (点击切换)" else "Trend 通知自动消失计时: 已关闭 (点击开启)"
+                    } else {
+                        if (enAuto) "Trend Alert Auto-Dismiss: ${sec}s (Tap to toggle)" else "Trend Alert Auto-Dismiss: OFF (Tap to enable)"
+                    }
+                    setPadding(0, QuotaHudView.dp(activity, 2f), 0, QuotaHudView.dp(activity, 2f))
+                }
+
+                val trendAutoDismissSeekBar = SeekBar(activity).apply {
+                    max = 55
+                    progress = currentTrendAutoDismissSec.get().coerceIn(5, 60) - 5
+                    isEnabled = currentTrendAutoDismissEnabled.get()
+                    alpha = if (isEnabled) 1.0f else 0.45f
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        bottomMargin = QuotaHudView.dp(activity, 6f)
+                    }
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                            val sec = (progress + 5).coerceIn(5, 60)
+                            currentTrendAutoDismissSec.set(sec)
+                            val enAuto = currentTrendAutoDismissEnabled.get()
+                            trendAutoDismissHeaderTv.text = if (zh) {
+                                if (enAuto) "Trend 通知自动消失计时: ${sec}s (点击切换)" else "Trend 通知自动消失计时: 已关闭 (点击开启)"
+                            } else {
+                                if (enAuto) "Trend Alert Auto-Dismiss: ${sec}s (Tap to toggle)" else "Trend Alert Auto-Dismiss: OFF (Tap to enable)"
+                            }
+                        }
+
+                        override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                        override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                            val sec = currentTrendAutoDismissSec.get().coerceIn(5, 60)
+                            saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get(), activeSessionTag.get())
+                            submitForegroundWork {
+                                QuotaSyncProvider.updatePreferences(activity, trendAutoDismissSec = sec)
+                            }
+                        }
+                    })
+                }
+
+                trendAutoDismissHeaderTv.setOnClickListener {
+                    val nextEn = !currentTrendAutoDismissEnabled.get()
+                    currentTrendAutoDismissEnabled.set(nextEn)
+                    val sec = currentTrendAutoDismissSec.get().coerceIn(5, 60)
+                    trendAutoDismissSeekBar.isEnabled = nextEn
+                    trendAutoDismissSeekBar.alpha = if (nextEn) 1.0f else 0.45f
+                    trendAutoDismissHeaderTv.text = if (zh) {
+                        if (nextEn) "Trend 通知自动消失计时: ${sec}s (点击切换)" else "Trend 通知自动消失计时: 已关闭 (点击开启)"
+                    } else {
+                        if (nextEn) "Trend Alert Auto-Dismiss: ${sec}s (Tap to toggle)" else "Trend Alert Auto-Dismiss: OFF (Tap to enable)"
+                    }
+                    saveSanitizedHostMirror(latestSnapshot.get(), currentLang.get(), currentTheme.get(), activeSessionTag.get())
+                    submitForegroundWork {
+                        QuotaSyncProvider.updatePreferences(activity, trendAutoDismissEnabled = nextEn)
                     }
                 }
 
@@ -7746,6 +8182,46 @@ object QuotaCoreEngine {
                     }
                 }
 
+                val exportCsvBtn = Button(activity).apply {
+                    isAllCaps = false
+                    text = if (zh) "Historical Impact CSV (导出 CSV)" else "Historical Impact CSV"
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    background = GradientDrawable().apply {
+                        setColor(Color.parseColor("#047857"))
+                        cornerRadius = QuotaHudView.dp(activity, 10f).toFloat()
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        topMargin = QuotaHudView.dp(activity, 6f)
+                    }
+                    setOnClickListener {
+                        val csv = EnergyImpactMonitor.buildHistoricalImpactCsv()
+                        val sess = activeSessionTag.get().ifBlank { "sess_default" }
+                        var savedPath = ""
+                        try {
+                            val dir = activity.getExternalFilesDir(null) ?: activity.filesDir
+                            val outFile = File(dir, "gemini-eye-historical-impact-$sess.csv")
+                            outFile.writeText("\uFEFF$csv", Charsets.UTF_8)
+                            savedPath = outFile.absolutePath
+                        } catch (_: Throwable) {
+                        }
+                        EnergyImpactMonitor.appendMilestoneLog("EXPORT_CSV", sess, emitToProvider = true)
+                        traceTv.text = if (savedPath.isNotEmpty()) {
+                            "[Historical Impact CSV Saved: $savedPath]\n\n$csv"
+                        } else {
+                            csv
+                        }
+                        try {
+                            val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("GeminiEyeHistoricalImpactCsv", csv))
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+
                 val energyBtnRow = LinearLayout(activity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     weightSum = 2f
@@ -7757,6 +8233,12 @@ object QuotaCoreEngine {
                     }
                     addView(toggleEnergyBtn)
                     addView(exportEnergyBtn)
+                }
+
+                val energyExportCsvWrap = LinearLayout(activity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(energyBtnRow)
+                    addView(exportCsvBtn)
                 }
 
                 val btnRow = LinearLayout(activity).apply {
@@ -7809,8 +8291,14 @@ object QuotaCoreEngine {
                 root.addView(opacityHeaderTv)
                 root.addView(opacitySeekBar)
                 root.addView(energyStatsTv)
+                root.addView(thresholdHeaderTv)
+                root.addView(thresholdSeekBar)
+                root.addView(trendThresholdHeaderTv)
+                root.addView(trendThresholdSeekBar)
+                root.addView(trendAutoDismissHeaderTv)
+                root.addView(trendAutoDismissSeekBar)
                 root.addView(forceScanBtn)
-                root.addView(energyBtnRow)
+                root.addView(energyExportCsvWrap)
                 root.addView(traceScroll)
                 root.addView(btnRow)
 

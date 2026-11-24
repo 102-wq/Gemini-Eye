@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Clock,
   Copy,
   Cpu,
   Download,
@@ -60,6 +61,71 @@ interface CachedSnapshotEntry {
   weeklyLimit: string;
   weeklyReset: string;
   source: string;
+}
+
+interface EnergyTimelineEntry {
+  index: number;
+  timestampIso: string;
+  timeHms: string;
+  sessionTag: string;
+  event: string;
+  maWindowSize: number;
+  filteredScore: number;
+  rawScore: number;
+  scoreDelta: number;
+  spikeBypass: boolean;
+  aboveHighThreshold: boolean;
+  cpuMs: number;
+  wallMs: number;
+  fgDispatches: number;
+  netReqs: number;
+  estimatedMah: number;
+}
+
+interface TrendWindowChartPoint {
+  time: string;
+  ts: number;
+  score: number;
+  streak: number;
+  deltaFromPrev: number;
+  event: string;
+  alertTriggered: boolean;
+}
+
+function buildTrendWindowChartSeries(
+  samples: Array<{ ts: number; score: number; event: string }>,
+  alertStreakThreshold = 3
+): TrendWindowChartPoint[] {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  let runningStreak = 0;
+  return samples.map((sample, idx) => {
+    const prev = idx > 0 ? samples[idx - 1] : null;
+    const deltaFromPrev = prev ? Math.round((sample.score - prev.score) * 100) / 100 : 0;
+    if (prev && sample.score > prev.score) {
+      runningStreak += 1;
+    } else {
+      runningStreak = 0;
+    }
+    const d = new Date(sample.ts);
+    const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    return {
+      time,
+      ts: sample.ts,
+      score: sample.score,
+      streak: runningStreak,
+      deltaFromPrev,
+      event: sample.event,
+      alertTriggered: runningStreak >= alertStreakThreshold,
+    };
+  });
+}
+
+function csvEscape(value: string | number | boolean): string {
+  const s = String(value);
+  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
 }
 
 function formatFullTimestampMs(date: Date): string {
@@ -181,11 +247,115 @@ const ACCOUNT_SESSIONS: SimulatedAccountSession[] = [
   },
 ];
 
+const DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD = 20;
+const HIGH_BATTERY_THRESHOLD_MIN = 5;
+const HIGH_BATTERY_THRESHOLD_MAX = 60;
+const HIGH_BATTERY_THRESHOLD_STORAGE_KEY = 'gemini_eye_high_battery_threshold';
+
+function clampHighBatteryThreshold(val: number): number {
+  if (!Number.isFinite(val)) return DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD;
+  return Math.min(HIGH_BATTERY_THRESHOLD_MAX, Math.max(HIGH_BATTERY_THRESHOLD_MIN, Math.round(val)));
+}
+
+function loadPersistedHighBatteryThreshold(): number {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD;
+    }
+    const raw = window.localStorage.getItem(HIGH_BATTERY_THRESHOLD_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD;
+    }
+    return clampHighBatteryThreshold(Number(raw));
+  } catch {
+    return DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD;
+  }
+}
+
+const DEFAULT_TREND_CONSECUTIVE_THRESHOLD = 3;
+const TREND_CONSECUTIVE_MIN = 2;
+const TREND_CONSECUTIVE_MAX = 10;
+const TREND_CONSECUTIVE_STORAGE_KEY = 'gemini_eye_trend_consecutive_threshold';
+
+function clampTrendConsecutiveThreshold(val: number): number {
+  if (!Number.isFinite(val)) return DEFAULT_TREND_CONSECUTIVE_THRESHOLD;
+  return Math.min(TREND_CONSECUTIVE_MAX, Math.max(TREND_CONSECUTIVE_MIN, Math.round(val)));
+}
+
+function loadPersistedTrendConsecutiveThreshold(): number {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return DEFAULT_TREND_CONSECUTIVE_THRESHOLD;
+    }
+    const raw = window.localStorage.getItem(TREND_CONSECUTIVE_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return DEFAULT_TREND_CONSECUTIVE_THRESHOLD;
+    }
+    return clampTrendConsecutiveThreshold(Number(raw));
+  } catch {
+    return DEFAULT_TREND_CONSECUTIVE_THRESHOLD;
+  }
+}
+
+const DEFAULT_TREND_AUTO_DISMISS_SEC = 15;
+const TREND_AUTO_DISMISS_MIN_SEC = 5;
+const TREND_AUTO_DISMISS_MAX_SEC = 60;
+const TREND_AUTO_DISMISS_SEC_STORAGE_KEY = 'gemini_eye_trend_auto_dismiss_sec';
+const TREND_AUTO_DISMISS_ENABLED_STORAGE_KEY = 'gemini_eye_trend_auto_dismiss_enabled';
+
+function clampTrendAutoDismissSec(val: number): number {
+  if (!Number.isFinite(val)) return DEFAULT_TREND_AUTO_DISMISS_SEC;
+  return Math.min(TREND_AUTO_DISMISS_MAX_SEC, Math.max(TREND_AUTO_DISMISS_MIN_SEC, Math.round(val)));
+}
+
+function loadPersistedTrendAutoDismissSec(): number {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return DEFAULT_TREND_AUTO_DISMISS_SEC;
+    }
+    const raw = window.localStorage.getItem(TREND_AUTO_DISMISS_SEC_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return DEFAULT_TREND_AUTO_DISMISS_SEC;
+    }
+    return clampTrendAutoDismissSec(Number(raw));
+  } catch {
+    return DEFAULT_TREND_AUTO_DISMISS_SEC;
+  }
+}
+
+function loadPersistedTrendAutoDismissEnabled(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return true;
+    }
+    const raw = window.localStorage.getItem(TREND_AUTO_DISMISS_ENABLED_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return true;
+    }
+    return raw !== 'false';
+  } catch {
+    return true;
+  }
+}
+
 export default function App() {
   const [uiLang, setUiLang] = useState<UiLang>('zh');
   const [hudLang, setHudLang] = useState<UiLang>('zh');
   const [hudTheme, setHudTheme] = useState<HudTheme>('MIUIX');
   const [hudOpacity, setHudOpacity] = useState<number>(85);
+  const [highBatteryImpactThreshold, setHighBatteryImpactThreshold] = useState<number>(() =>
+    loadPersistedHighBatteryThreshold()
+  );
+  const [trendConsecutiveThreshold, setTrendConsecutiveThreshold] = useState<number>(() =>
+    loadPersistedTrendConsecutiveThreshold()
+  );
+  const [trendAutoDismissEnabled, setTrendAutoDismissEnabled] = useState<boolean>(() =>
+    loadPersistedTrendAutoDismissEnabled()
+  );
+  const [trendAutoDismissSec, setTrendAutoDismissSec] = useState<number>(() =>
+    loadPersistedTrendAutoDismissSec()
+  );
+  const [trendAlertRemainingSec, setTrendAlertRemainingSec] = useState<number | null>(null);
   const [activeView, setActiveView] = useState<ActiveView>('simulator');
   const [selectedPath, setSelectedPath] = useState<string>(
     'app/src/main/java/com/example/bardquotahook/QuotaCoreEngine.kt'
@@ -220,14 +390,16 @@ export default function App() {
   const [energyNetBytes, setEnergyNetBytes] = useState<number>(1420);
   const [energyBgSuppressed, setEnergyBgSuppressed] = useState<number>(2);
   const [energyScoreHistory, setEnergyScoreHistory] = useState<
-    Array<{ time: string; score: number; cpuMs: number; event: string }>
+    Array<{ time: string; score: number; rawScore: number; spikeBypass: boolean; cpuMs: number; event: string }>
   >([
-    { time: '09:41:00', score: 0.08, cpuMs: 0.6, event: 'INIT' },
-    { time: '09:41:01', score: 0.21, cpuMs: 1.4, event: 'HOOK_BIND' },
-    { time: '09:41:02', score: 0.52, cpuMs: 3.4, event: 'APP_OPEN' },
-    { time: '09:41:05', score: 0.52, cpuMs: 3.4, event: 'IDLE_SETTLE' },
-    { time: '09:41:07', score: 0.52, cpuMs: 3.4, event: 'IDLE_0T' },
+    { time: '09:41:00', score: 0.08, rawScore: 0.08, spikeBypass: false, cpuMs: 0.6, event: 'INIT' },
+    { time: '09:41:01', score: 0.15, rawScore: 0.21, spikeBypass: false, cpuMs: 1.4, event: 'HOOK_BIND' },
+    { time: '09:41:02', score: 0.27, rawScore: 0.52, spikeBypass: false, cpuMs: 3.4, event: 'APP_OPEN' },
+    { time: '09:41:05', score: 0.33, rawScore: 0.52, spikeBypass: false, cpuMs: 3.4, event: 'IDLE_SETTLE' },
+    { time: '09:41:07', score: 0.38, rawScore: 0.52, spikeBypass: false, cpuMs: 3.4, event: 'IDLE_0T' },
   ]);
+  const [smoothedEnergyScore, setSmoothedEnergyScore] = useState<number>(0.38);
+  const [energyTimelineCount, setEnergyTimelineCount] = useState<number>(5);
   const [exportedBatteryReport, setExportedBatteryReport] = useState<string>('');
   const [batteryReportCopied, setBatteryReportCopied] = useState<boolean>(false);
   const [energySurgeAlert, setEnergySurgeAlert] = useState<{
@@ -247,6 +419,7 @@ export default function App() {
     timeMs: string;
     sessionTag: string;
     events: string[];
+    triggeredAtMs: number;
   } | null>(null);
   const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
   const bgWakeupCountRef = useRef<number>(0);
@@ -259,10 +432,109 @@ export default function App() {
   const heartbeatBaselineScoreRef = useRef<number>(0.52);
   const surgeAlertedInCycleRef = useRef<boolean>(false);
   const latestEnergyScoreRef = useRef<number>(0.52);
+  const energyMaWindowRef = useRef<number[]>([0.08, 0.21, 0.52, 0.52]);
   const energyTrendWindowRef = useRef<Array<{ ts: number; score: number; event: string }>>([
-    { ts: Date.now(), score: 0.52, event: 'INIT_BASELINE' },
+    { ts: Date.now() - 6_000, score: 0.52, event: 'APP_OPEN' },
+    { ts: Date.now() - 1_000, score: 0.52, event: 'INIT_BASELINE' },
   ]);
+  const [highUsageTrendChartHistory, setHighUsageTrendChartHistory] = useState<TrendWindowChartPoint[]>(() =>
+    buildTrendWindowChartSeries(energyTrendWindowRef.current, loadPersistedTrendConsecutiveThreshold())
+  );
+  const trendConsecutiveThresholdRef = useRef<number>(trendConsecutiveThreshold);
+  trendConsecutiveThresholdRef.current = trendConsecutiveThreshold;
   const highUsageTrendAlertedStreakRef = useRef<number>(0);
+  const fullEnergyTimelineRef = useRef<EnergyTimelineEntry[]>([
+    {
+      index: 1,
+      timestampIso: new Date(Date.now() - 25_000).toISOString(),
+      timeHms: '09:41:00',
+      sessionTag: 'sess_8f3a91c04b12',
+      event: 'INIT',
+      maWindowSize: 4,
+      filteredScore: 0.08,
+      rawScore: 0.08,
+      scoreDelta: 0,
+      spikeBypass: false,
+      aboveHighThreshold: false,
+      cpuMs: 0.6,
+      wallMs: 3.1,
+      fgDispatches: 0,
+      netReqs: 0,
+      estimatedMah: 0.0001,
+    },
+    {
+      index: 2,
+      timestampIso: new Date(Date.now() - 24_000).toISOString(),
+      timeHms: '09:41:01',
+      sessionTag: 'sess_8f3a91c04b12',
+      event: 'HOOK_BIND',
+      maWindowSize: 4,
+      filteredScore: 0.15,
+      rawScore: 0.21,
+      scoreDelta: 0.13,
+      spikeBypass: false,
+      aboveHighThreshold: false,
+      cpuMs: 1.4,
+      wallMs: 7.5,
+      fgDispatches: 1,
+      netReqs: 0,
+      estimatedMah: 0.0003,
+    },
+    {
+      index: 3,
+      timestampIso: new Date(Date.now() - 23_000).toISOString(),
+      timeHms: '09:41:02',
+      sessionTag: 'sess_8f3a91c04b12',
+      event: 'APP_OPEN',
+      maWindowSize: 4,
+      filteredScore: 0.27,
+      rawScore: 0.52,
+      scoreDelta: 0.31,
+      spikeBypass: false,
+      aboveHighThreshold: false,
+      cpuMs: 3.4,
+      wallMs: 18.2,
+      fgDispatches: 1,
+      netReqs: 1,
+      estimatedMah: 0.0127,
+    },
+    {
+      index: 4,
+      timestampIso: new Date(Date.now() - 20_000).toISOString(),
+      timeHms: '09:41:05',
+      sessionTag: 'sess_8f3a91c04b12',
+      event: 'IDLE_SETTLE',
+      maWindowSize: 4,
+      filteredScore: 0.33,
+      rawScore: 0.52,
+      scoreDelta: 0,
+      spikeBypass: false,
+      aboveHighThreshold: false,
+      cpuMs: 3.4,
+      wallMs: 18.2,
+      fgDispatches: 1,
+      netReqs: 1,
+      estimatedMah: 0.0127,
+    },
+    {
+      index: 5,
+      timestampIso: new Date(Date.now() - 18_000).toISOString(),
+      timeHms: '09:41:07',
+      sessionTag: 'sess_8f3a91c04b12',
+      event: 'IDLE_0T',
+      maWindowSize: 4,
+      filteredScore: 0.38,
+      rawScore: 0.52,
+      scoreDelta: 0,
+      spikeBypass: false,
+      aboveHighThreshold: false,
+      cpuMs: 3.4,
+      wallMs: 18.2,
+      fgDispatches: 1,
+      netReqs: 1,
+      estimatedMah: 0.0127,
+    },
+  ]);
   bgWakeupCountRef.current = bgWakeupCount;
   fgDispatchCountRef.current = fgDispatchCount;
   const cachedSnapshotsRef = useRef<Record<string, CachedSnapshotEntry>>({
@@ -385,9 +657,10 @@ export default function App() {
   const HUD_FRAME_SMOOTH_OFFSET_MS = 8;
   const HUD_TOUCH_JITTER_DEADBAND_PX = 1.1;
   const HUD_TOUCH_SAMPLE_WINDOW_MS = 8;
-  const HUD_MAGNET_EDGE_THRESHOLD_PX = 40;
+  const HUD_MAGNET_EDGE_THRESHOLD_PX = 48;
 
   const [hudDockedEdge, setHudDockedEdge] = useState<HudDockEdge>('NONE');
+  const [hudDragEdgePreview, setHudDragEdgePreview] = useState<HudDockEdge>('NONE');
   const hudDockedEdgeRef = useRef<HudDockEdge>('NONE');
   hudDockedEdgeRef.current = hudDockedEdge;
   const prevHudDockEdgeRef = useRef<HudDockEdge>('NONE');
@@ -400,6 +673,9 @@ export default function App() {
     startY: number;
     origX: number;
     origY: number;
+    rawX: number;
+    pointerLocalX: number;
+    intendedDock: HudDockEdge;
     filteredX: number;
     filteredY: number;
     targetX: number;
@@ -417,6 +693,9 @@ export default function App() {
     startY: 0,
     origX: 0,
     origY: 0,
+    rawX: 0,
+    pointerLocalX: 0,
+    intendedDock: 'NONE',
     filteredX: 0,
     filteredY: 0,
     targetX: 0,
@@ -551,21 +830,195 @@ export default function App() {
     );
   }, [energyCpuMs, energyNetReqs, fgDispatchCount]);
 
-  const HIGH_BATTERY_IMPACT_THRESHOLD = 20;
   const HEARTBEAT_ENERGY_SURGE_DELTA = 15;
   const ENERGY_TREND_WINDOW_MS = 5 * 60 * 1000;
-  const ENERGY_TREND_MIN_CONSECUTIVE_INCREASES = 3;
+  const ENERGY_MA_WINDOW_SIZE = 4;
+  const ENERGY_SPIKE_SENSITIVITY_DELTA = 5.0;
   latestEnergyScoreRef.current = energyImpactScore;
+  const highThresholdMountedRef = useRef<boolean>(false);
+  const wasHighBatteryImpactRef = useRef<boolean>(false);
+  const suppressNextThresholdCrossLogRef = useRef<boolean>(false);
+
+  const computeSpikeAwareMovingAverage = (rawScore: number) => {
+    const prevWindow = energyMaWindowRef.current;
+    const prevFiltered =
+      prevWindow.length > 0
+        ? prevWindow.reduce((sum, val) => sum + val, 0) / prevWindow.length
+        : rawScore;
+    const jumpDelta = Math.abs(rawScore - prevFiltered);
+    const spikeBypass =
+      jumpDelta >= ENERGY_SPIKE_SENSITIVITY_DELTA ||
+      (rawScore >= highBatteryImpactThreshold && prevFiltered < highBatteryImpactThreshold);
+
+    const nextWindow = spikeBypass
+      ? [rawScore]
+      : [...prevWindow.slice(-(ENERGY_MA_WINDOW_SIZE - 1)), rawScore];
+    energyMaWindowRef.current = nextWindow;
+
+    const avg = nextWindow.reduce((sum, val) => sum + val, 0) / nextWindow.length;
+    return {
+      filteredScore: Math.round(avg * 100) / 100,
+      spikeBypass,
+    };
+  };
 
   const energyImpactRating = useMemo(() => {
-    if (energyImpactScore < 5) return 'Minimal';
-    if (energyImpactScore < HIGH_BATTERY_IMPACT_THRESHOLD) return 'Low';
-    return 'Moderate';
-  }, [energyImpactScore]);
+    const minimalCutoff = Math.min(5, Math.max(1, Math.round(highBatteryImpactThreshold * 0.25)));
+    if (energyImpactScore < minimalCutoff) return 'Minimal';
+    if (energyImpactScore < highBatteryImpactThreshold) return 'Low';
+    return 'High';
+  }, [energyImpactScore, highBatteryImpactThreshold]);
 
-  const isHighBatteryImpact = energyImpactScore >= HIGH_BATTERY_IMPACT_THRESHOLD;
+  const isHighBatteryImpact = energyImpactScore >= highBatteryImpactThreshold;
+
+  useEffect(() => {
+    if (!highThresholdMountedRef.current) {
+      highThresholdMountedRef.current = true;
+      wasHighBatteryImpactRef.current = isHighBatteryImpact;
+      return;
+    }
+    const prev = wasHighBatteryImpactRef.current;
+    wasHighBatteryImpactRef.current = isHighBatteryImpact;
+    if (isHighBatteryImpact && !prev) {
+      if (suppressNextThresholdCrossLogRef.current) {
+        suppressNextThresholdCrossLogRef.current = false;
+        return;
+      }
+      const sess = activeSessionRef.current.sessionTag;
+      setBatteryImpactCount((c) => c + 1);
+      logDevEvent(
+        'BATTERY_IMPACT',
+        sess,
+        `[高能耗阈值告警 · >=${highBatteryImpactThreshold}] 当前 Energy Impact Score (${energyImpactScore}) 已超越用户设定阈值 (>=${highBatteryImpactThreshold})`,
+        `[High Battery Impact Alert · >=${highBatteryImpactThreshold}] Current Energy Impact Score (${energyImpactScore}) crossed user threshold (>=${highBatteryImpactThreshold})`,
+        'warn'
+      );
+    } else if (!isHighBatteryImpact) {
+      suppressNextThresholdCrossLogRef.current = false;
+    }
+  }, [isHighBatteryImpact, highBatteryImpactThreshold, energyImpactScore]);
+
+  useEffect(() => {
+    const normalized = clampHighBatteryThreshold(highBatteryImpactThreshold);
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(HIGH_BATTERY_THRESHOLD_STORAGE_KEY, String(normalized));
+      }
+    } catch {
+      // Ignore storage quota or sandbox restrictions
+    }
+  }, [highBatteryImpactThreshold]);
+
+  useEffect(() => {
+    const normalized = clampTrendConsecutiveThreshold(trendConsecutiveThreshold);
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(TREND_CONSECUTIVE_STORAGE_KEY, String(normalized));
+      }
+    } catch {
+      // Ignore storage quota or sandbox restrictions
+    }
+    const nowTs = Date.now();
+    const pruned = energyTrendWindowRef.current.filter(
+      (sample) => nowTs - sample.ts <= ENERGY_TREND_WINDOW_MS
+    );
+    energyTrendWindowRef.current = pruned;
+    setHighUsageTrendChartHistory(buildTrendWindowChartSeries(pruned, normalized));
+
+    let streak = 0;
+    let startIdx = Math.max(0, pruned.length - 1);
+    for (let i = pruned.length - 1; i > 0; i--) {
+      if (pruned[i].score > pruned[i - 1].score) {
+        streak += 1;
+        startIdx = i - 1;
+      } else {
+        break;
+      }
+    }
+    if (streak < normalized) {
+      highUsageTrendAlertedStreakRef.current = 0;
+      setHighUsageTrendAlert((prev) => (prev && prev.consecutiveIncreases < normalized ? null : prev));
+    } else if (pruned.length > 0) {
+      const startSample = pruned[startIdx];
+      const latestSample = pruned[pruned.length - 1];
+      const delta = Math.round((latestSample.score - startSample.score) * 100) / 100;
+      const windowSec = Math.max(1, Math.round((nowTs - startSample.ts) / 1000));
+      setHighUsageTrendAlert((prev) => ({
+        consecutiveIncreases: streak,
+        startScore: startSample.score,
+        curScore: latestSample.score,
+        delta,
+        windowSec,
+        timeMs: formatFullTimestampMs(new Date(nowTs)),
+        sessionTag: activeSessionRef.current.sessionTag,
+        events: pruned.slice(startIdx).map((s) => s.event),
+        triggeredAtMs: prev ? prev.triggeredAtMs : nowTs,
+      }));
+    }
+  }, [trendConsecutiveThreshold]);
+
+  useEffect(() => {
+    const normalizedSec = clampTrendAutoDismissSec(trendAutoDismissSec);
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(
+          TREND_AUTO_DISMISS_ENABLED_STORAGE_KEY,
+          String(trendAutoDismissEnabled)
+        );
+        window.localStorage.setItem(TREND_AUTO_DISMISS_SEC_STORAGE_KEY, String(normalizedSec));
+      }
+    } catch {
+      // Ignore storage quota or sandbox restrictions
+    }
+  }, [trendAutoDismissEnabled, trendAutoDismissSec]);
+
+  useEffect(() => {
+    if (!highUsageTrendAlert || !trendAutoDismissEnabled) {
+      setTrendAlertRemainingSec(null);
+      return;
+    }
+    const durationMs = clampTrendAutoDismissSec(trendAutoDismissSec) * 1000;
+    const deadlineMs = highUsageTrendAlert.triggeredAtMs + durationMs;
+
+    const tick = () => {
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) {
+        setTrendAlertRemainingSec(null);
+        setHighUsageTrendAlert(null);
+        return false;
+      }
+      setTrendAlertRemainingSec(Math.ceil(remainingMs / 1000));
+      return true;
+    };
+
+    if (!tick()) return;
+    const intervalId = window.setInterval(() => {
+      if (!tick()) {
+        window.clearInterval(intervalId);
+      }
+    }, 250);
+    return () => window.clearInterval(intervalId);
+  }, [highUsageTrendAlert, trendAutoDismissEnabled, trendAutoDismissSec]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleStorageSync = (e: StorageEvent) => {
+      if (e.key === HIGH_BATTERY_THRESHOLD_STORAGE_KEY && e.newValue !== null) {
+        setHighBatteryImpactThreshold(clampHighBatteryThreshold(Number(e.newValue)));
+      } else if (e.key === TREND_CONSECUTIVE_STORAGE_KEY && e.newValue !== null) {
+        setTrendConsecutiveThreshold(clampTrendConsecutiveThreshold(Number(e.newValue)));
+      } else if (e.key === TREND_AUTO_DISMISS_SEC_STORAGE_KEY && e.newValue !== null) {
+        setTrendAutoDismissSec(clampTrendAutoDismissSec(Number(e.newValue)));
+      } else if (e.key === TREND_AUTO_DISMISS_ENABLED_STORAGE_KEY && e.newValue !== null) {
+        setTrendAutoDismissEnabled(e.newValue !== 'false');
+      }
+    };
+    window.addEventListener('storage', handleStorageSync);
+    return () => window.removeEventListener('storage', handleStorageSync);
+  }, []);
 
   const evaluateBatteryUsageTrendWindow = (curScore: number, eventName: string) => {
+    const minStreak = trendConsecutiveThresholdRef.current;
     const nowTs = Date.now();
     const pruned = energyTrendWindowRef.current.filter(
       (sample) => nowTs - sample.ts <= ENERGY_TREND_WINDOW_MS
@@ -574,6 +1027,9 @@ export default function App() {
 
     if (lastSample && curScore === lastSample.score) {
       energyTrendWindowRef.current = pruned;
+      setHighUsageTrendChartHistory(
+        buildTrendWindowChartSeries(pruned, minStreak)
+      );
       return;
     }
 
@@ -583,6 +1039,9 @@ export default function App() {
 
     const updated = [...pruned, { ts: nowTs, score: curScore, event: eventName }];
     energyTrendWindowRef.current = updated;
+    setHighUsageTrendChartHistory(
+      buildTrendWindowChartSeries(updated, minStreak)
+    );
 
     let consecutiveIncreases = 0;
     let streakStartIdx = updated.length - 1;
@@ -595,7 +1054,7 @@ export default function App() {
       }
     }
 
-    if (consecutiveIncreases < ENERGY_TREND_MIN_CONSECUTIVE_INCREASES) {
+    if (consecutiveIncreases < minStreak) {
       return;
     }
 
@@ -615,6 +1074,7 @@ export default function App() {
       timeMs,
       sessionTag: sess,
       events: trailEvents,
+      triggeredAtMs: nowTs,
     });
 
     if (consecutiveIncreases > highUsageTrendAlertedStreakRef.current) {
@@ -673,17 +1133,70 @@ export default function App() {
     const pad = (n: number) => String(n).padStart(2, '0');
     const timeStr = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     const eventName = lastEnergyEventTagRef.current || 'SAMPLE';
+    const { filteredScore, spikeBypass } = computeSpikeAwareMovingAverage(energyImpactScore);
+    setSmoothedEnergyScore(filteredScore);
+    const prevTimeline = fullEnergyTimelineRef.current;
+    const prevRaw = prevTimeline.length > 0 ? prevTimeline[prevTimeline.length - 1].rawScore : energyImpactScore;
+    const scoreDelta = Math.round((energyImpactScore - prevRaw) * 100) / 100;
+    const nextEntry: EnergyTimelineEntry = {
+      index: prevTimeline.length + 1,
+      timestampIso: d.toISOString(),
+      timeHms: timeStr,
+      sessionTag: activeSessionRef.current.sessionTag,
+      event: eventName,
+      maWindowSize: ENERGY_MA_WINDOW_SIZE,
+      filteredScore,
+      rawScore: energyImpactScore,
+      scoreDelta,
+      spikeBypass,
+      aboveHighThreshold: energyImpactScore >= highBatteryImpactThreshold || filteredScore >= highBatteryImpactThreshold,
+      cpuMs: energyCpuMs,
+      wallMs: energyWallMs,
+      fgDispatches: fgDispatchCount,
+      netReqs: energyNetReqs,
+      estimatedMah: estimatedEnergyMah,
+    };
+    fullEnergyTimelineRef.current = [...prevTimeline, nextEntry];
+    setEnergyTimelineCount(fullEnergyTimelineRef.current.length);
     setEnergyScoreHistory((prev) => [
       ...prev.slice(-23),
-      { time: timeStr, score: energyImpactScore, cpuMs: energyCpuMs, event: eventName },
+      {
+        time: timeStr,
+        score: filteredScore,
+        rawScore: energyImpactScore,
+        spikeBypass,
+        cpuMs: energyCpuMs,
+        event: eventName,
+      },
     ]);
     pushHeartbeatEnergySurgeWarn(energyImpactScore, eventName);
     evaluateBatteryUsageTrendWindow(energyImpactScore, eventName);
   }, [energyImpactScore, energyCpuMs]);
 
+  const handleSimulateEnergyJitterTest = () => {
+    const sess = activeSessionRef.current.sessionTag;
+    const deltas = [3.6, -3.2, 3.8, -3.4];
+    deltas.forEach((reqDelta, idx) => {
+      window.setTimeout(() => {
+        lastEnergyEventTagRef.current = `JITTER_PROBE_${idx + 1}`;
+        setEnergyCpuMs((v) => Math.max(0.5, Math.round((v + reqDelta * 12) * 10) / 10));
+        setEnergyNetReqs((v) => Math.max(1, v + (reqDelta > 0 ? 4 : -4)));
+        setBatteryImpactCount((c) => c + 1);
+      }, idx * 140);
+    });
+    logDevEvent(
+      'BATTERY_IMPACT',
+      sess,
+      `[MA(${ENERGY_MA_WINDOW_SIZE}) 抖动滤波测试] 注入 ±3.5 分瞬时抖动样本，验证均值滤波器抑制图表毛刺的同时保持 >=${ENERGY_SPIKE_SENSITIVITY_DELTA} 分真实尖峰秒级穿透`,
+      `[MA(${ENERGY_MA_WINDOW_SIZE}) Jitter Filter Test] Injected +/-3.5pt transient jitter probes to verify chart smoothing while keeping >=${ENERGY_SPIKE_SENSITIVITY_DELTA}pt legitimate spikes unattenuated`,
+      'info'
+    );
+  };
+
   const handleSimulateHighUsageTrend = () => {
     const sess = activeSessionRef.current.sessionTag;
-    const stepTags = ['TREND_STEP_1', 'TREND_STEP_2', 'TREND_STEP_3'];
+    const stepCount = clampTrendConsecutiveThreshold(trendConsecutiveThresholdRef.current);
+    const stepTags = Array.from({ length: stepCount }, (_, idx) => `TREND_STEP_${idx + 1}`);
     stepTags.forEach((stepTag, idx) => {
       window.setTimeout(() => {
         lastEnergyEventTagRef.current = stepTag;
@@ -697,8 +1210,8 @@ export default function App() {
         logDevEvent(
           'BATTERY_IMPACT',
           sess,
-          `[5m 趋势采样 #${idx + 1}/3 · ${stepTag}] 前台高频交互触发能耗递进样本采集`,
-          `[5m Trend Sample #${idx + 1}/3 · ${stepTag}] Foreground burst triggered progressive energy score sample`,
+          `[5m 趋势采样 #${idx + 1}/${stepCount} · ${stepTag}] 前台高频交互触发能耗递进样本采集`,
+          `[5m Trend Sample #${idx + 1}/${stepCount} · ${stepTag}] Foreground burst triggered progressive energy score sample`,
           'info'
         );
       }, idx * 180);
@@ -707,7 +1220,10 @@ export default function App() {
 
   const handleSimulateHighBatteryImpact = () => {
     lastEnergyEventTagRef.current = 'HIGH_LOAD_SPIKE';
-    setEnergyCpuMs((v) => Math.max(v + 380, 420.0));
+    suppressNextThresholdCrossLogRef.current = true;
+    const targetScore = Math.max(highBatteryImpactThreshold + 3, 24);
+    const extraCpu = Math.max(380, Math.round((targetScore - energyImpactScore + 2) * 50));
+    setEnergyCpuMs((v) => Math.round((Math.max(v + extraCpu, 420.0)) * 10) / 10);
     setEnergyWallMs((v) => Math.max(v + 620, 840.0));
     setEnergyNetReqs((v) => Math.max(v + 28, 32));
     setEnergyNetBytes((v) => v + 64_500);
@@ -717,12 +1233,12 @@ export default function App() {
     logDevEvent(
       'BATTERY_IMPACT',
       activeSession.sessionTag,
-      `[高能耗阈值触发 · >=${HIGH_BATTERY_IMPACT_THRESHOLD}] 突发全量协议重放与 ProtoBuf 流解码导致 Energy Score 越过高阈值；${
+      `[高能耗阈值触发 · >=${highBatteryImpactThreshold}] 突发全量协议重放与 ProtoBuf 流解码导致 Energy Score 越过高阈值；${
         hudTheme === 'MIUIX'
           ? 'MIUIX 主题已自动激活柔和背景模糊呼吸动画 (backdrop-blur breathe)'
           : '当前为 MD3 主题（切换至 MIUIX 可预览模糊呼吸动画）'
       }`,
-      `[High Energy Threshold Crossed · >=${HIGH_BATTERY_IMPACT_THRESHOLD}] Burst full-protocol replay & ProtoBuf decoding pushed Energy Score above threshold; ${
+      `[High Energy Threshold Crossed · >=${highBatteryImpactThreshold}] Burst full-protocol replay & ProtoBuf decoding pushed Energy Score above threshold; ${
         hudTheme === 'MIUIX'
           ? 'MIUIX HUD subtle backdrop-blur animation activated'
           : 'switch HUD theme to MIUIX to preview backdrop-blur animation'
@@ -733,21 +1249,24 @@ export default function App() {
 
   const handleExportBatteryReport = () => {
     const batteryLogs = devLogs.filter((l) => l.eventType === 'BATTERY_IMPACT');
+    const timeline = fullEnergyTimelineRef.current;
+    const spikeBypassCount = timeline.filter((e) => e.spikeBypass).length;
     const nowStr = formatFullTimestampMs(new Date());
     const headerLines = isZh
       ? [
           '=== Gemini-Eye 电池消耗影响报告 (Battery Impact Report · 模拟) ===',
           `生成时间: ${nowStr}`,
           `当前会话: ${activeSession.sessionTag} | 前台状态: ${isGeminiForeground}`,
-          `Energy Impact 评级: ${energyImpactRating} (Score=${energyImpactScore})`,
+          `Energy Impact 评级: ${energyImpactRating} (Filtered MA(${ENERGY_MA_WINDOW_SIZE})=${smoothedEnergyScore} | Raw=${energyImpactScore} | 高能耗阈值 >=${highBatteryImpactThreshold})`,
+          `时间线采样全集: ${timeline.length} 条记录 (Spike Bypass 尖峰直通事件: ${spikeBypassCount} 次 · 可导出 Historical Impact CSV)`,
           `后台唤醒: ${bgWakeupCount} 次 (1ns 门控拦截: ${energyBgSuppressed} 次) | 当前线程池: ${poolStateLabel} (${activePoolThreads} 线程)`,
           `前台按需派发: ${fgDispatchCount} 次 | Hook 捕获事件: ${energyHookEvents} 次`,
           `累计 CPU / 墙钟耗时: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
           `网络重放与拦截传输: ${energyNetReqs} 次请求 / ${energyNetBytes} Bytes`,
           `估算电池消耗: ~${estimatedEnergyMah.toFixed(4)} mAh`,
           highUsageTrendAlert
-            ? `趋势告警: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases} 次连续上升 / 5m 窗口: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
-            : '趋势告警: 正常 (5 分钟窗口无连续递增异常)',
+            ? `趋势告警: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} 次连续上升 / 5m 窗口: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
+            : `趋势告警: 正常 (5 分钟窗口阈值 >=${trendConsecutiveThreshold}x 未触发)`,
           '',
           `--- 当前能耗事件日志 (${batteryLogs.length} 条) ---`,
         ]
@@ -755,15 +1274,16 @@ export default function App() {
           '=== Gemini-Eye Battery Impact Statistics Report (Simulated) ===',
           `Generated: ${nowStr}`,
           `Session: ${activeSession.sessionTag} | ForegroundActive: ${isGeminiForeground}`,
-          `Energy Rating: ${energyImpactRating} (Score=${energyImpactScore})`,
+          `Energy Rating: ${energyImpactRating} (Filtered MA(${ENERGY_MA_WINDOW_SIZE})=${smoothedEnergyScore} | Raw=${energyImpactScore} | High Threshold >=${highBatteryImpactThreshold})`,
+          `Full Timeline History: ${timeline.length} samples (Spike Bypass Events: ${spikeBypassCount} · Historical Impact CSV Ready)`,
           `BG Wakeups: ${bgWakeupCount} (1ns Gate Suppressed: ${energyBgSuppressed}) | Pool State: ${poolStateLabel} (${activePoolThreads} threads)`,
           `FG On-Demand Dispatches: ${fgDispatchCount} | Hook Events: ${energyHookEvents}`,
           `Cumulative CPU / Wall Time: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
           `Network Replays / Transferred: ${energyNetReqs} reqs / ${energyNetBytes} Bytes`,
           `Estimated Battery Draw: ~${estimatedEnergyMah.toFixed(4)} mAh`,
           highUsageTrendAlert
-            ? `Trend Alert: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases} consecutive increases in 5m window: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
-            : 'Trend Alert: Normal (no consecutive 5m increase streak detected)',
+            ? `Trend Alert: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} consecutive increases in 5m window: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
+            : `Trend Alert: Normal (5m window threshold >=${trendConsecutiveThreshold}x not triggered)`,
           '',
           `--- Current Energy Usage Log (${batteryLogs.length} entries) ---`,
         ];
@@ -782,6 +1302,73 @@ export default function App() {
     const reportText = [...headerLines, ...bodyLines].join('\n');
     setExportedBatteryReport(reportText);
     setDevConsoleOpen(true);
+  };
+
+  const buildHistoricalImpactCsv = (): string => {
+    const header = [
+      'index',
+      'timestamp_iso',
+      'time_hms',
+      'session_id',
+      'event',
+      'ma_window_size',
+      'filtered_ma_score',
+      'raw_score',
+      'score_delta',
+      'spike_bypass',
+      'above_high_threshold',
+      'cpu_ms',
+      'wall_ms',
+      'fg_dispatches',
+      'net_reqs',
+      'estimated_mah',
+    ].join(',');
+    const rows = fullEnergyTimelineRef.current.map((entry) =>
+      [
+        entry.index,
+        entry.timestampIso,
+        entry.timeHms,
+        entry.sessionTag,
+        entry.event,
+        entry.maWindowSize,
+        entry.filteredScore,
+        entry.rawScore,
+        entry.scoreDelta,
+        entry.spikeBypass,
+        entry.aboveHighThreshold,
+        entry.cpuMs.toFixed(1),
+        entry.wallMs.toFixed(1),
+        entry.fgDispatches,
+        entry.netReqs,
+        entry.estimatedMah.toFixed(4),
+      ]
+        .map(csvEscape)
+        .join(',')
+    );
+    return [header, ...rows].join('\n');
+  };
+
+  const handleDownloadHistoricalImpactCsv = () => {
+    const csv = buildHistoricalImpactCsv();
+    const totalSamples = fullEnergyTimelineRef.current.length;
+    const spikeBypassCount = fullEnergyTimelineRef.current.filter((e) => e.spikeBypass).length;
+    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `gemini-eye-historical-impact-${activeSession.sessionTag}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    const sess = activeSessionRef.current.sessionTag;
+    logDevEvent(
+      'BATTERY_IMPACT',
+      sess,
+      `[Historical Impact CSV 已导出] 导出完整历史时间线共 ${totalSamples} 条样本 (含 Raw Score 原始值与 ${spikeBypassCount} 次 Spike Bypass 尖峰直通标记)`,
+      `[Historical Impact CSV Exported] Downloaded full timeline (${totalSamples} samples including raw scores and ${spikeBypassCount} spike bypass events)`,
+      'info'
+    );
   };
 
   const handleCopyBatteryReport = async () => {
@@ -886,23 +1473,34 @@ export default function App() {
     const prevEdge = prevHudDockEdgeRef.current;
     prevHudDockEdgeRef.current = hudDockedEdge;
 
+    if (prevEdge !== hudDockedEdge && hudAnimRafRef.current !== null) {
+      cancelAnimationFrame(hudAnimRafRef.current);
+      hudAnimRafRef.current = null;
+    }
+
     let nextX = hudPosRef.current.x;
     if (!hudPosInitializedRef.current) {
-      nextX = Math.max(10, hostW - elW - 10);
+      nextX = Math.max(8, hostW - elW - 10);
       hudPosInitializedRef.current = true;
     } else if (hudDockedEdge === 'LEFT') {
-      nextX = 4;
+      nextX = 0;
     } else if (hudDockedEdge === 'RIGHT') {
-      nextX = Math.max(4, hostW - elW - 4);
+      nextX = Math.max(0, hostW - elW);
     } else if (prevEdge === 'LEFT') {
-      nextX = 10;
+      nextX = 8;
     } else if (prevEdge === 'RIGHT') {
-      nextX = Math.max(10, hostW - elW - 10);
+      nextX = Math.max(8, hostW - elW - 10);
     } else {
-      nextX = Math.max(10, Math.min(Math.max(10, hostW - elW - 10), nextX));
+      nextX = Math.max(4, Math.min(Math.max(4, hostW - elW - 4), nextX));
     }
 
     hudPosRef.current = { x: nextX, y: hudPosRef.current.y };
+    if (prevEdge !== hudDockedEdge) {
+      dragRef.current.filteredX = nextX;
+      dragRef.current.targetX = nextX;
+      dragRef.current.vx = 0;
+      dragRef.current.intendedDock = 'NONE';
+    }
     capsule.style.transform = `translate3d(${nextX.toFixed(2)}px, ${hudPosRef.current.y.toFixed(2)}px, 0)`;
   }, [isGeminiForeground, hudDockedEdge, activeSession, hudLang, isStaleOffline, isSessionDeepCleaned, activeView]);
 
@@ -1432,16 +2030,22 @@ export default function App() {
     const capsule = hudCapsuleRef.current;
     const host = capsule?.parentElement;
     if (capsule && host) {
-      const maxXShift = Math.max(24, host.clientWidth - capsule.offsetWidth - 4);
+      const hostW = host.clientWidth;
+      const isOrb = hudDockedEdgeRef.current !== 'NONE';
+      const minX = isOrb ? 0 : 4;
+      const maxXShift = isOrb
+        ? Math.max(0, hostW - capsule.offsetWidth)
+        : Math.max(minX + 8, hostW - capsule.offsetWidth - 4);
       const maxDownShift = Math.max(180, host.clientHeight - capsule.offsetHeight - 132);
       return {
-        minX: 4,
+        hostW,
+        minX,
         maxX: maxXShift,
         minY: -6,
         maxY: maxDownShift,
       };
     }
-    return { minX: 4, maxX: 300, minY: -8, maxY: 260 };
+    return { hostW: 400, minX: 4, maxX: 300, minY: -8, maxY: 260 };
   };
 
   const clampHudValue = (val: number, min: number, max: number) =>
@@ -1457,6 +2061,57 @@ export default function App() {
       return max + maxOvershoot * (1 - Math.exp(-over / 42));
     }
     return val;
+  };
+
+  const resolveIntendedDockEdge = (
+    rawX: number,
+    pointerLocalX: number,
+    vx: number,
+    bounds: { hostW: number; minX: number; maxX: number },
+    dxFromStart: number
+  ): HudDockEdge => {
+    const isCurrentlyOrb = hudDockedEdgeRef.current !== 'NONE';
+    if (isCurrentlyOrb) {
+      const distLeft = Math.max(0, rawX - bounds.minX);
+      const distRight = Math.max(0, bounds.maxX - rawX);
+      const orbZone = 72;
+      if (distLeft <= orbZone && distLeft <= distRight) return 'LEFT';
+      if (distRight <= orbZone) return 'RIGHT';
+      if (pointerLocalX <= 64) return 'LEFT';
+      if (pointerLocalX >= bounds.hostW - 64) return 'RIGHT';
+      return 'NONE';
+    }
+
+    const span = bounds.maxX - bounds.minX;
+    const distLeft = Math.max(0, rawX - bounds.minX);
+    const distRight = Math.max(0, bounds.maxX - rawX);
+    const edgeZonePx = Math.min(HUD_MAGNET_EDGE_THRESHOLD_PX, Math.max(24, span * 0.38));
+
+    if (
+      rawX <= bounds.minX - 6 ||
+      (pointerLocalX <= 68 && dxFromStart < -14) ||
+      (vx <= -0.32 && dxFromStart < -18)
+    ) {
+      return 'LEFT';
+    }
+    if (
+      rawX >= bounds.maxX + 6 ||
+      (pointerLocalX >= bounds.hostW - 68 && dxFromStart > 14) ||
+      (vx >= 0.32 && dxFromStart > 18)
+    ) {
+      return 'RIGHT';
+    }
+
+    if (span <= 84) {
+      if (dxFromStart <= -18 && distLeft <= distRight) return 'LEFT';
+      if (dxFromStart >= 18 && distRight <= distLeft) return 'RIGHT';
+      if (dxFromStart <= -28) return 'LEFT';
+      if (dxFromStart >= 28) return 'RIGHT';
+    } else {
+      if (distLeft <= edgeZonePx && distLeft <= distRight) return 'LEFT';
+      if (distRight <= edgeZonePx) return 'RIGHT';
+    }
+    return 'NONE';
   };
 
   const applyHudTransform = (x: number, y: number) => {
@@ -1479,7 +2134,6 @@ export default function App() {
       const bounds = getHudDragBounds();
 
       if (drag.pointerDown) {
-        // Decay residual velocity if finger pauses while held so the 8ms lead offset settles to exact finger position
         const idleSinceSample = now - drag.lastSampleTimeMs;
         if (idleSinceSample > 24) {
           const holdDecay = Math.pow(0.72, frameScale);
@@ -1492,7 +2146,7 @@ export default function App() {
         drag.targetX = rubberBandHudValue(drag.filteredX + leadX, bounds.minX, bounds.maxX);
         drag.targetY = rubberBandHudValue(drag.filteredY + leadY, bounds.minY, bounds.maxY);
 
-        const lerpAlpha = 1 - Math.pow(1 - 0.48, frameScale);
+        const lerpAlpha = 1 - Math.pow(1 - 0.52, frameScale);
         const curX = hudPosRef.current.x;
         const curY = hudPosRef.current.y;
         const dx = drag.targetX - curX;
@@ -1508,8 +2162,8 @@ export default function App() {
         return;
       }
 
-      // Release phase: inertial glide + smooth elastic settle + Left/Right 40px edge Magnetism -> Floating Orb
-      const decay = Math.pow(0.9, frameScale);
+      // Release phase: inertial glide + deterministic Left/Right edge Magnetism -> Floating Orb
+      const decay = Math.pow(0.88, frameScale);
       drag.vx *= decay;
       drag.vy *= decay;
 
@@ -1518,49 +2172,55 @@ export default function App() {
       let nextTargetX = clampHudValue(rawNextTargetX, bounds.minX, bounds.maxX);
       let nextTargetY = clampHudValue(rawNextTargetY, bounds.minY, bounds.maxY);
 
-      if (rawNextTargetX !== nextTargetX) drag.vx *= 0.45;
+      if (rawNextTargetX !== nextTargetX) drag.vx *= 0.4;
       if (rawNextTargetY !== nextTargetY) drag.vy *= 0.45;
 
       const speed = Math.hypot(drag.vx, drag.vy);
-      let magnetPending = false;
-      let targetDockAfterSettle: HudDockEdge | null = null;
+      let xMagnetPending = false;
       const capsule = hudCapsuleRef.current;
 
-      if (capsule && speed < 0.18) {
-        const distLeftEdge = Math.abs(nextTargetX - bounds.minX);
-        const distRightEdge = Math.abs(bounds.maxX - nextTargetX);
-        const nearestEdgeXDist = Math.min(distLeftEdge, distRightEdge);
+      const activeIntendedDock: HudDockEdge =
+        drag.intendedDock !== 'NONE'
+          ? drag.intendedDock
+          : speed < 0.18
+          ? (() => {
+              const dLeft = Math.abs(nextTargetX - bounds.minX);
+              const dRight = Math.abs(bounds.maxX - nextTargetX);
+              if (hudDockedEdgeRef.current !== 'NONE') {
+                if (dLeft <= 72 && dLeft <= dRight) return 'LEFT';
+                if (dRight <= 72) return 'RIGHT';
+                return 'NONE';
+              }
+              if (dLeft <= HUD_MAGNET_EDGE_THRESHOLD_PX && dLeft <= dRight) return 'LEFT';
+              if (dRight <= HUD_MAGNET_EDGE_THRESHOLD_PX) return 'RIGHT';
+              return 'NONE';
+            })()
+          : hudDockedEdgeRef.current;
 
-        const distTop = Math.abs(nextTargetY - bounds.minY);
-        const distBottom = Math.abs(bounds.maxY - nextTargetY);
-        const nearestEdgeYDist = Math.min(distTop, distBottom);
-        const magnetAlpha = 1 - Math.pow(1 - 0.24, frameScale);
-
-        if (nearestEdgeXDist <= HUD_MAGNET_EDGE_THRESHOLD_PX) {
-          const isLeft = distLeftEdge <= distRightEdge;
-          const snapX = isLeft ? bounds.minX : bounds.maxX;
-          targetDockAfterSettle = isLeft ? 'LEFT' : 'RIGHT';
+      if (capsule && (drag.intendedDock !== 'NONE' || speed < 0.18)) {
+        const magnetAlpha = 1 - Math.pow(1 - 0.34, frameScale);
+        if (activeIntendedDock === 'LEFT' || activeIntendedDock === 'RIGHT') {
+          const snapX = activeIntendedDock === 'LEFT' ? bounds.minX : bounds.maxX;
           const deltaSnapX = snapX - nextTargetX;
-          if (Math.abs(deltaSnapX) < 0.15) {
+          if (Math.abs(deltaSnapX) < 0.6) {
             nextTargetX = snapX;
           } else {
             nextTargetX += deltaSnapX * magnetAlpha;
-            drag.vx *= 0.6;
-            magnetPending = true;
+            drag.vx *= 0.55;
+            xMagnetPending = true;
           }
-        } else {
-          targetDockAfterSettle = 'NONE';
         }
 
-        if (nearestEdgeYDist <= HUD_MAGNET_EDGE_THRESHOLD_PX) {
+        const distTop = Math.abs(nextTargetY - bounds.minY);
+        const distBottom = Math.abs(bounds.maxY - nextTargetY);
+        if (Math.min(distTop, distBottom) <= 28) {
           const snapY = distTop <= distBottom ? bounds.minY : bounds.maxY;
           const deltaSnapY = snapY - nextTargetY;
-          if (Math.abs(deltaSnapY) < 0.12) {
+          if (Math.abs(deltaSnapY) < 0.35) {
             nextTargetY = snapY;
           } else {
             nextTargetY += deltaSnapY * magnetAlpha;
             drag.vy *= 0.6;
-            magnetPending = true;
           }
         }
       }
@@ -1570,18 +2230,42 @@ export default function App() {
 
       const curX = hudPosRef.current.x;
       const curY = hudPosRef.current.y;
-      const followAlpha = 1 - Math.pow(1 - 0.28, frameScale);
+      const followAlpha = 1 - Math.pow(1 - 0.34, frameScale);
       const nextX = curX + (nextTargetX - curX) * followAlpha;
       const nextY = curY + (nextTargetY - curY) * followAlpha;
 
-      const dist = Math.hypot(nextTargetX - nextX, nextTargetY - nextY);
-      if (!magnetPending && speed < 0.025 && dist < 0.12) {
+      const distX = Math.abs(nextTargetX - nextX);
+      const distY = Math.abs(nextTargetY - nextY);
+      const readyToCommitDock =
+        !xMagnetPending &&
+        distX < 1.2 &&
+        (activeIntendedDock !== hudDockedEdgeRef.current) &&
+        (drag.intendedDock !== 'NONE' || speed < 0.12);
+
+      if (readyToCommitDock) {
+        drag.intendedDock = 'NONE';
+        drag.vx = 0;
+        drag.vy = 0;
+        applyHudTransform(nextTargetX, nextY);
+        setHudDragEdgePreview('NONE');
+        setHudDockedEdge(activeIntendedDock);
+        if (distY < 0.35) {
+          hudAnimRafRef.current = null;
+          return;
+        }
+        hudAnimRafRef.current = requestAnimationFrame(step);
+        return;
+      }
+
+      if (!xMagnetPending && speed < 0.03 && distX < 0.25 && distY < 0.25) {
+        drag.intendedDock = 'NONE';
         drag.vx = 0;
         drag.vy = 0;
         applyHudTransform(nextTargetX, nextTargetY);
+        setHudDragEdgePreview('NONE');
         hudAnimRafRef.current = null;
-        if (targetDockAfterSettle !== null && targetDockAfterSettle !== hudDockedEdgeRef.current) {
-          setHudDockedEdge(targetDockAfterSettle);
+        if (activeIntendedDock !== hudDockedEdgeRef.current) {
+          setHudDockedEdge(activeIntendedDock);
         }
         return;
       }
@@ -1600,11 +2284,16 @@ export default function App() {
     }
     e.currentTarget.setPointerCapture(e.pointerId);
     const now = performance.now();
+    const hostRect = e.currentTarget.parentElement?.getBoundingClientRect();
+    const localX = hostRect ? e.clientX - hostRect.left : 0;
     dragRef.current = {
       startX: e.clientX,
       startY: e.clientY,
       origX: hudPosRef.current.x,
       origY: hudPosRef.current.y,
+      rawX: hudPosRef.current.x,
+      pointerLocalX: localX,
+      intendedDock: 'NONE',
       filteredX: hudPosRef.current.x,
       filteredY: hudPosRef.current.y,
       targetX: hudPosRef.current.x,
@@ -1637,7 +2326,6 @@ export default function App() {
     const stepDist = Math.hypot(stepDx, stepDy);
     const sampleDt = now - drag.lastSampleTimeMs;
 
-    // Anti-jitter touch sampling: drop sub-pixel digitizer tremor bursts within 8ms window
     if (stepDist < HUD_TOUCH_JITTER_DEADBAND_PX && sampleDt < HUD_TOUCH_SAMPLE_WINDOW_MS) {
       return;
     }
@@ -1646,7 +2334,6 @@ export default function App() {
     const instVx = stepDx / dt;
     const instVy = stepDy / dt;
 
-    // Exponential velocity smoothing prevents fast-swipe spike jitter
     drag.vx = drag.vx * 0.55 + clampHudValue(instVx, -1.8, 1.8) * 0.45;
     drag.vy = drag.vy * 0.55 + clampHudValue(instVy, -1.8, 1.8) * 0.45;
     drag.lastClientX = e.clientX;
@@ -1654,20 +2341,27 @@ export default function App() {
     drag.lastTimeMs = now;
     drag.lastSampleTimeMs = now;
 
-    // Adaptive speed-coupled position smoothing (suppresses slow micro-jitter while preserving fast swipe tracking)
     const speed = Math.hypot(drag.vx, drag.vy);
     const posAlpha = clampHudValue(0.48 + speed * 0.44, 0.48, 0.96);
     const rawX = drag.origX + dx;
     const rawY = drag.origY + dy;
+    drag.rawX = rawX;
+    const hostRect = e.currentTarget.parentElement?.getBoundingClientRect();
+    const pointerLocalX = hostRect ? e.clientX - hostRect.left : drag.pointerLocalX;
+    drag.pointerLocalX = pointerLocalX;
+
     drag.filteredX = drag.filteredX + (rawX - drag.filteredX) * posAlpha;
     drag.filteredY = drag.filteredY + (rawY - drag.filteredY) * posAlpha;
 
-    // Apply 8ms predictive frame-smoothing offset to reduce touch-to-display drag latency on Android
     const bounds = getHudDragBounds();
     const leadX = clampHudValue(drag.vx * HUD_FRAME_SMOOTH_OFFSET_MS, -14, 14);
     const leadY = clampHudValue(drag.vy * HUD_FRAME_SMOOTH_OFFSET_MS, -14, 14);
     drag.targetX = rubberBandHudValue(drag.filteredX + leadX, bounds.minX, bounds.maxX);
     drag.targetY = rubberBandHudValue(drag.filteredY + leadY, bounds.minY, bounds.maxY);
+
+    const previewDock = resolveIntendedDockEdge(rawX, pointerLocalX, drag.vx, bounds, dx);
+    drag.intendedDock = previewDock;
+    setHudDragEdgePreview((prev) => (prev === previewDock ? prev : previewDock));
 
     ensureHudAnimationLoop();
   };
@@ -1676,6 +2370,7 @@ export default function App() {
     const drag = dragRef.current;
     if (!drag.pointerDown) return;
     drag.pointerDown = false;
+    setHudDragEdgePreview('NONE');
     try {
       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
         e.currentTarget.releasePointerCapture(e.pointerId);
@@ -1685,7 +2380,17 @@ export default function App() {
     }
     if (drag.moved) {
       const bounds = getHudDragBounds();
-      drag.targetX = clampHudValue(drag.filteredX, bounds.minX, bounds.maxX);
+      const dx = e.clientX - drag.startX;
+      const hostRect = e.currentTarget.parentElement?.getBoundingClientRect();
+      const pointerLocalX = hostRect ? e.clientX - hostRect.left : drag.pointerLocalX;
+      const intended = resolveIntendedDockEdge(drag.rawX, pointerLocalX, drag.vx, bounds, dx);
+      drag.intendedDock = intended;
+      drag.targetX =
+        intended === 'LEFT'
+          ? bounds.minX
+          : intended === 'RIGHT'
+          ? bounds.maxX
+          : clampHudValue(drag.filteredX, bounds.minX, bounds.maxX);
       drag.targetY = clampHudValue(drag.filteredY, bounds.minY, bounds.maxY);
       if (performance.now() - drag.lastSampleTimeMs > 64) {
         drag.vx = 0;
@@ -1693,11 +2398,9 @@ export default function App() {
       }
       ensureHudAnimationLoop();
     } else if (hudDockedEdgeRef.current !== 'NONE') {
-      // Tap the Floating Orb -> ripple + expand back into the full HUD capsule
       triggerHudTapRipple(e.clientX, e.clientY);
       setHudDockedEdge('NONE');
     } else {
-      // Tap the HUD capsule body -> ripple visual feedback + manual refresh
       performManualHudRefresh('CAPSULE_TAP', e.clientX, e.clientY);
     }
   };
@@ -2407,7 +3110,7 @@ export default function App() {
 
                       {usageSheetOpen && isGeminiForeground && (
                         <div
-                          className={`p-3.5 rounded-2xl border space-y-2 max-h-[250px] overflow-y-auto ${
+                          className={`p-3.5 rounded-2xl border space-y-2 max-h-[340px] overflow-y-auto ${
                             simDarkTheme
                               ? 'bg-zinc-900 border-zinc-700 text-zinc-100'
                               : 'bg-white border-slate-200 text-slate-900 shadow-xs'
@@ -2501,7 +3204,7 @@ export default function App() {
                                   aria-label="HUD Opacity"
                                   className="w-full h-1.5 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-sky-500"
                                 />
-                                {hudOpacity !== 85 && (
+                                  {hudOpacity !== 85 && (
                                   <button
                                     type="button"
                                     onClick={() => setHudOpacity(85)}
@@ -2514,6 +3217,138 @@ export default function App() {
                                     {isZh ? '重置' : 'Reset'}
                                   </button>
                                 )}
+                              </div>
+                            </div>
+
+                            <div className="space-y-1 pt-1">
+                              <div className="flex items-center justify-between gap-2 text-[11px]">
+                                <span className="font-medium">
+                                  {isZh
+                                    ? 'High Usage Trend 灵敏度 (连续上升次数)'
+                                    : 'High Usage Trend Sensitivity (Consecutive Increases)'}
+                                </span>
+                                <span className="font-mono text-[10px] text-rose-500 font-semibold">
+                                  &gt;= {trendConsecutiveThreshold}x / 5m
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[9px] font-mono opacity-60 shrink-0">{TREND_CONSECUTIVE_MIN}</span>
+                                <input
+                                  type="range"
+                                  min={TREND_CONSECUTIVE_MIN}
+                                  max={TREND_CONSECUTIVE_MAX}
+                                  step={1}
+                                  value={trendConsecutiveThreshold}
+                                  onChange={(e) =>
+                                    setTrendConsecutiveThreshold(
+                                      clampTrendConsecutiveThreshold(Number(e.target.value))
+                                    )
+                                  }
+                                  aria-label="High Usage Trend Consecutive Increases Threshold"
+                                  className="w-full h-1.5 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                                />
+                                <span className="text-[9px] font-mono opacity-60 shrink-0">{TREND_CONSECUTIVE_MAX}</span>
+                                {trendConsecutiveThreshold !== DEFAULT_TREND_CONSECUTIVE_THRESHOLD && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setTrendConsecutiveThreshold(DEFAULT_TREND_CONSECUTIVE_THRESHOLD)
+                                    }
+                                    className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 cursor-pointer ${
+                                      simDarkTheme
+                                        ? 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                                        : 'border-slate-200 bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                    }`}
+                                  >
+                                    {isZh ? '重置' : 'Reset'}
+                                  </button>
+                                )}
+                              </div>
+                              <div className="text-[9.5px] opacity-65 font-mono">
+                                {isZh
+                                  ? '5 分钟滑动窗口连续上升触发阈值 · 已自动保存至 localStorage'
+                                  : '5-min rolling window trigger streak · Saved to localStorage'}
+                              </div>
+                            </div>
+
+                            <div className="space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60">
+                              <div className="flex items-center justify-between gap-2 text-[11px]">
+                                <span className="font-medium">
+                                  {isZh
+                                    ? 'Trend 通知自动消失计时'
+                                    : 'Trend Alert Auto-Dismiss Timer'}
+                                </span>
+                                <div className="flex items-center gap-1.5">
+                                  <span
+                                    className={`font-mono text-[10px] font-semibold ${
+                                      trendAutoDismissEnabled ? 'text-amber-500' : 'opacity-60'
+                                    }`}
+                                  >
+                                    {trendAutoDismissEnabled
+                                      ? `${trendAutoDismissSec}s`
+                                      : isZh
+                                        ? '已关闭'
+                                        : 'OFF'}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setTrendAutoDismissEnabled((v) => !v)}
+                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors cursor-pointer ${
+                                      trendAutoDismissEnabled
+                                        ? 'bg-amber-600 border-amber-500 text-white'
+                                        : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-300'
+                                    }`}
+                                  >
+                                    {trendAutoDismissEnabled ? 'AUTO' : 'OFF'}
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[9px] font-mono opacity-60 shrink-0">
+                                  {TREND_AUTO_DISMISS_MIN_SEC}s
+                                </span>
+                                <input
+                                  type="range"
+                                  min={TREND_AUTO_DISMISS_MIN_SEC}
+                                  max={TREND_AUTO_DISMISS_MAX_SEC}
+                                  step={1}
+                                  disabled={!trendAutoDismissEnabled}
+                                  value={trendAutoDismissSec}
+                                  onChange={(e) =>
+                                    setTrendAutoDismissSec(
+                                      clampTrendAutoDismissSec(Number(e.target.value))
+                                    )
+                                  }
+                                  aria-label="High Usage Trend Auto-Dismiss Timer Seconds"
+                                  className={`w-full h-1.5 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none accent-amber-500 ${
+                                    trendAutoDismissEnabled
+                                      ? 'cursor-pointer'
+                                      : 'opacity-45 cursor-not-allowed'
+                                  }`}
+                                />
+                                <span className="text-[9px] font-mono opacity-60 shrink-0">
+                                  {TREND_AUTO_DISMISS_MAX_SEC}s
+                                </span>
+                                {trendAutoDismissSec !== DEFAULT_TREND_AUTO_DISMISS_SEC && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setTrendAutoDismissSec(DEFAULT_TREND_AUTO_DISMISS_SEC)
+                                    }
+                                    className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 cursor-pointer ${
+                                      simDarkTheme
+                                        ? 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                                        : 'border-slate-200 bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                    }`}
+                                  >
+                                    {isZh ? '重置' : 'Reset'}
+                                  </button>
+                                )}
+                              </div>
+                              <div className="text-[9.5px] opacity-65 font-mono">
+                                {isZh
+                                  ? '触发后超时自动从控制台移除 · 已保存至 localStorage'
+                                  : 'Auto-removes console alert after timeout · Saved to localStorage'}
                               </div>
                             </div>
                           </div>
@@ -2604,6 +3439,20 @@ export default function App() {
                     )}
                   </div>
 
+                  {/* Edge-dock snap preview strips on left / right bezels while dragging */}
+                  {isGeminiForeground && hudDragEdgePreview === 'LEFT' && (
+                    <div
+                      aria-hidden="true"
+                      className="pointer-events-none absolute left-0 top-14 w-1.5 h-16 rounded-r-full bg-sky-400/90 shadow-[0_0_12px_rgba(56,189,248,0.85)] animate-pulse z-20"
+                    />
+                  )}
+                  {isGeminiForeground && hudDragEdgePreview === 'RIGHT' && (
+                    <div
+                      aria-hidden="true"
+                      className="pointer-events-none absolute right-0 top-14 w-1.5 h-16 rounded-l-full bg-sky-400/90 shadow-[0_0_12px_rgba(56,189,248,0.85)] animate-pulse z-20"
+                    />
+                  )}
+
                   {/* EXACT SINGLE-LINE CAPSULE / EDGE-DOCKED FLOATING ORB HUD (`QuotaHudView.kt` Spec — Foreground Only) */}
                   {isGeminiForeground && (
                     <div
@@ -2621,12 +3470,16 @@ export default function App() {
                           ? '轻点胶囊触发波纹并手动刷新，或拖拽至左右边缘贴边收起'
                           : 'Tap capsule for ripple & manual refresh, or drag to left/right edge'
                       }
-                      className={`absolute top-12 left-0 max-w-[96%] inline-flex flex-col items-stretch rounded-full border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${
+                      className={`absolute top-12 left-0 border text-[11px] leading-none whitespace-nowrap cursor-grab active:cursor-grabbing touch-none will-change-transform transition-colors ${
                         hudDockedEdge !== 'NONE'
-                          ? 'w-11 h-11 p-1 items-center justify-center'
-                          : isStaleOffline
-                          ? 'px-3 py-1.5'
-                          : 'px-2.5 py-1.5'
+                          ? `w-11 h-11 p-0.5 flex items-center justify-center ${
+                              hudDockedEdge === 'LEFT'
+                                ? 'rounded-r-full rounded-l-xl border-l-2 border-l-sky-400/80'
+                                : 'rounded-l-full rounded-r-xl border-r-2 border-r-sky-400/80'
+                            }`
+                          : `max-w-[96%] inline-flex flex-col items-stretch rounded-full ${
+                              isStaleOffline ? 'px-3 py-1.5' : 'px-2.5 py-1.5'
+                            }`
                       } ${capsuleContainerClass}`}
                     >
                       {/* Clipped radial tap ripple layer */}
@@ -2967,6 +3820,16 @@ export default function App() {
                                 ? `5分钟窗口连续上升 ${highUsageTrendAlert.consecutiveIncreases} 次`
                                 : `${highUsageTrendAlert.consecutiveIncreases} consecutive increases in 5m window`}
                             </span>
+                            {trendAutoDismissEnabled && trendAlertRemainingSec !== null && (
+                              <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200 border border-amber-400/40 tabular-nums">
+                                <Clock className="w-3 h-3" />
+                                <span>
+                                  {isZh
+                                    ? `${trendAlertRemainingSec}s 后自动消失`
+                                    : `Auto-dismiss in ${trendAlertRemainingSec}s`}
+                                </span>
+                              </span>
+                            )}
                           </div>
                           <div className="text-[11px] text-rose-100/90 break-words">
                             {isZh
@@ -3101,18 +3964,47 @@ export default function App() {
                           skipNextEnergyHistoryPushRef.current = true;
                           heartbeatBaselineScoreRef.current = 0;
                           surgeAlertedInCycleRef.current = false;
-                          energyTrendWindowRef.current = [
-                            { ts: Date.now(), score: 0, event: 'RESET' },
-                          ];
+                          energyMaWindowRef.current = [0];
+                          setSmoothedEnergyScore(0);
+                          const resetTs = Date.now();
+                          const resetSamples = [{ ts: resetTs, score: 0, event: 'RESET' }];
+                          energyTrendWindowRef.current = resetSamples;
+                          setHighUsageTrendChartHistory(
+                            buildTrendWindowChartSeries(resetSamples, trendConsecutiveThresholdRef.current)
+                          );
                           highUsageTrendAlertedStreakRef.current = 0;
                           setEnergySurgeAlert(null);
                           setHighUsageTrendAlert(null);
                           const d = new Date();
                           const pad = (n: number) => String(n).padStart(2, '0');
+                          const resetTimeStr = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+                          fullEnergyTimelineRef.current = [
+                            {
+                              index: 1,
+                              timestampIso: d.toISOString(),
+                              timeHms: resetTimeStr,
+                              sessionTag: activeSessionRef.current.sessionTag,
+                              event: 'RESET',
+                              maWindowSize: ENERGY_MA_WINDOW_SIZE,
+                              filteredScore: 0,
+                              rawScore: 0,
+                              scoreDelta: 0,
+                              spikeBypass: false,
+                              aboveHighThreshold: false,
+                              cpuMs: 0,
+                              wallMs: 0,
+                              fgDispatches: 0,
+                              netReqs: 0,
+                              estimatedMah: 0,
+                            },
+                          ];
+                          setEnergyTimelineCount(1);
                           setEnergyScoreHistory([
                             {
-                              time: `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
+                              time: resetTimeStr,
                               score: 0,
+                              rawScore: 0,
+                              spikeBypass: false,
                               cpuMs: 0,
                               event: 'RESET',
                             },
@@ -3145,7 +4037,7 @@ export default function App() {
                               : 'bg-teal-500/15 text-teal-300 border-teal-500/30'
                           }`}
                         >
-                          Energy Impact: {energyImpactRating} ({energyImpactScore})
+                          Energy Impact: {energyImpactRating} · MA({ENERGY_MA_WINDOW_SIZE})={smoothedEnergyScore} (Raw {energyImpactScore})
                         </span>
                         {isHighBatteryImpact && hudTheme === 'MIUIX' && (
                           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 animate-pulse">
@@ -3160,7 +4052,19 @@ export default function App() {
                           onClick={handleSimulateHighBatteryImpact}
                           className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-amber-950/60 hover:bg-amber-900/60 text-amber-200 border border-amber-700/60 transition-colors cursor-pointer"
                         >
-                          <span>{isZh ? '模拟高能耗 (>=20)' : 'Simulate High Load'}</span>
+                          <span>
+                            {isZh
+                              ? `模拟高能耗 (>=${highBatteryImpactThreshold})`
+                              : `Simulate High Load (>=${highBatteryImpactThreshold})`}
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleSimulateEnergyJitterTest}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] rounded bg-cyan-950/60 hover:bg-cyan-900/60 text-cyan-200 border border-cyan-700/60 transition-colors cursor-pointer"
+                        >
+                          <span>{isZh ? '抖动滤波测试' : 'Jitter Filter Test'}</span>
                         </button>
 
                         <button
@@ -3209,6 +4113,85 @@ export default function App() {
                           <FileText className="w-3 h-3" />
                           <span>Export Report</span>
                         </button>
+
+                        <button
+                          type="button"
+                          onClick={handleDownloadHistoricalImpactCsv}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded bg-emerald-700 hover:bg-emerald-600 text-white border border-emerald-400/40 transition-colors cursor-pointer"
+                          title={
+                            isZh
+                              ? `下载完整历史能耗时间线 CSV（${energyTimelineCount} 条样本，含 Raw 值与 Spike Bypass 事件）`
+                              : `Download complete energy impact timeline CSV (${energyTimelineCount} samples including raw scores & spike bypass events)`
+                          }
+                        >
+                          <Download className="w-3 h-3" />
+                          <span>Historical Impact CSV ({energyTimelineCount})</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Dynamic High Battery Impact Threshold Settings Slider */}
+                    <div className="rounded-lg border border-teal-500/25 bg-slate-950/65 px-3 py-2 space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-semibold text-teal-200">
+                            {isZh
+                              ? '高能耗告警阈值设置 (High Battery Impact Threshold)'
+                              : 'High Battery Impact Threshold'}
+                          </span>
+                          <span
+                            className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                              isHighBatteryImpact
+                                ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                                : 'bg-slate-800 text-slate-300 border-slate-700'
+                            }`}
+                          >
+                            {isHighBatteryImpact
+                              ? isZh
+                                ? `已超过阈值 (${energyImpactScore} >= ${highBatteryImpactThreshold})`
+                                : `ALERT ACTIVE (${energyImpactScore} >= ${highBatteryImpactThreshold})`
+                              : isZh
+                              ? `监控中 (${energyImpactScore} < ${highBatteryImpactThreshold})`
+                              : `MONITORING (${energyImpactScore} < ${highBatteryImpactThreshold})`}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-[11px] font-semibold text-amber-300">
+                            &gt;= {highBatteryImpactThreshold} pts
+                          </span>
+                          {highBatteryImpactThreshold !== DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD && (
+                            <button
+                              type="button"
+                              onClick={() => setHighBatteryImpactThreshold(DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD)}
+                              className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer"
+                            >
+                              {isZh
+                                ? `重置 (${DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD})`
+                                : `Reset (${DEFAULT_HIGH_BATTERY_IMPACT_THRESHOLD})`}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="text-[10px] font-mono text-slate-500 shrink-0">{HIGH_BATTERY_THRESHOLD_MIN}</span>
+                        <input
+                          type="range"
+                          min={HIGH_BATTERY_THRESHOLD_MIN}
+                          max={HIGH_BATTERY_THRESHOLD_MAX}
+                          step={1}
+                          value={highBatteryImpactThreshold}
+                          onChange={(e) =>
+                            setHighBatteryImpactThreshold(clampHighBatteryThreshold(Number(e.target.value)))
+                          }
+                          aria-label="High Battery Impact Threshold"
+                          className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-400"
+                        />
+                        <span className="text-[10px] font-mono text-slate-500 shrink-0">{HIGH_BATTERY_THRESHOLD_MAX}</span>
+                      </div>
+                      <div className="text-[10px] text-slate-400 font-mono">
+                        {isZh
+                          ? '已自动持久化至 localStorage（刷新保留）；实时联动警戒参考线、Spike Bypass、高能耗告警及 MIUIX 呼吸模糊动画'
+                          : 'Persisted automatically to localStorage across refreshes; updates chart line, spike bypass, alerts & MIUIX blur live'}
                       </div>
                     </div>
 
@@ -3280,108 +4263,282 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* Energy Impact Score Time-Series Line Chart (Recharts) */}
-                        <div className="rounded-lg bg-slate-950/80 border border-slate-800/90 p-3 space-y-2">
-                          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-                            <span className="font-mono font-semibold text-teal-300">
-                              {isZh
-                                ? 'Energy Impact Score 趋势图（识别高负载峰值）'
-                                : 'Energy Impact Score Over Time (High-Load Spike Monitor)'}
-                            </span>
-                            <div className="flex items-center gap-3 text-[10px] font-mono text-slate-400">
-                              <span className="inline-flex items-center gap-1">
-                                <span className="w-2 h-2 rounded-full bg-teal-400" />
-                                {isZh ? '正常能耗' : 'Normal'}
+                        {/* Dual Time-Series Charts: Primary Energy Impact (MA) + Secondary 5-Min Rolling High Usage Trend */}
+                        <div className="grid grid-cols-1 xl:grid-cols-2 gap-2.5">
+                          <div className="rounded-lg bg-slate-950/80 border border-slate-800/90 p-3 space-y-2">
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                              <span className="font-mono font-semibold text-teal-300">
+                                {isZh
+                                  ? `Energy Impact Score 移动平均滤波曲线 · MA(${ENERGY_MA_WINDOW_SIZE})`
+                                  : `Energy Impact Score · Moving Average Filter MA(${ENERGY_MA_WINDOW_SIZE})`}
                               </span>
-                              <span className="inline-flex items-center gap-1">
-                                <span className="w-2 h-2 rounded-full bg-amber-400" />
-                                {isZh ? `高负载阈值 (>=${HIGH_BATTERY_IMPACT_THRESHOLD})` : `Spike Threshold (>=${HIGH_BATTERY_IMPACT_THRESHOLD})`}
-                              </span>
+                              <div className="flex flex-wrap items-center gap-3 text-[10px] font-mono text-slate-400">
+                                <span className="inline-flex items-center gap-1">
+                                  <span className="w-2.5 h-0.5 bg-teal-400" />
+                                  {isZh ? '滤波平滑曲线 (MA)' : 'Filtered (MA)'}
+                                </span>
+                                <span className="inline-flex items-center gap-1">
+                                  <span className="w-2.5 h-0 border-t border-dashed border-slate-400" />
+                                  {isZh ? '原始采样 (Raw)' : 'Raw Sample'}
+                                </span>
+                                <span className="inline-flex items-center gap-1">
+                                  <span className="w-2 h-2 rounded-full bg-amber-400" />
+                                  {isZh ? `尖峰直通 (>=${highBatteryImpactThreshold})` : `Spike Bypass (>=${highBatteryImpactThreshold})`}
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="w-full h-44">
+                              <ResponsiveContainer width="100%" height="100%">
+                                <LineChart
+                                  data={energyScoreHistory}
+                                  margin={{ top: 8, right: 14, left: -14, bottom: 2 }}
+                                >
+                                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                                  <XAxis
+                                    dataKey="time"
+                                    tick={{ fill: '#64748b', fontSize: 10 }}
+                                    stroke="#334155"
+                                  />
+                                  <YAxis
+                                    domain={[
+                                      0,
+                                      (dataMax: number) => Math.max(highBatteryImpactThreshold + 5, 25, Math.ceil(dataMax * 1.15)),
+                                    ]}
+                                    tick={{ fill: '#64748b', fontSize: 10 }}
+                                    stroke="#334155"
+                                  />
+                                  <Tooltip
+                                    content={({ active, payload, label }) => {
+                                      if (!active || !payload || payload.length === 0) return null;
+                                      const pt = payload[0]?.payload as
+                                        | { time: string; score: number; rawScore: number; spikeBypass: boolean; cpuMs: number; event: string }
+                                        | undefined;
+                                      if (!pt) return null;
+                                      const spike = pt.score >= highBatteryImpactThreshold || pt.spikeBypass;
+                                      return (
+                                        <div className="rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-[11px] font-mono shadow-lg">
+                                          <div className="text-slate-400">
+                                            {label} · {pt.event}
+                                          </div>
+                                          <div className={spike ? 'text-amber-300 font-bold' : 'text-teal-300 font-semibold'}>
+                                            MA({ENERGY_MA_WINDOW_SIZE}) Score: {pt.score} {pt.spikeBypass ? '(SPIKE BYPASS)' : ''}
+                                          </div>
+                                          <div className="text-slate-400 text-[10px]">
+                                            Raw: {pt.rawScore} · CPU: {pt.cpuMs.toFixed(1)} ms
+                                          </div>
+                                        </div>
+                                      );
+                                    }}
+                                  />
+                                  <ReferenceLine
+                                    y={highBatteryImpactThreshold}
+                                    stroke="#f59e0b"
+                                    strokeDasharray="4 4"
+                                    label={{
+                                      value: `High >= ${highBatteryImpactThreshold}`,
+                                      position: 'insideTopRight',
+                                      fill: '#fbbf24',
+                                      fontSize: 10,
+                                    }}
+                                  />
+                                  <Line
+                                    type="linear"
+                                    dataKey="rawScore"
+                                    name={isZh ? '原始采样' : 'Raw Score'}
+                                    stroke="#64748b"
+                                    strokeWidth={1.25}
+                                    strokeDasharray="3 3"
+                                    dot={false}
+                                    isAnimationActive={false}
+                                  />
+                                  <Line
+                                    type="monotone"
+                                    dataKey="score"
+                                    name={isZh ? `移动平均 MA(${ENERGY_MA_WINDOW_SIZE})` : `Moving Avg MA(${ENERGY_MA_WINDOW_SIZE})`}
+                                    stroke={isHighBatteryImpact ? '#f59e0b' : '#2dd4bf'}
+                                    strokeWidth={2.4}
+                                    isAnimationActive={false}
+                                    dot={(dotProps) => {
+                                      const { cx, cy, index, payload } = dotProps;
+                                      if (typeof cx !== 'number' || typeof cy !== 'number') {
+                                        return <g key={`empty-${index ?? 0}`} />;
+                                      }
+                                      const pt = payload as { score?: number; spikeBypass?: boolean } | undefined;
+                                      const isSpike = (pt?.score ?? 0) >= highBatteryImpactThreshold || Boolean(pt?.spikeBypass);
+                                      return (
+                                        <circle
+                                          key={`dot-${index ?? cx}`}
+                                          cx={cx}
+                                          cy={cy}
+                                          r={isSpike ? 4.5 : 3}
+                                          fill={isSpike ? '#f59e0b' : '#2dd4bf'}
+                                          stroke="#0f172a"
+                                          strokeWidth={1.5}
+                                        />
+                                      );
+                                    }}
+                                    activeDot={{ r: 5.5, fill: '#fbbf24', stroke: '#0f172a', strokeWidth: 1.5 }}
+                                  />
+                                </LineChart>
+                              </ResponsiveContainer>
                             </div>
                           </div>
 
-                          <div className="w-full h-44">
-                            <ResponsiveContainer width="100%" height="100%">
-                              <LineChart
-                                data={energyScoreHistory}
-                                margin={{ top: 8, right: 14, left: -14, bottom: 2 }}
-                              >
-                                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                                <XAxis
-                                  dataKey="time"
-                                  tick={{ fill: '#64748b', fontSize: 10 }}
-                                  stroke="#334155"
-                                />
-                                <YAxis
-                                  domain={[0, (dataMax: number) => Math.max(25, Math.ceil(dataMax * 1.15))]}
-                                  tick={{ fill: '#64748b', fontSize: 10 }}
-                                  stroke="#334155"
-                                />
-                                <Tooltip
-                                  content={({ active, payload, label }) => {
-                                    if (!active || !payload || payload.length === 0) return null;
-                                    const pt = payload[0]?.payload as
-                                      | { time: string; score: number; cpuMs: number; event: string }
-                                      | undefined;
-                                    if (!pt) return null;
-                                    const spike = pt.score >= HIGH_BATTERY_IMPACT_THRESHOLD;
-                                    return (
-                                      <div className="rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-[11px] font-mono shadow-lg">
-                                        <div className="text-slate-400">
-                                          {label} · {pt.event}
-                                        </div>
-                                        <div className={spike ? 'text-amber-300 font-bold' : 'text-teal-300 font-semibold'}>
-                                          Score: {pt.score} {spike ? '(HIGH SPIKE)' : ''}
-                                        </div>
-                                        <div className="text-slate-400 text-[10px]">
-                                          CPU: {pt.cpuMs.toFixed(1)} ms
-                                        </div>
-                                      </div>
-                                    );
-                                  }}
-                                />
-                                <ReferenceLine
-                                  y={HIGH_BATTERY_IMPACT_THRESHOLD}
-                                  stroke="#f59e0b"
-                                  strokeDasharray="4 4"
-                                  label={{
-                                    value: `High >= ${HIGH_BATTERY_IMPACT_THRESHOLD}`,
-                                    position: 'insideTopRight',
-                                    fill: '#fbbf24',
-                                    fontSize: 10,
-                                  }}
-                                />
-                                <Line
-                                  type="monotone"
-                                  dataKey="score"
-                                  name={isZh ? '能耗评分' : 'Energy Score'}
-                                  stroke={isHighBatteryImpact ? '#f59e0b' : '#2dd4bf'}
-                                  strokeWidth={2.2}
-                                  isAnimationActive={false}
-                                  dot={(dotProps) => {
-                                    const { cx, cy, index, payload } = dotProps;
-                                    if (typeof cx !== 'number' || typeof cy !== 'number') {
-                                      return <g key={`empty-${index ?? 0}`} />;
-                                    }
-                                    const pt = payload as { score?: number } | undefined;
-                                    const isSpike = (pt?.score ?? 0) >= HIGH_BATTERY_IMPACT_THRESHOLD;
-                                    return (
-                                      <circle
-                                        key={`dot-${index ?? cx}`}
-                                        cx={cx}
-                                        cy={cy}
-                                        r={isSpike ? 4.5 : 3}
-                                        fill={isSpike ? '#f59e0b' : '#2dd4bf'}
-                                        stroke="#0f172a"
-                                        strokeWidth={1.5}
+                          {/* Secondary Line Chart: 5-Minute Rolling Window High Usage Trend Streak */}
+                          {(() => {
+                            const latestTrendPoint =
+                              highUsageTrendChartHistory[highUsageTrendChartHistory.length - 1];
+                            const currentStreak = latestTrendPoint?.streak ?? 0;
+                            const isStreakAlert = currentStreak >= trendConsecutiveThreshold;
+                            return (
+                              <div className="rounded-lg bg-slate-950/80 border border-rose-500/25 p-3 space-y-2">
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-mono font-semibold text-rose-300">
+                                      {isZh
+                                        ? 'High Usage Trend · 5分钟滑动窗口连续上升'
+                                        : 'High Usage Trend · 5m Rolling Streak'}
+                                    </span>
+                                    <span
+                                      className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                                        isStreakAlert
+                                          ? 'bg-rose-500/20 text-rose-200 border-rose-400/50 font-semibold'
+                                          : 'bg-slate-800 text-slate-300 border-slate-700'
+                                      }`}
+                                    >
+                                      {isZh
+                                        ? `连升 ${currentStreak}/${trendConsecutiveThreshold} 次`
+                                        : `Streak ${currentStreak}/${trendConsecutiveThreshold}x`}
+                                    </span>
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-3 text-[10px] font-mono text-slate-400">
+                                    <span className="inline-flex items-center gap-1">
+                                      <span className="w-2.5 h-0.5 bg-rose-400" />
+                                      {isZh ? '连续上升计数' : 'Increase Streak'}
+                                    </span>
+                                    <span className="inline-flex items-center gap-1">
+                                      <span className="w-2.5 h-0 border-t border-dashed border-sky-400" />
+                                      {isZh ? '原始功耗分' : 'Energy Score'}
+                                    </span>
+                                  </div>
+                                </div>
+
+                                <div className="w-full h-44">
+                                  <ResponsiveContainer width="100%" height="100%">
+                                    <LineChart
+                                      data={highUsageTrendChartHistory}
+                                      margin={{ top: 8, right: 4, left: -18, bottom: 2 }}
+                                    >
+                                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                                      <XAxis
+                                        dataKey="time"
+                                        tick={{ fill: '#64748b', fontSize: 10 }}
+                                        stroke="#334155"
                                       />
-                                    );
-                                  }}
-                                  activeDot={{ r: 5.5, fill: '#fbbf24', stroke: '#0f172a', strokeWidth: 1.5 }}
-                                />
-                              </LineChart>
-                            </ResponsiveContainer>
-                          </div>
+                                      <YAxis
+                                        yAxisId="streak"
+                                        allowDecimals={false}
+                                        domain={[
+                                          0,
+                                          (dataMax: number) => Math.max(trendConsecutiveThreshold + 1, 4, Math.ceil(dataMax + 1)),
+                                        ]}
+                                        tick={{ fill: '#fda4af', fontSize: 10 }}
+                                        stroke="#4c0519"
+                                      />
+                                      <YAxis
+                                        yAxisId="score"
+                                        orientation="right"
+                                        domain={[0, (dataMax: number) => Math.max(10, Math.ceil(dataMax * 1.15))]}
+                                        tick={{ fill: '#7dd3fc', fontSize: 10 }}
+                                        stroke="#1e293b"
+                                      />
+                                      <Tooltip
+                                        content={({ active, payload, label }) => {
+                                          if (!active || !payload || payload.length === 0) return null;
+                                          const pt = payload[0]?.payload as TrendWindowChartPoint | undefined;
+                                          if (!pt) return null;
+                                          return (
+                                            <div className="rounded-lg border border-rose-500/40 bg-slate-950 px-2.5 py-1.5 text-[11px] font-mono shadow-lg">
+                                              <div className="text-slate-400">
+                                                {label} · {pt.event}
+                                              </div>
+                                              <div
+                                                className={
+                                                  pt.alertTriggered
+                                                    ? 'text-rose-300 font-bold'
+                                                    : 'text-rose-200 font-semibold'
+                                                }
+                                              >
+                                                Consecutive Streak: {pt.streak}/{trendConsecutiveThreshold}x{' '}
+                                                {pt.alertTriggered ? '(HIGH USAGE TREND)' : ''}
+                                              </div>
+                                              <div className="text-sky-300 text-[10px]">
+                                                Energy Score: {pt.score} ({pt.deltaFromPrev >= 0 ? '+' : ''}
+                                                {pt.deltaFromPrev.toFixed(2)} pts)
+                                              </div>
+                                            </div>
+                                          );
+                                        }}
+                                      />
+                                      <ReferenceLine
+                                        yAxisId="streak"
+                                        y={trendConsecutiveThreshold}
+                                        stroke="#fb7185"
+                                        strokeDasharray="4 4"
+                                        label={{
+                                          value: `Alert >= ${trendConsecutiveThreshold}x`,
+                                          position: 'insideTopRight',
+                                          fill: '#fda4af',
+                                          fontSize: 10,
+                                        }}
+                                      />
+                                      <Line
+                                        yAxisId="score"
+                                        type="monotone"
+                                        dataKey="score"
+                                        name={isZh ? '能耗评分' : 'Energy Score'}
+                                        stroke="#38bdf8"
+                                        strokeWidth={1.5}
+                                        strokeDasharray="3 3"
+                                        dot={false}
+                                        isAnimationActive={false}
+                                      />
+                                      <Line
+                                        yAxisId="streak"
+                                        type="linear"
+                                        dataKey="streak"
+                                        name={isZh ? '连续上升次数' : 'Increase Streak'}
+                                        stroke="#fb7185"
+                                        strokeWidth={2.4}
+                                        isAnimationActive={false}
+                                        dot={(dotProps) => {
+                                          const { cx, cy, index, payload } = dotProps;
+                                          if (typeof cx !== 'number' || typeof cy !== 'number') {
+                                            return <g key={`trend-empty-${index ?? 0}`} />;
+                                          }
+                                          const pt = payload as TrendWindowChartPoint | undefined;
+                                          const isAlert = Boolean(pt?.alertTriggered);
+                                          return (
+                                            <circle
+                                              key={`trend-dot-${index ?? cx}`}
+                                              cx={cx}
+                                              cy={cy}
+                                              r={isAlert ? 4.5 : 3}
+                                              fill={isAlert ? '#f43f5e' : '#fb7185'}
+                                              stroke="#0f172a"
+                                              strokeWidth={1.5}
+                                            />
+                                          );
+                                        }}
+                                        activeDot={{ r: 5.5, fill: '#f43f5e', stroke: '#0f172a', strokeWidth: 1.5 }}
+                                      />
+                                    </LineChart>
+                                  </ResponsiveContainer>
+                                </div>
+                              </div>
+                            );
+                          })()}
                         </div>
                       </div>
                     )}
@@ -3392,7 +4549,7 @@ export default function App() {
                           <span className="text-[11px] font-mono font-semibold text-teal-300">
                             {isZh ? '能耗统计纯文本报告 (Battery Impact Report)' : 'Energy Usage Statistics Report (.txt)'}
                           </span>
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <button
                               type="button"
                               onClick={handleCopyBatteryReport}
@@ -3412,6 +4569,14 @@ export default function App() {
                             >
                               <Download className="w-3 h-3" />
                               <span>.txt</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleDownloadHistoricalImpactCsv}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold rounded bg-emerald-900/70 hover:bg-emerald-800/80 text-emerald-200 border border-emerald-600/60 transition-colors cursor-pointer"
+                            >
+                              <Download className="w-3 h-3" />
+                              <span>Historical Impact CSV ({energyTimelineCount})</span>
                             </button>
                             <button
                               type="button"

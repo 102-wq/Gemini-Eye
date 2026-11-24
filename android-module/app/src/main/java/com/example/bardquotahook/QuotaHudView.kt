@@ -20,6 +20,8 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -157,6 +159,8 @@ class QuotaHudView(
         private set
     var currentOpacityPct: Int = QuotaSyncProvider.DEFAULT_HUD_OPACITY
         private set
+    var currentHighEnergyThreshold: Double = HIGH_BATTERY_IMPACT_THRESHOLD
+        private set
     private var currentEnergyScore: Double = 0.0
 
     private var miuixBlurAnimator: ValueAnimator? = null
@@ -203,6 +207,7 @@ class QuotaHudView(
     private var startTopMargin = 0
     private var lastParentWidth = 0
     private var lastParentHeight = 0
+    private var dockAnimator: ValueAnimator? = null
     private var isDraggingCapsule = false
     var currentDockedEdge: DockEdge = DockEdge.NONE
         private set
@@ -390,10 +395,16 @@ class QuotaHudView(
         renderAll()
     }
 
-    fun applyPreferences(lang: Lang, themeMode: ThemeMode, opacityPct: Int = currentOpacityPct) {
+    fun applyPreferences(
+        lang: Lang,
+        themeMode: ThemeMode,
+        opacityPct: Int = currentOpacityPct,
+        highEnergyThreshold: Double = currentHighEnergyThreshold
+    ) {
         currentLang = lang
         currentTheme = themeMode
         currentOpacityPct = opacityPct.coerceIn(20, 100)
+        currentHighEnergyThreshold = highEnergyThreshold.coerceIn(5.0, 60.0)
         renderAll()
     }
 
@@ -406,15 +417,24 @@ class QuotaHudView(
         }
     }
 
+    fun setHighBatteryThreshold(threshold: Double) {
+        val clamped = threshold.coerceIn(5.0, 60.0)
+        if (abs(currentHighEnergyThreshold - clamped) >= 0.01) {
+            currentHighEnergyThreshold = clamped
+            renderAll()
+            invalidate()
+        }
+    }
+
     fun updateEnergyScore(score: Double) {
         val clamped = score.coerceIn(0.0, 100.0)
-        if (abs(clamped - currentEnergyScore) >= 0.05 || (clamped >= HIGH_BATTERY_IMPACT_THRESHOLD) != isHighBatteryImpact()) {
+        if (abs(clamped - currentEnergyScore) >= 0.05 || (clamped >= currentHighEnergyThreshold) != isHighBatteryImpact()) {
             currentEnergyScore = clamped
             renderAll()
         }
     }
 
-    fun isHighBatteryImpact(): Boolean = currentEnergyScore >= HIGH_BATTERY_IMPACT_THRESHOLD
+    fun isHighBatteryImpact(): Boolean = currentEnergyScore >= currentHighEnergyThreshold
 
     fun triggerRefreshSpin() {
         refreshIconBtn.spinOnce()
@@ -428,6 +448,11 @@ class QuotaHudView(
     override fun onDetachedFromWindow() {
         stopMiuixBlurAnimation()
         stopTapRipple()
+        try {
+            dockAnimator?.cancel()
+        } catch (_: Throwable) {
+        }
+        dockAnimator = null
         super.onDetachedFromWindow()
     }
 
@@ -705,27 +730,64 @@ class QuotaHudView(
     // =========================================================================
 
     fun setDockedEdge(edge: DockEdge, animateMargin: Boolean = true) {
-        if (currentDockedEdge == edge) return
+        val edgeChanged = currentDockedEdge != edge
         currentDockedEdge = edge
-        renderAll()
-        if (animateMargin && draggableInFrame) {
-            post {
-                val parentView = parent as? View ?: return@post
-                val pw = parentView.width
-                val lp = layoutParams as? FrameLayout.LayoutParams ?: return@post
-                normalizeLayoutParamsToStart(lp, pw)
-                val edgePad = dp(context, 4f)
-                val viewW = if (width > 0) width else measuredWidth
-                when (edge) {
-                    DockEdge.LEFT -> lp.leftMargin = edgePad
-                    DockEdge.RIGHT -> lp.leftMargin = maxOf(edgePad, pw - viewW - edgePad)
-                    DockEdge.NONE -> {
-                        val safePad = dp(context, 10f)
-                        lp.leftMargin = lp.leftMargin.coerceIn(safePad, maxOf(safePad, pw - viewW - safePad))
+        if (edgeChanged) {
+            renderAll()
+        }
+        if (draggableInFrame && onWindowDrag == null) {
+            val applyPosition = {
+                val parentView = parent as? View
+                if (parentView != null && parentView.width > 0) {
+                    val pw = parentView.width
+                    val ph = parentView.height.takeIf { it > 0 } ?: 1080
+                    val lp = layoutParams as? ViewGroup.MarginLayoutParams
+                    if (lp != null) {
+                        if (lp is FrameLayout.LayoutParams) {
+                            normalizeLayoutParamsToStart(lp, pw)
+                        }
+                        measure(
+                            MeasureSpec.makeMeasureSpec(pw, MeasureSpec.AT_MOST),
+                            MeasureSpec.makeMeasureSpec(ph, MeasureSpec.AT_MOST)
+                        )
+                        val orbFallbackW = dp(context, 44f)
+                        val targetW = if (edge != DockEdge.NONE) {
+                            measuredWidth.coerceIn(orbFallbackW, dp(context, 52f))
+                        } else {
+                            maxOf(measuredWidth, width)
+                        }
+                        val curLeft = lp.leftMargin
+                        val targetLeft = when (edge) {
+                            DockEdge.LEFT -> 0
+                            DockEdge.RIGHT -> maxOf(0, pw - targetW)
+                            DockEdge.NONE -> {
+                                val safePad = dp(context, 10f)
+                                curLeft.coerceIn(safePad, maxOf(safePad, pw - targetW - safePad))
+                            }
+                        }
+                        try {
+                            dockAnimator?.cancel()
+                        } catch (_: Throwable) {
+                        }
+                        if (animateMargin && abs(targetLeft - curLeft) > 2) {
+                            dockAnimator = ValueAnimator.ofInt(curLeft, targetLeft).apply {
+                                duration = 180L
+                                interpolator = DecelerateInterpolator()
+                                addUpdateListener { anim ->
+                                    val mLp = layoutParams as? ViewGroup.MarginLayoutParams ?: return@addUpdateListener
+                                    mLp.leftMargin = anim.animatedValue as Int
+                                    layoutParams = mLp
+                                }
+                                start()
+                            }
+                        } else {
+                            lp.leftMargin = targetLeft
+                            layoutParams = lp
+                        }
                     }
                 }
-                layoutParams = lp
             }
+            post { applyPosition() }
         }
     }
 
@@ -757,9 +819,11 @@ class QuotaHudView(
                 val parentView = parent as? View
                 lastParentWidth = parentView?.width ?: 0
                 lastParentHeight = parentView?.height ?: 0
-                val lp = layoutParams as? FrameLayout.LayoutParams
+                val lp = layoutParams as? ViewGroup.MarginLayoutParams
                 if (lp != null && lastParentWidth > 0) {
-                    normalizeLayoutParamsToStart(lp, lastParentWidth)
+                    if (lp is FrameLayout.LayoutParams) {
+                        normalizeLayoutParamsToStart(lp, lastParentWidth)
+                    }
                     startLeftMargin = lp.leftMargin
                     startTopMargin = lp.topMargin
                 }
@@ -790,6 +854,10 @@ class QuotaHudView(
         }
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                try {
+                    dockAnimator?.cancel()
+                } catch (_: Throwable) {
+                }
                 downRawX = ev.rawX
                 downRawY = ev.rawY
                 lastRawX = ev.rawX
@@ -798,9 +866,11 @@ class QuotaHudView(
                 val parentView = parent as? View
                 lastParentWidth = parentView?.width ?: 0
                 lastParentHeight = parentView?.height ?: 0
-                val lp = layoutParams as? FrameLayout.LayoutParams
+                val lp = layoutParams as? ViewGroup.MarginLayoutParams
                 if (lp != null && lastParentWidth > 0) {
-                    normalizeLayoutParamsToStart(lp, lastParentWidth)
+                    if (lp is FrameLayout.LayoutParams) {
+                        normalizeLayoutParamsToStart(lp, lastParentWidth)
+                    }
                     startLeftMargin = lp.leftMargin
                     startTopMargin = lp.topMargin
                 }
@@ -822,7 +892,7 @@ class QuotaHudView(
                         lastRawY = ev.rawY
                         winDrag(stepDx, stepDy)
                     } else if (draggableInFrame) {
-                        val lp = layoutParams as? FrameLayout.LayoutParams
+                        val lp = layoutParams as? ViewGroup.MarginLayoutParams
                         if (lp != null) {
                             val pw = lastParentWidth.takeIf { it > 0 } ?: (parent as? View)?.width ?: 0
                             val ph = lastParentHeight.takeIf { it > 0 } ?: (parent as? View)?.height ?: 0
@@ -852,15 +922,26 @@ class QuotaHudView(
                     return true
                 }
                 if (draggableInFrame && onWindowDrag == null) {
-                    val lp = layoutParams as? FrameLayout.LayoutParams
+                    val lp = layoutParams as? ViewGroup.MarginLayoutParams
                     val pw = lastParentWidth.takeIf { it > 0 } ?: (parent as? View)?.width ?: 0
                     if (lp != null && pw > 0) {
+                        val curW = if (width > 0) width else measuredWidth
+                        val totalDx = ev.rawX - downRawX
+                        val rawLeft = startLeftMargin + totalDx.toInt()
                         val distLeft = lp.leftMargin
-                        val distRight = maxOf(0, pw - width - lp.leftMargin)
-                        val dockThreshold = dp(context, 26f)
+                        val distRight = maxOf(0, pw - curW - lp.leftMargin)
+                        val dockThreshold = if (currentDockedEdge != DockEdge.NONE) dp(context, 64f) else dp(context, 44f)
+                        val bezelZone = dp(context, 56f)
+                        val wantLeft = distLeft <= dockThreshold ||
+                            rawLeft <= -dp(context, 10f) ||
+                            (ev.rawX <= bezelZone && totalDx < -dp(context, 14f))
+                        val wantRight = distRight <= dockThreshold ||
+                            (rawLeft + curW >= pw + dp(context, 10f)) ||
+                            (ev.rawX >= pw - bezelZone && totalDx > dp(context, 14f))
                         when {
-                            distLeft <= dockThreshold && distLeft <= distRight -> setDockedEdge(DockEdge.LEFT, animateMargin = true)
-                            distRight <= dockThreshold -> setDockedEdge(DockEdge.RIGHT, animateMargin = true)
+                            wantLeft && distLeft <= distRight -> setDockedEdge(DockEdge.LEFT, animateMargin = true)
+                            wantRight -> setDockedEdge(DockEdge.RIGHT, animateMargin = true)
+                            wantLeft -> setDockedEdge(DockEdge.LEFT, animateMargin = true)
                             else -> setDockedEdge(DockEdge.NONE, animateMargin = true)
                         }
                     }

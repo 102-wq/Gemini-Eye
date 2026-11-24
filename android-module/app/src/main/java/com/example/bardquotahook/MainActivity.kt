@@ -14,7 +14,9 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.LocaleList
+import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -24,9 +26,11 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import org.json.JSONObject
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 class MainActivity : Activity() {
 
@@ -54,12 +58,25 @@ class MainActivity : Activity() {
     private var energyCardTitleView: TextView? = null
     private var energyToggleBtn: Button? = null
     private var energyExportBtn: Button? = null
+    private var energyCsvExportBtn: Button? = null
+    private var energyThresholdLabelView: TextView? = null
+    private var energyThresholdSeekBar: SeekBar? = null
+    private var isUpdatingThresholdSeekBar = false
+    private var energyTrendThresholdLabelView: TextView? = null
+    private var energyTrendThresholdSeekBar: SeekBar? = null
+    private var isUpdatingTrendThresholdSeekBar = false
+    private var energyTrendAutoDismissLabelView: TextView? = null
+    private var energyTrendAutoDismissToggleBtn: Button? = null
+    private var energyTrendAutoDismissSeekBar: SeekBar? = null
+    private var isUpdatingTrendAutoDismissSeekBar = false
     private var energyStatsView: TextView? = null
     private var energyExportReportView: TextView? = null
     private var forceScanBtn: Button? = null
     private var launchGeminiBtn: Button? = null
 
     private var stateObserver: ContentObserver? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val trendAutoDismissRefreshRunnable = Runnable { refreshAllUi() }
     private var bardInstalled = false
     private var gsaInstalled = false
     private var showEnergyImpactStats = true
@@ -172,7 +189,12 @@ class MainActivity : Activity() {
         }
         val eScore = energyObj.optDouble("energyScore", 0.0)
 
-        liveCapsulePreview?.applyPreferences(state.lang, state.theme, state.hudOpacity)
+        liveCapsulePreview?.applyPreferences(
+            state.lang,
+            state.theme,
+            state.hudOpacity,
+            state.highBatteryThreshold.toDouble()
+        )
         liveCapsulePreview?.updateSnapshot(snap)
         liveCapsulePreview?.updateEnergyScore(eScore)
 
@@ -243,7 +265,21 @@ class MainActivity : Activity() {
         val zeroCount = maxOf(state.zeroGuardCount, entries.count { it.eventType == "ZERO_GUARD" })
         val anomalyCount = maxOf(state.linkAnomalyCount, entries.count { it.eventType == "LINK_ANOMALY" })
         val batteryCount = entries.count { it.eventType == "BATTERY_IMPACT" }
-        val hasHighUsageTrend = energyObj.optBoolean("highUsageTrendActive", false)
+        val hasHighUsageTrendRaw = energyObj.optBoolean("highUsageTrendActive", false)
+        val lastTrendAlertAtMs = energyObj.optLong("lastTrendAlertAtMs", 0L)
+        val autoDismissEnabled = state.trendAutoDismissEnabled
+        val autoDismissSec = state.trendAutoDismissSec.coerceIn(5, 60)
+        val remainingAutoDismissSec: Int? = if (hasHighUsageTrendRaw && autoDismissEnabled && lastTrendAlertAtMs > 0L) {
+            val remainingMs = (lastTrendAlertAtMs + autoDismissSec * 1000L) - System.currentTimeMillis()
+            if (remainingMs <= 0L) 0 else ((remainingMs + 999L) / 1000L).toInt()
+        } else {
+            null
+        }
+        val hasHighUsageTrend = hasHighUsageTrendRaw && (remainingAutoDismissSec == null || remainingAutoDismissSec > 0)
+        mainHandler.removeCallbacks(trendAutoDismissRefreshRunnable)
+        if (hasHighUsageTrend && remainingAutoDismissSec != null && remainingAutoDismissSec > 0) {
+            mainHandler.postDelayed(trendAutoDismissRefreshRunnable, 1000L)
+        }
         val trendStreak = energyObj.optInt("trendConsecutiveIncreases", 0)
         val trendStart = energyObj.optDouble("trendStartScore", 0.0)
         val trendCur = energyObj.optDouble("trendCurrentScore", 0.0)
@@ -258,10 +294,15 @@ class MainActivity : Activity() {
         devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
         devConsoleLogsView?.text = buildString {
             if (hasHighUsageTrend) {
-                if (zh) {
-                    append("⚠ High Usage Trend · 5分钟滑动窗口连续上升 $trendStreak 次 ($trendStart -> $trendCur, +$trendDelta 分)\n\n")
+                val countdownHint = if (remainingAutoDismissSec != null) {
+                    if (zh) " · ${remainingAutoDismissSec}s 后自动消失" else " · Auto-dismiss in ${remainingAutoDismissSec}s"
                 } else {
-                    append("⚠ High Usage Trend · $trendStreak consecutive increases in 5m window ($trendStart -> $trendCur, +$trendDelta pts)\n\n")
+                    ""
+                }
+                if (zh) {
+                    append("⚠ High Usage Trend · 5分钟滑动窗口连续上升 $trendStreak 次 ($trendStart -> $trendCur, +$trendDelta 分)$countdownHint\n\n")
+                } else {
+                    append("⚠ High Usage Trend · $trendStreak consecutive increases in 5m window ($trendStart -> $trendCur, +$trendDelta pts)$countdownHint\n\n")
                 }
             }
             if (entries.isEmpty()) {
@@ -308,6 +349,8 @@ class MainActivity : Activity() {
         }
 
         val eRating = energyObj.optString("rating", "Minimal")
+        val eMaScore = energyObj.optDouble("smoothedEnergyScore", eScore)
+        val eMaWindow = energyObj.optInt("maWindowSize", 4)
         val eFg = energyObj.optLong("fgDispatches", 0L)
         val eBgSkip = energyObj.optLong("bgSuppressed", 0L)
         val eHooks = energyObj.optLong("hookEvents", 0L)
@@ -351,15 +394,63 @@ class MainActivity : Activity() {
             setTextColor(if (showEnergyImpactStats) Color.WHITE else Color.parseColor("#94A3B8"))
         }
         energyExportBtn?.text = if (zh) "Export Report (导出报告)" else "Export Report"
+        val timelineCount = energyObj.optInt("timelineCount", 0)
+        energyCsvExportBtn?.text = if (zh) {
+            "Historical Impact CSV (导出 CSV${if (timelineCount > 0) " · $timelineCount" else ""})"
+        } else {
+            "Historical Impact CSV${if (timelineCount > 0) " ($timelineCount)" else ""}"
+        }
+        val activeThreshold = state.highBatteryThreshold.coerceIn(5, 60)
+        val isAboveThreshold = eScore >= activeThreshold.toDouble()
+        energyThresholdLabelView?.text = if (zh) {
+            "高能耗告警阈值 (High Battery Impact): >= $activeThreshold 分 (${if (isAboveThreshold) "已触发告警" else "监控中"})"
+        } else {
+            "High Battery Impact Threshold: >= $activeThreshold pts (${if (isAboveThreshold) "ALERT ACTIVE" else "Monitoring"})"
+        }
+        if (energyThresholdSeekBar != null && energyThresholdSeekBar?.progress != (activeThreshold - 5)) {
+            isUpdatingThresholdSeekBar = true
+            energyThresholdSeekBar?.progress = activeThreshold - 5
+            isUpdatingThresholdSeekBar = false
+        }
+        val activeTrendThreshold = state.trendConsecutiveThreshold.coerceIn(2, 10)
+        energyTrendThresholdLabelView?.text = if (zh) {
+            "High Usage Trend 灵敏度 (连续上升次数): >= ${activeTrendThreshold}x / 5m (${if (trendActive) "已触发 $trendStreak/$activeTrendThreshold" else "监控中"})"
+        } else {
+            "High Usage Trend Sensitivity: >= ${activeTrendThreshold}x / 5m (${if (trendActive) "ALERT $trendStreak/$activeTrendThreshold" else "Monitoring"})"
+        }
+        if (energyTrendThresholdSeekBar != null && energyTrendThresholdSeekBar?.progress != (activeTrendThreshold - 2)) {
+            isUpdatingTrendThresholdSeekBar = true
+            energyTrendThresholdSeekBar?.progress = activeTrendThreshold - 2
+            isUpdatingTrendThresholdSeekBar = false
+        }
+        energyTrendAutoDismissLabelView?.text = if (zh) {
+            if (autoDismissEnabled) "Trend 通知自动消失计时: ${autoDismissSec}s (5-60s)" else "Trend 通知自动消失计时: 已关闭"
+        } else {
+            if (autoDismissEnabled) "Trend Alert Auto-Dismiss Timer: ${autoDismissSec}s (5-60s)" else "Trend Alert Auto-Dismiss Timer: OFF"
+        }
+        energyTrendAutoDismissToggleBtn?.apply {
+            text = if (autoDismissEnabled) "AUTO" else "OFF"
+            background = if (autoDismissEnabled) makeBtnDrawable("#B45309") else makeBtnDrawable("#1E293B", "#475569")
+            setTextColor(if (autoDismissEnabled) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+        energyTrendAutoDismissSeekBar?.apply {
+            isEnabled = autoDismissEnabled
+            alpha = if (autoDismissEnabled) 1.0f else 0.45f
+            if (progress != (autoDismissSec - 5)) {
+                isUpdatingTrendAutoDismissSeekBar = true
+                progress = autoDismissSec - 5
+                isUpdatingTrendAutoDismissSeekBar = false
+            }
+        }
         energyStatsView?.apply {
             visibility = if (showEnergyImpactStats) View.VISIBLE else View.GONE
             text = if (zh) {
-                "能耗评级: $eRating (Score=$eScore) | 估算耗电: ~${eMah} mAh (电量 $eBatStr)\n" +
+                "能耗评级: $eRating (MA($eMaWindow)=$eMaScore | Raw=$eScore) | 估算耗电: ~${eMah} mAh (电量 $eBatStr)\n" +
                     "后台唤醒: 0 次 (1ns 门控拦截: $eBgSkip 次) | 线程池: ${ePoolAct}/${ePoolSize} 线程\n" +
                     "前台按需派发: $eFg 次 | Hook 事件: $eHooks | CPU/墙钟: ${eCpuMs}ms / ${eWallMs}ms\n" +
                     "网络重放与拦截传输: $eNetReq 次 / $eNetBytes Bytes | 日志条目: $batteryCount$surgeLine$trendLine"
             } else {
-                "Energy Rating: $eRating (Score=$eScore) | Est. Draw: ~${eMah} mAh (Bat $eBatStr)\n" +
+                "Energy Rating: $eRating (MA($eMaWindow)=$eMaScore | Raw=$eScore) | Est. Draw: ~${eMah} mAh (Bat $eBatStr)\n" +
                     "BG Wakeups: 0 (1ns Gated: $eBgSkip) | Thread Pool: ${ePoolAct}/${ePoolSize} threads\n" +
                     "FG Dispatches: $eFg | Hook Events: $eHooks | CPU/Wall: ${eCpuMs}ms / ${eWallMs}ms\n" +
                     "Network Replays/Bytes: $eNetReq reqs / $eNetBytes B | Log Entries: $batteryCount$surgeLine$trendLine"
@@ -425,6 +516,90 @@ class MainActivity : Activity() {
             }
         }
         return sb.toString().trim()
+    }
+
+    private fun csvEscape(value: Any): String {
+        val s = value.toString()
+        return if (s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r')) {
+            "\"" + s.replace("\"", "\"\"") + "\""
+        } else {
+            s
+        }
+    }
+
+    private fun formatIsoUtc(ms: Long): String {
+        return try {
+            val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+            sdf.timeZone = TimeZone.getTimeZone("UTC")
+            sdf.format(Date(ms))
+        } catch (_: Throwable) {
+            ms.toString()
+        }
+    }
+
+    private fun formatHms(ms: Long): String {
+        return try {
+            SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(ms))
+        } catch (_: Throwable) {
+            ms.toString()
+        }
+    }
+
+    private fun buildHistoricalImpactCsv(state: QuotaSyncProvider.UnifiedState): String {
+        val energyObj = try {
+            JSONObject(state.energyStatsJson.ifBlank { "{}" })
+        } catch (_: Throwable) {
+            JSONObject()
+        }
+        val maWindowSize = energyObj.optInt("maWindowSize", 4)
+        val timelineArr = energyObj.optJSONArray("timelineSamples")
+        val sb = StringBuilder(512)
+        sb.append("index,timestamp_iso,time_hms,session_id,event,ma_window_size,filtered_ma_score,raw_score,score_delta,spike_bypass,above_high_threshold,cpu_ms,wall_ms,fg_dispatches,net_reqs,estimated_mah\n")
+        if (timelineArr != null && timelineArr.length() > 0) {
+            for (i in 0 until timelineArr.length()) {
+                val item = timelineArr.optJSONObject(i) ?: continue
+                val ts = item.optLong("ts", System.currentTimeMillis())
+                sb.append(item.optInt("i", i + 1)).append(',')
+                    .append(csvEscape(formatIsoUtc(ts))).append(',')
+                    .append(csvEscape(formatHms(ts))).append(',')
+                    .append(csvEscape(item.optString("sess", state.sessionId.ifBlank { "sess_default" }))).append(',')
+                    .append(csvEscape(item.optString("evt", "SAMPLE"))).append(',')
+                    .append(maWindowSize).append(',')
+                    .append(item.optDouble("ma", 0.0)).append(',')
+                    .append(item.optDouble("raw", 0.0)).append(',')
+                    .append(item.optDouble("d", 0.0)).append(',')
+                    .append(item.optBoolean("sb", false)).append(',')
+                    .append(item.optBoolean("ht", false)).append(',')
+                    .append(item.optDouble("cpu", 0.0)).append(',')
+                    .append(item.optDouble("wall", 0.0)).append(',')
+                    .append(item.optLong("fg", 0L)).append(',')
+                    .append(item.optLong("net", 0L)).append(',')
+                    .append(item.optDouble("mah", 0.0)).append('\n')
+            }
+        } else {
+            val nowMs = energyObj.optLong("updatedAtMs", System.currentTimeMillis()).let {
+                if (it > 0L) it else System.currentTimeMillis()
+            }
+            val rawScore = energyObj.optDouble("energyScore", 0.0)
+            val maScore = energyObj.optDouble("smoothedEnergyScore", rawScore)
+            sb.append(1).append(',')
+                .append(csvEscape(formatIsoUtc(nowMs))).append(',')
+                .append(csvEscape(formatHms(nowMs))).append(',')
+                .append(csvEscape(state.sessionId.ifBlank { "sess_default" })).append(',')
+                .append("SNAPSHOT_BASELINE").append(',')
+                .append(maWindowSize).append(',')
+                .append(maScore).append(',')
+                .append(rawScore).append(',')
+                .append(0.0).append(',')
+                .append(energyObj.optBoolean("spikeBypassActive", false)).append(',')
+                .append(rawScore >= energyObj.optInt("highBatteryThreshold", state.highBatteryThreshold).toDouble()).append(',')
+                .append(energyObj.optDouble("cpuMs", 0.0)).append(',')
+                .append(energyObj.optDouble("wallMs", 0.0)).append(',')
+                .append(energyObj.optLong("fgDispatches", 0L)).append(',')
+                .append(energyObj.optLong("networkReplays", 0L)).append(',')
+                .append(energyObj.optDouble("estimatedMah", 0.0)).append('\n')
+        }
+        return sb.toString().trimEnd('\n')
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -801,6 +976,50 @@ class MainActivity : Activity() {
         }
         energyExportBtn = energyExport
 
+        val energyCsvExport = Button(this).apply {
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            background = makeBtnDrawable("#047857")
+            setPadding(dp(10f), dp(5f), dp(10f), dp(5f))
+            minimumHeight = 0
+            minHeight = dp(28f)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8f)
+            }
+            setOnClickListener {
+                val st = QuotaSyncProvider.ensureLoaded(this@MainActivity)
+                val csv = buildHistoricalImpactCsv(st)
+                val sess = st.sessionId.ifBlank { "sess_default" }
+                var savedPath = ""
+                try {
+                    val dir = getExternalFilesDir(null) ?: filesDir
+                    val outFile = File(dir, "gemini-eye-historical-impact-$sess.csv")
+                    outFile.writeText("\uFEFF$csv", Charsets.UTF_8)
+                    savedPath = outFile.absolutePath
+                } catch (_: Throwable) {
+                }
+                val displayReport = if (savedPath.isNotEmpty()) {
+                    "[Historical Impact CSV Saved: $savedPath]\n\n$csv"
+                } else {
+                    csv
+                }
+                lastExportedBatteryReport = displayReport
+                energyExportReportView?.text = displayReport
+                energyExportReportView?.visibility = View.VISIBLE
+                try {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    cm?.setPrimaryClip(ClipData.newPlainText("GeminiEyeHistoricalImpactCsv", csv))
+                } catch (_: Throwable) {
+                }
+                refreshAllUi()
+            }
+        }
+        energyCsvExportBtn = energyCsvExport
+
         energyHeaderRow.addView(energyTitle)
         energyHeaderRow.addView(energyToggle)
         energyHeaderRow.addView(energyExport)
@@ -832,7 +1051,115 @@ class MainActivity : Activity() {
         }
         energyExportReportView = energyReportTv
 
+        val energyThresholdLabel = TextView(this).apply {
+            setTextColor(Color.parseColor("#FCD34D"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(10f), 0, dp(4f))
+        }
+        energyThresholdLabelView = energyThresholdLabel
+
+        val energyThresholdSlider = SeekBar(this).apply {
+            max = 55
+            progress = QuotaSyncProvider.DEFAULT_HIGH_ENERGY_THRESHOLD - 5
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (isUpdatingThresholdSeekBar || !fromUser) return
+                    val th = (progress + 5).coerceIn(5, 60)
+                    liveCapsulePreview?.setHighBatteryThreshold(th.toDouble())
+                    QuotaSyncProvider.updatePreferences(this@MainActivity, highBatteryThreshold = th)
+                    refreshAllUi()
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+        energyThresholdSeekBar = energyThresholdSlider
+
+        val energyTrendThresholdLabel = TextView(this).apply {
+            setTextColor(Color.parseColor("#FDA4AF"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(8f), 0, dp(4f))
+        }
+        energyTrendThresholdLabelView = energyTrendThresholdLabel
+
+        val energyTrendThresholdSlider = SeekBar(this).apply {
+            max = 8
+            progress = QuotaSyncProvider.DEFAULT_TREND_CONSECUTIVE_THRESHOLD - 2
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (isUpdatingTrendThresholdSeekBar || !fromUser) return
+                    val t = (progress + 2).coerceIn(2, 10)
+                    QuotaSyncProvider.updatePreferences(this@MainActivity, trendConsecutiveThreshold = t)
+                    refreshAllUi()
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+        energyTrendThresholdSeekBar = energyTrendThresholdSlider
+
+        val energyTrendAutoDismissHeaderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8f), 0, dp(4f))
+        }
+        val energyTrendAutoDismissLabel = TextView(this).apply {
+            setTextColor(Color.parseColor("#FBBF24"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        energyTrendAutoDismissLabelView = energyTrendAutoDismissLabel
+
+        val energyTrendAutoDismissToggle = Button(this).apply {
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setPadding(dp(10f), dp(4f), dp(10f), dp(4f))
+            setOnClickListener {
+                val cur = QuotaSyncProvider.ensureLoaded(this@MainActivity)
+                QuotaSyncProvider.updatePreferences(
+                    this@MainActivity,
+                    trendAutoDismissEnabled = !cur.trendAutoDismissEnabled
+                )
+                refreshAllUi()
+            }
+        }
+        energyTrendAutoDismissToggleBtn = energyTrendAutoDismissToggle
+        energyTrendAutoDismissHeaderRow.addView(energyTrendAutoDismissLabel)
+        energyTrendAutoDismissHeaderRow.addView(energyTrendAutoDismissToggle)
+
+        val energyTrendAutoDismissSlider = SeekBar(this).apply {
+            max = 55
+            progress = QuotaSyncProvider.DEFAULT_TREND_AUTO_DISMISS_SEC - 5
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (isUpdatingTrendAutoDismissSeekBar || !fromUser) return
+                    val sec = (progress + 5).coerceIn(5, 60)
+                    QuotaSyncProvider.updatePreferences(this@MainActivity, trendAutoDismissSec = sec)
+                    refreshAllUi()
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+        energyTrendAutoDismissSeekBar = energyTrendAutoDismissSlider
+
         energyCard.addView(energyHeaderRow)
+        energyCard.addView(energyCsvExport)
+        energyCard.addView(energyThresholdLabel)
+        energyCard.addView(energyThresholdSlider)
+        energyCard.addView(energyTrendThresholdLabel)
+        energyCard.addView(energyTrendThresholdSlider)
+        energyCard.addView(energyTrendAutoDismissHeaderRow)
+        energyCard.addView(energyTrendAutoDismissSlider)
         energyCard.addView(energyStatsTv)
         energyCard.addView(energyReportTv)
 
@@ -911,6 +1238,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(trendAutoDismissRefreshRunnable)
         HookTelemetryReceiver.setUiListener(null)
         QuotaSyncProvider.unregisterStateObserver(this, stateObserver)
         stateObserver = null

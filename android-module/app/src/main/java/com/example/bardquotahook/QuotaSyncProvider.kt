@@ -45,6 +45,10 @@ class QuotaSyncProvider : ContentProvider() {
         val lang: QuotaHudView.Lang = defaultLangForDevice(),
         val theme: QuotaHudView.ThemeMode = QuotaHudView.ThemeMode.MIUIX,
         val hudOpacity: Int = DEFAULT_HUD_OPACITY,
+        val highBatteryThreshold: Int = DEFAULT_HIGH_ENERGY_THRESHOLD,
+        val trendConsecutiveThreshold: Int = DEFAULT_TREND_CONSECUTIVE_THRESHOLD,
+        val trendAutoDismissEnabled: Boolean = DEFAULT_TREND_AUTO_DISMISS_ENABLED,
+        val trendAutoDismissSec: Int = DEFAULT_TREND_AUTO_DISMISS_SEC,
         val xposedBound: Boolean = false,
         val isApi102: Boolean = false,
         val lastHeartbeatMs: Long = 0L,
@@ -77,6 +81,10 @@ class QuotaSyncProvider : ContentProvider() {
                 putString(KEY_LANG, lang.code)
                 putString(KEY_THEME, theme.code)
                 putInt(KEY_HUD_OPACITY, hudOpacity.coerceIn(20, 100))
+                putInt(KEY_HIGH_ENERGY_THRESHOLD, highBatteryThreshold.coerceIn(5, 60))
+                putInt(KEY_TREND_CONSECUTIVE_THRESHOLD, trendConsecutiveThreshold.coerceIn(2, 10))
+                putBoolean(KEY_TREND_AUTO_DISMISS_ENABLED, trendAutoDismissEnabled)
+                putInt(KEY_TREND_AUTO_DISMISS_SEC, trendAutoDismissSec.coerceIn(5, 60))
                 putBoolean(KEY_XPOSED_BOUND, isActivelyBound)
                 putBoolean(KEY_API_102, isApi102)
                 putLong(KEY_LAST_HB_MS, lastHeartbeatMs)
@@ -110,6 +118,10 @@ class QuotaSyncProvider : ContentProvider() {
                     lang = bundle.getString(KEY_LANG, null)?.let { QuotaHudView.Lang.fromCode(it) } ?: defaultLangForDevice(),
                     theme = QuotaHudView.ThemeMode.fromCode(bundle.getString(KEY_THEME, "MIUIX")),
                     hudOpacity = bundle.getInt(KEY_HUD_OPACITY, DEFAULT_HUD_OPACITY).coerceIn(20, 100),
+                    highBatteryThreshold = bundle.getInt(KEY_HIGH_ENERGY_THRESHOLD, DEFAULT_HIGH_ENERGY_THRESHOLD).coerceIn(5, 60),
+                    trendConsecutiveThreshold = bundle.getInt(KEY_TREND_CONSECUTIVE_THRESHOLD, DEFAULT_TREND_CONSECUTIVE_THRESHOLD).coerceIn(2, 10),
+                    trendAutoDismissEnabled = bundle.getBoolean(KEY_TREND_AUTO_DISMISS_ENABLED, DEFAULT_TREND_AUTO_DISMISS_ENABLED),
+                    trendAutoDismissSec = bundle.getInt(KEY_TREND_AUTO_DISMISS_SEC, DEFAULT_TREND_AUTO_DISMISS_SEC).coerceIn(5, 60),
                     xposedBound = bundle.getBoolean(KEY_XPOSED_BOUND, false),
                     isApi102 = bundle.getBoolean(KEY_API_102, false),
                     lastHeartbeatMs = bundle.getLong(KEY_LAST_HB_MS, 0L),
@@ -170,11 +182,35 @@ class QuotaSyncProvider : ContentProvider() {
                     } else {
                         null
                     }
+                    val highThreshold = if (extras?.containsKey(KEY_HIGH_ENERGY_THRESHOLD) == true) {
+                        extras.getInt(KEY_HIGH_ENERGY_THRESHOLD, DEFAULT_HIGH_ENERGY_THRESHOLD).coerceIn(5, 60)
+                    } else {
+                        null
+                    }
+                    val trendThreshold = if (extras?.containsKey(KEY_TREND_CONSECUTIVE_THRESHOLD) == true) {
+                        extras.getInt(KEY_TREND_CONSECUTIVE_THRESHOLD, DEFAULT_TREND_CONSECUTIVE_THRESHOLD).coerceIn(2, 10)
+                    } else {
+                        null
+                    }
+                    val autoDismissEnabled = if (extras?.containsKey(KEY_TREND_AUTO_DISMISS_ENABLED) == true) {
+                        extras.getBoolean(KEY_TREND_AUTO_DISMISS_ENABLED, DEFAULT_TREND_AUTO_DISMISS_ENABLED)
+                    } else {
+                        null
+                    }
+                    val autoDismissSec = if (extras?.containsKey(KEY_TREND_AUTO_DISMISS_SEC) == true) {
+                        extras.getInt(KEY_TREND_AUTO_DISMISS_SEC, DEFAULT_TREND_AUTO_DISMISS_SEC).coerceIn(5, 60)
+                    } else {
+                        null
+                    }
                     val updated = mutateLocalStore(
                         appCtx = appCtx,
                         lang = lang,
                         theme = theme,
-                        hudOpacity = hudOpacity
+                        hudOpacity = hudOpacity,
+                        highBatteryThreshold = highThreshold,
+                        trendConsecutiveThreshold = trendThreshold,
+                        trendAutoDismissEnabled = autoDismissEnabled,
+                        trendAutoDismissSec = autoDismissSec
                     )
                     dispatchForegroundNotifications(appCtx, updated)
                     updated.toBundle()
@@ -333,6 +369,14 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_THEME = "ui_theme"
         const val KEY_HUD_OPACITY = "hud_opacity"
         const val DEFAULT_HUD_OPACITY = 85
+        const val KEY_HIGH_ENERGY_THRESHOLD = "high_energy_threshold"
+        const val DEFAULT_HIGH_ENERGY_THRESHOLD = 20
+        const val KEY_TREND_CONSECUTIVE_THRESHOLD = "trend_consecutive_threshold"
+        const val DEFAULT_TREND_CONSECUTIVE_THRESHOLD = 3
+        const val KEY_TREND_AUTO_DISMISS_ENABLED = "trend_auto_dismiss_enabled"
+        const val DEFAULT_TREND_AUTO_DISMISS_ENABLED = true
+        const val KEY_TREND_AUTO_DISMISS_SEC = "trend_auto_dismiss_sec"
+        const val DEFAULT_TREND_AUTO_DISMISS_SEC = 15
         const val KEY_XPOSED_BOUND = "xposed_bound"
         const val KEY_API_102 = "api_102_bound"
         const val KEY_LAST_HB_MS = "last_hb_ms"
@@ -398,6 +442,10 @@ class QuotaSyncProvider : ContentProvider() {
                     lang = prefs.getString(KEY_LANG, null)?.let { QuotaHudView.Lang.fromCode(it) } ?: defaultLangForDevice(),
                     theme = QuotaHudView.ThemeMode.fromCode(prefs.getString(KEY_THEME, "MIUIX")),
                     hudOpacity = prefs.getInt(KEY_HUD_OPACITY, DEFAULT_HUD_OPACITY).coerceIn(20, 100),
+                    highBatteryThreshold = prefs.getInt(KEY_HIGH_ENERGY_THRESHOLD, DEFAULT_HIGH_ENERGY_THRESHOLD).coerceIn(5, 60),
+                    trendConsecutiveThreshold = prefs.getInt(KEY_TREND_CONSECUTIVE_THRESHOLD, DEFAULT_TREND_CONSECUTIVE_THRESHOLD).coerceIn(2, 10),
+                    trendAutoDismissEnabled = prefs.getBoolean(KEY_TREND_AUTO_DISMISS_ENABLED, DEFAULT_TREND_AUTO_DISMISS_ENABLED),
+                    trendAutoDismissSec = prefs.getInt(KEY_TREND_AUTO_DISMISS_SEC, DEFAULT_TREND_AUTO_DISMISS_SEC).coerceIn(5, 60),
                     xposedBound = prefs.getBoolean(KEY_XPOSED_BOUND, false),
                     isApi102 = prefs.getBoolean(KEY_API_102, false),
                     lastHeartbeatMs = prefs.getLong(KEY_LAST_HB_MS, 0L),
@@ -426,6 +474,10 @@ class QuotaSyncProvider : ContentProvider() {
             lang: QuotaHudView.Lang? = null,
             theme: QuotaHudView.ThemeMode? = null,
             hudOpacity: Int? = null,
+            highBatteryThreshold: Int? = null,
+            trendConsecutiveThreshold: Int? = null,
+            trendAutoDismissEnabled: Boolean? = null,
+            trendAutoDismissSec: Int? = null,
             pkg: String? = null,
             proc: String? = null,
             bridge: String? = null,
@@ -475,6 +527,10 @@ class QuotaSyncProvider : ContentProvider() {
                 lang = lang ?: prev.lang,
                 theme = theme ?: prev.theme,
                 hudOpacity = hudOpacity?.coerceIn(20, 100) ?: prev.hudOpacity,
+                highBatteryThreshold = highBatteryThreshold?.coerceIn(5, 60) ?: prev.highBatteryThreshold,
+                trendConsecutiveThreshold = trendConsecutiveThreshold?.coerceIn(2, 10) ?: prev.trendConsecutiveThreshold,
+                trendAutoDismissEnabled = trendAutoDismissEnabled ?: prev.trendAutoDismissEnabled,
+                trendAutoDismissSec = trendAutoDismissSec?.coerceIn(5, 60) ?: prev.trendAutoDismissSec,
                 xposedBound = nextBound,
                 isApi102 = isApi102 ?: prev.isApi102,
                 lastHeartbeatMs = nextHbMs,
@@ -500,6 +556,10 @@ class QuotaSyncProvider : ContentProvider() {
                     .putString(KEY_LANG, next.lang.code)
                     .putString(KEY_THEME, next.theme.code)
                     .putInt(KEY_HUD_OPACITY, next.hudOpacity)
+                    .putInt(KEY_HIGH_ENERGY_THRESHOLD, next.highBatteryThreshold)
+                    .putInt(KEY_TREND_CONSECUTIVE_THRESHOLD, next.trendConsecutiveThreshold)
+                    .putBoolean(KEY_TREND_AUTO_DISMISS_ENABLED, next.trendAutoDismissEnabled)
+                    .putInt(KEY_TREND_AUTO_DISMISS_SEC, next.trendAutoDismissSec)
                     .putBoolean(KEY_XPOSED_BOUND, next.xposedBound)
                     .putBoolean(KEY_API_102, next.isApi102)
                     .putLong(KEY_LAST_HB_MS, next.lastHeartbeatMs)
@@ -630,6 +690,10 @@ class QuotaSyncProvider : ContentProvider() {
             lang: QuotaHudView.Lang? = null,
             theme: QuotaHudView.ThemeMode? = null,
             hudOpacity: Int? = null,
+            highBatteryThreshold: Int? = null,
+            trendConsecutiveThreshold: Int? = null,
+            trendAutoDismissEnabled: Boolean? = null,
+            trendAutoDismissSec: Int? = null,
             overlayEnabled: Boolean? = null
         ): UnifiedState? {
             return try {
@@ -639,7 +703,11 @@ class QuotaSyncProvider : ContentProvider() {
                         appCtx = appCtx,
                         lang = lang,
                         theme = theme,
-                        hudOpacity = hudOpacity
+                        hudOpacity = hudOpacity,
+                        highBatteryThreshold = highBatteryThreshold,
+                        trendConsecutiveThreshold = trendConsecutiveThreshold,
+                        trendAutoDismissEnabled = trendAutoDismissEnabled,
+                        trendAutoDismissSec = trendAutoDismissSec
                     )
                     dispatchForegroundNotifications(appCtx, updated)
                     updated
@@ -648,6 +716,10 @@ class QuotaSyncProvider : ContentProvider() {
                         if (lang != null) putString(KEY_LANG, lang.code)
                         if (theme != null) putString(KEY_THEME, theme.code)
                         if (hudOpacity != null) putInt(KEY_HUD_OPACITY, hudOpacity.coerceIn(20, 100))
+                        if (highBatteryThreshold != null) putInt(KEY_HIGH_ENERGY_THRESHOLD, highBatteryThreshold.coerceIn(5, 60))
+                        if (trendConsecutiveThreshold != null) putInt(KEY_TREND_CONSECUTIVE_THRESHOLD, trendConsecutiveThreshold.coerceIn(2, 10))
+                        if (trendAutoDismissEnabled != null) putBoolean(KEY_TREND_AUTO_DISMISS_ENABLED, trendAutoDismissEnabled)
+                        if (trendAutoDismissSec != null) putInt(KEY_TREND_AUTO_DISMISS_SEC, trendAutoDismissSec.coerceIn(5, 60))
                     }
                     val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_PUT_PREFS, null, extras)
                     UnifiedState.fromBundle(reply)
