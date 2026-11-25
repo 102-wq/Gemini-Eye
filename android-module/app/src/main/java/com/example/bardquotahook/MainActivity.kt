@@ -20,10 +20,13 @@ import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.TextView
 import org.json.JSONObject
 import java.io.File
@@ -55,6 +58,11 @@ class MainActivity : Activity() {
     private var devConsoleCountView: TextView? = null
     private var devConsoleResetTrendBtn: Button? = null
     private var devConsoleClearBtn: Button? = null
+    private var devConsoleTrendRangeRow: LinearLayout? = null
+    private var devConsoleTrendRangeLabel: TextView? = null
+    private var devConsoleTrendRangeSpinner: Spinner? = null
+    private var isUpdatingTrendRangeSpinner = false
+    private var selectedTrendRangeIdx = 4
     private var devConsoleLogsView: TextView? = null
     private var energyCardTitleView: TextView? = null
     private var energyToggleBtn: Button? = null
@@ -294,9 +302,26 @@ class MainActivity : Activity() {
             "Zero-Guard: $zeroCount | Anomaly: $anomalyCount | Energy: $batteryCount"
         }
         devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
+        val hasTrendHistory = trendHistoryArr != null && trendHistoryArr.length() > 0
         devConsoleResetTrendBtn?.apply {
             text = if (zh) "重置告警历史" else "Reset Alert History"
-            visibility = if (hasHighUsageTrend || trendStreak > 0 || (trendHistoryArr != null && trendHistoryArr.length() > 0)) View.VISIBLE else View.GONE
+            visibility = if (hasHighUsageTrend || trendStreak > 0 || hasTrendHistory) View.VISIBLE else View.GONE
+        }
+        devConsoleTrendRangeRow?.visibility = if (hasTrendHistory) View.VISIBLE else View.GONE
+        devConsoleTrendRangeLabel?.text = if (zh) "趋势触发时间范围:" else "Trend Occurrence Range:"
+        devConsoleTrendRangeSpinner?.let { sp ->
+            val items = if (zh) {
+                listOf("最近 15 分钟", "最近 1 小时", "最近 6 小时", "最近 24 小时", "全部时间")
+            } else {
+                listOf("Last 15m", "Last 1h", "Last 6h", "Last 24h", "All Time")
+            }
+            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, items).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            isUpdatingTrendRangeSpinner = true
+            sp.adapter = adapter
+            sp.setSelection(selectedTrendRangeIdx.coerceIn(0, 4), false)
+            isUpdatingTrendRangeSpinner = false
         }
         devConsoleLogsView?.text = buildString {
             if (hasHighUsageTrend) {
@@ -311,20 +336,46 @@ class MainActivity : Activity() {
                     append("⚠ High Usage Trend · $trendStreak consecutive increases in 5m window ($trendStart -> $trendCur, +$trendDelta pts)$countdownHint\n")
                 }
             }
-            if (trendHistoryArr != null && trendHistoryArr.length() > 0) {
-                val count = trendHistoryArr.length()
-                append(if (zh) "  近期触发历史 ($count 条):\n" else "  Recent Alert Occurrences ($count):\n")
-                val limit = minOf(count, 8)
-                for (idx in 0 until limit) {
+            if (hasTrendHistory && trendHistoryArr != null) {
+                val nowMs = System.currentTimeMillis()
+                val windowMs = when (selectedTrendRangeIdx) {
+                    0 -> 15 * 60 * 1000L
+                    1 -> 60 * 60 * 1000L
+                    2 -> 6 * 60 * 60 * 1000L
+                    3 -> 24 * 60 * 60 * 1000L
+                    else -> Long.MAX_VALUE
+                }
+                val filteredItems = ArrayList<JSONObject>()
+                for (idx in 0 until trendHistoryArr.length()) {
                     val item = trendHistoryArr.optJSONObject(idx) ?: continue
-                    val ts = formatLogTime(item.optLong("ts", 0L))
-                    val st = item.optInt("streak", 0)
-                    val th = item.optInt("threshold", state.trendConsecutiveThreshold)
-                    val s0 = item.optDouble("startScore", 0.0)
-                    val s1 = item.optDouble("curScore", 0.0)
-                    val d = item.optDouble("delta", 0.0)
-                    val r = item.optString("reason", "SAMPLE")
-                    append("   • $ts · ${st}x>=$th · $s0->$s1 (+$d) [$r]\n")
+                    val tsMs = item.optLong("ts", 0L)
+                    if (windowMs == Long.MAX_VALUE || (tsMs > 0L && (nowMs - tsMs) <= windowMs)) {
+                        filteredItems.add(item)
+                    }
+                }
+                val totalCount = trendHistoryArr.length()
+                append(
+                    if (zh) {
+                        "  近期触发历史 (${filteredItems.size}/$totalCount 条):\n"
+                    } else {
+                        "  Recent Alert Occurrences (${filteredItems.size}/$totalCount):\n"
+                    }
+                )
+                if (filteredItems.isEmpty()) {
+                    append(if (zh) "   (所选时间范围内无记录)\n" else "   (No occurrences in selected time range)\n")
+                } else {
+                    val limit = minOf(filteredItems.size, 8)
+                    for (idx in 0 until limit) {
+                        val item = filteredItems[idx]
+                        val ts = formatLogTime(item.optLong("ts", 0L))
+                        val st = item.optInt("streak", 0)
+                        val th = item.optInt("threshold", state.trendConsecutiveThreshold)
+                        val s0 = item.optDouble("startScore", 0.0)
+                        val s1 = item.optDouble("curScore", 0.0)
+                        val d = item.optDouble("delta", 0.0)
+                        val r = item.optString("reason", "SAMPLE")
+                        append("   • $ts · ${st}x>=$th · $s0->$s1 (+$d) [$r]\n")
+                    }
                 }
                 append('\n')
             } else if (hasHighUsageTrend) {
@@ -439,9 +490,9 @@ class MainActivity : Activity() {
         }
         val activeTrendThreshold = state.trendConsecutiveThreshold.coerceIn(2, 10)
         energyTrendThresholdLabelView?.text = if (zh) {
-            "High Usage Trend 灵敏度 (连续上升次数): >= ${activeTrendThreshold}x / 5m (${if (trendActive) "已触发 $trendStreak/$activeTrendThreshold" else "监控中"})"
+            "High Usage Trend 灵敏度 (连续上升次数): >= ${activeTrendThreshold}x / 5m (${if (hasHighUsageTrend) "已触发 $trendStreak/$activeTrendThreshold" else "监控中"})"
         } else {
-            "High Usage Trend Sensitivity: >= ${activeTrendThreshold}x / 5m (${if (trendActive) "ALERT $trendStreak/$activeTrendThreshold" else "Monitoring"})"
+            "High Usage Trend Sensitivity: >= ${activeTrendThreshold}x / 5m (${if (hasHighUsageTrend) "ALERT $trendStreak/$activeTrendThreshold" else "Monitoring"})"
         }
         if (energyTrendThresholdSeekBar != null && energyTrendThresholdSeekBar?.progress != (activeTrendThreshold - 2)) {
             isUpdatingTrendThresholdSeekBar = true
@@ -942,6 +993,42 @@ class MainActivity : Activity() {
         devHeaderRow.addView(devResetTrend)
         devHeaderRow.addView(devClear)
 
+        val devRangeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8f), 0, 0)
+            visibility = View.GONE
+        }
+        devConsoleTrendRangeRow = devRangeRow
+
+        val devRangeLabel = TextView(this).apply {
+            setTextColor(Color.parseColor("#FDA4AF"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, dp(8f), 0)
+        }
+        devConsoleTrendRangeLabel = devRangeLabel
+
+        val devRangeSpinner = Spinner(this).apply {
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    (view as? TextView)?.apply {
+                        setTextColor(Color.parseColor("#FECDD3"))
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+                    }
+                    if (isUpdatingTrendRangeSpinner || selectedTrendRangeIdx == position) return
+                    selectedTrendRangeIdx = position
+                    refreshAllUi()
+                }
+
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
+        }
+        devConsoleTrendRangeSpinner = devRangeSpinner
+
+        devRangeRow.addView(devRangeLabel)
+        devRangeRow.addView(devRangeSpinner)
+
         val devLogsTv = TextView(this).apply {
             setTextColor(Color.parseColor("#CBD5E1"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
@@ -952,6 +1039,7 @@ class MainActivity : Activity() {
         devConsoleLogsView = devLogsTv
 
         devCard.addView(devHeaderRow)
+        devCard.addView(devRangeRow)
         devCard.addView(devLogsTv)
 
         // 2.6 Battery Impact & Energy Statistics Card (Toggle + Export Report)

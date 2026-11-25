@@ -85,6 +85,159 @@ interface EnergyTimelineEntry {
   estimatedMah: number;
 }
 
+interface TrendSpikePoint {
+  time: string;
+  score: number;
+  event: string;
+}
+
+function buildTrendSpikePoints(
+  samples: Array<{ ts: number; score: number; event: string }>
+): TrendSpikePoint[] {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return samples.map((sample) => {
+    const d = new Date(sample.ts);
+    return {
+      time: `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
+      score: Math.round(sample.score * 100) / 100,
+      event: sample.event,
+    };
+  });
+}
+
+function TrendScoreSparkline({
+  points,
+  compact = false,
+  active = true,
+  isZh = false,
+}: {
+  points: TrendSpikePoint[];
+  compact?: boolean;
+  active?: boolean;
+  isZh?: boolean;
+}) {
+  const rawId = React.useId();
+  const gradId = `trend-spark-${rawId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
+
+  if (!points || points.length === 0) return null;
+
+  const width = compact ? 84 : 136;
+  const height = compact ? 24 : 36;
+  const padX = compact ? 4 : 6;
+  const padY = compact ? 4 : 5;
+  const plotW = width - padX * 2;
+  const plotH = height - padY * 2;
+
+  const scores = points.map((p) => p.score);
+  const minScore = Math.min(...scores);
+  const maxScore = Math.max(...scores);
+  const span = maxScore - minScore;
+
+  const coords = points.map((p, idx) => {
+    const x =
+      points.length === 1
+        ? width / 2
+        : padX + (idx / (points.length - 1)) * plotW;
+    const norm = span > 0 ? (p.score - minScore) / span : 0.5;
+    const y = padY + plotH - norm * plotH;
+    return {
+      x: Math.round(x * 10) / 10,
+      y: Math.round(y * 10) / 10,
+      point: p,
+    };
+  });
+
+  const linePoints = coords.map((c) => `${c.x},${c.y}`).join(' ');
+  const firstCoord = coords[0];
+  const lastCoord = coords[coords.length - 1];
+  const areaPoints =
+    coords.length >= 2
+      ? `${firstCoord.x},${height - padY} ${linePoints} ${lastCoord.x},${height - padY}`
+      : '';
+
+  const strokeColor = active ? '#fb7185' : '#f59e0b';
+  const fillStopTop = active ? '#f43f5e' : '#f59e0b';
+  const peakColor = active ? '#fda4af' : '#fcd34d';
+  const tooltipText = points
+    .map((p) => `${p.score.toFixed(2)} (${p.time} · ${p.event})`)
+    .join(' -> ');
+
+  return (
+    <div
+      title={
+        isZh
+          ? `功耗尖峰轨迹: ${tooltipText}`
+          : `Energy Spike Trajectory: ${tooltipText}`
+      }
+      className={`inline-flex items-center gap-1.5 rounded border px-1.5 py-0.5 shrink-0 ${
+        active
+          ? 'border-rose-500/35 bg-rose-950/60'
+          : 'border-slate-700/80 bg-slate-900/90'
+      }`}
+    >
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className={compact ? 'w-[84px] h-[24px] overflow-visible' : 'w-[136px] h-[36px] overflow-visible'}
+        role="img"
+        aria-label={
+          isZh
+            ? `功耗尖峰折线图：${minScore.toFixed(2)} 至 ${maxScore.toFixed(2)}`
+            : `Energy score spike sparkline: ${minScore.toFixed(2)} to ${maxScore.toFixed(2)}`
+        }
+      >
+        <title>{tooltipText}</title>
+        <defs>
+          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={fillStopTop} stopOpacity="0.42" />
+            <stop offset="100%" stopColor={fillStopTop} stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        <line
+          x1={padX}
+          y1={firstCoord.y}
+          x2={width - padX}
+          y2={firstCoord.y}
+          stroke={active ? 'rgba(251, 113, 133, 0.25)' : 'rgba(148, 163, 184, 0.25)'}
+          strokeWidth="1"
+          strokeDasharray="2 2"
+        />
+        {areaPoints && <polygon points={areaPoints} fill={`url(#${gradId})`} />}
+        {coords.length >= 2 && (
+          <polyline
+            fill="none"
+            stroke={strokeColor}
+            strokeWidth={compact ? '1.6' : '2'}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            points={linePoints}
+          />
+        )}
+        {coords.map((c, idx) => {
+          const isLast = idx === coords.length - 1;
+          const isFirst = idx === 0;
+          return (
+            <circle
+              key={`${c.point.time}-${idx}`}
+              cx={c.x}
+              cy={c.y}
+              r={isLast ? (compact ? 2.6 : 3.2) : isFirst ? 1.8 : 1.5}
+              fill={isLast ? peakColor : strokeColor}
+              stroke={isLast ? '#0f172a' : 'none'}
+              strokeWidth={isLast ? '1' : '0'}
+            />
+          );
+        })}
+      </svg>
+      {!compact && (
+        <div className="flex flex-col leading-tight font-mono text-[9.5px] tabular-nums pr-0.5">
+          <span className="text-rose-200 font-bold">{maxScore.toFixed(2)}</span>
+          <span className="text-slate-400">{minScore.toFixed(2)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface TrendWindowChartPoint {
   time: string;
   ts: number;
@@ -442,6 +595,7 @@ export default function App() {
     timeMs: string;
     sessionTag: string;
     events: string[];
+    scores: TrendSpikePoint[];
     triggeredAtMs: number;
   } | null>(null);
   const [highUsageTrendOccurrences, setHighUsageTrendOccurrences] = useState<
@@ -456,10 +610,15 @@ export default function App() {
       timeMs: string;
       sessionTag: string;
       events: string[];
+      scores: TrendSpikePoint[];
       triggeredAtMs: number;
     }>
   >([]);
   const [trendOccurrencesExpanded, setTrendOccurrencesExpanded] = useState<boolean>(true);
+  const [trendOccurrenceTimeRange, setTrendOccurrenceTimeRange] = useState<
+    '15M' | '1H' | '6H' | '24H' | 'ALL'
+  >('ALL');
+  const [trendRangeTick, setTrendRangeTick] = useState<number>(0);
   const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
   const bgWakeupCountRef = useRef<number>(0);
   const fgDispatchCountRef = useRef<number>(1);
@@ -988,6 +1147,8 @@ export default function App() {
       const timeMs = formatFullTimestampMs(new Date(nowTs));
       const sess = activeSessionRef.current.sessionTag;
       const trailEvents = pruned.slice(startIdx).map((s) => s.event);
+      const spikeSlice = pruned.slice(Math.max(0, startIdx - 1));
+      const spikeScores = buildTrendSpikePoints(spikeSlice);
       setHighUsageTrendAlert((prev) => ({
         consecutiveIncreases: streak,
         startScore: startSample.score,
@@ -997,6 +1158,7 @@ export default function App() {
         timeMs,
         sessionTag: sess,
         events: trailEvents,
+        scores: spikeScores,
         triggeredAtMs: prev ? prev.triggeredAtMs : nowTs,
       }));
       if (streak > highUsageTrendAlertedStreakRef.current) {
@@ -1013,6 +1175,7 @@ export default function App() {
             timeMs,
             sessionTag: sess,
             events: trailEvents,
+            scores: spikeScores,
             triggeredAtMs: nowTs,
           },
           ...prev,
@@ -1063,6 +1226,28 @@ export default function App() {
     }, 250);
     return () => window.clearInterval(intervalId);
   }, [highUsageTrendAlert, trendAutoDismissEnabled, trendAutoDismissSec]);
+
+  useEffect(() => {
+    if (trendOccurrenceTimeRange === 'ALL' || highUsageTrendOccurrences.length === 0) return;
+    const id = window.setInterval(() => {
+      setTrendRangeTick((t) => t + 1);
+    }, 15_000);
+    return () => window.clearInterval(id);
+  }, [trendOccurrenceTimeRange, highUsageTrendOccurrences.length]);
+
+  const filteredTrendOccurrences = useMemo(() => {
+    if (trendOccurrenceTimeRange === 'ALL') return highUsageTrendOccurrences;
+    const windowMs =
+      trendOccurrenceTimeRange === '15M'
+        ? 15 * 60 * 1000
+        : trendOccurrenceTimeRange === '1H'
+          ? 60 * 60 * 1000
+          : trendOccurrenceTimeRange === '6H'
+            ? 6 * 60 * 60 * 1000
+            : 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - windowMs;
+    return highUsageTrendOccurrences.filter((occ) => occ.triggeredAtMs >= cutoff);
+  }, [highUsageTrendOccurrences, trendOccurrenceTimeRange, trendRangeTick]);
 
   useEffect(() => {
     try {
@@ -1201,6 +1386,8 @@ export default function App() {
     const timeMs = formatFullTimestampMs(new Date(nowTs));
     const sess = activeSessionRef.current.sessionTag;
     const trailEvents = updated.slice(streakStartIdx).map((s) => s.event);
+    const spikeSlice = updated.slice(Math.max(0, streakStartIdx - 1));
+    const spikeScores = buildTrendSpikePoints(spikeSlice);
 
     setHighUsageTrendAlert({
       consecutiveIncreases,
@@ -1211,6 +1398,7 @@ export default function App() {
       timeMs,
       sessionTag: sess,
       events: trailEvents,
+      scores: spikeScores,
       triggeredAtMs: nowTs,
     });
 
@@ -1228,6 +1416,7 @@ export default function App() {
           timeMs,
           sessionTag: sess,
           events: trailEvents,
+          scores: spikeScores,
           triggeredAtMs: nowTs,
         },
         ...prev,
@@ -4067,7 +4256,14 @@ export default function App() {
                             </div>
                           </div>
                         </div>
-                        <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          {highUsageTrendAlert && highUsageTrendAlert.scores.length > 0 && (
+                            <TrendScoreSparkline
+                              points={highUsageTrendAlert.scores}
+                              active
+                              isZh={isZh}
+                            />
+                          )}
                           <button
                             type="button"
                             onClick={() => setTrendSoundEnabled((v) => !v)}
@@ -4120,7 +4316,7 @@ export default function App() {
 
                       {highUsageTrendOccurrences.length > 0 && (
                         <div className="pt-2 border-t border-rose-500/25 space-y-1.5">
-                          <div className="flex items-center justify-between gap-2 text-[10px] font-mono">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono">
                             <button
                               type="button"
                               onClick={() => setTrendOccurrencesExpanded((v) => !v)}
@@ -4133,70 +4329,124 @@ export default function App() {
                               )}
                               <span>
                                 {isZh
-                                  ? `最近触发历史 (${highUsageTrendOccurrences.length})`
-                                  : `Recent Alert Occurrences (${highUsageTrendOccurrences.length})`}
+                                  ? trendOccurrenceTimeRange === 'ALL'
+                                    ? `最近触发历史 (${highUsageTrendOccurrences.length})`
+                                    : `最近触发历史 (${filteredTrendOccurrences.length}/${highUsageTrendOccurrences.length})`
+                                  : trendOccurrenceTimeRange === 'ALL'
+                                    ? `Recent Alert Occurrences (${highUsageTrendOccurrences.length})`
+                                    : `Recent Alert Occurrences (${filteredTrendOccurrences.length}/${highUsageTrendOccurrences.length})`}
                               </span>
                             </button>
-                            <span className="text-[9.5px] text-slate-400">
-                              {isZh ? '按时间倒序 · 最多保留 20 条' : 'Newest first · Up to 20 entries'}
-                            </span>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <label className="inline-flex items-center gap-1.5 text-[9.5px] text-slate-300">
+                                <span className="text-slate-400">
+                                  {isZh ? '时间范围:' : 'Time Range:'}
+                                </span>
+                                <select
+                                  aria-label={isZh ? '触发历史时间范围筛选' : 'High Usage Trend Occurrence Time Range Filter'}
+                                  value={trendOccurrenceTimeRange}
+                                  onChange={(e) =>
+                                    setTrendOccurrenceTimeRange(
+                                      e.target.value as '15M' | '1H' | '6H' | '24H' | 'ALL'
+                                    )
+                                  }
+                                  className="rounded border border-rose-500/35 bg-slate-900 px-1.5 py-0.5 text-[10px] font-mono text-rose-100 focus:outline-none focus:border-rose-400 cursor-pointer"
+                                >
+                                  <option value="15M">{isZh ? '最近 15 分钟' : 'Last 15m'}</option>
+                                  <option value="1H">{isZh ? '最近 1 小时' : 'Last 1h'}</option>
+                                  <option value="6H">{isZh ? '最近 6 小时' : 'Last 6h'}</option>
+                                  <option value="24H">{isZh ? '最近 24 小时' : 'Last 24h'}</option>
+                                  <option value="ALL">{isZh ? '全部时间' : 'All Time'}</option>
+                                </select>
+                              </label>
+                              <span className="text-[9.5px] text-slate-400 hidden sm:inline">
+                                {isZh ? '按时间倒序 · 最多 20 条' : 'Newest first · Max 20'}
+                              </span>
+                            </div>
                           </div>
 
                           {trendOccurrencesExpanded && (
                             <div className="max-h-36 overflow-y-auto space-y-1 pr-1">
-                              {highUsageTrendOccurrences.map((occ, idx) => {
-                                const isCurrentLatest =
-                                  Boolean(highUsageTrendAlert) &&
-                                  idx === 0 &&
-                                  occ.triggeredAtMs === highUsageTrendAlert?.triggeredAtMs;
-                                return (
-                                  <div
-                                    key={occ.id}
-                                    className={`rounded-lg border px-2.5 py-1.5 font-mono text-[10px] flex flex-wrap items-center justify-between gap-2 ${
-                                      isCurrentLatest
-                                        ? 'border-rose-400/45 bg-rose-950/60 text-rose-100'
-                                        : 'border-slate-800 bg-slate-950/75 text-slate-300'
-                                    }`}
+                              {filteredTrendOccurrences.length === 0 ? (
+                                <div className="rounded-lg border border-slate-800 bg-slate-950/75 px-3 py-2 text-[10px] font-mono text-slate-400 flex flex-wrap items-center justify-between gap-2">
+                                  <span>
+                                    {isZh
+                                      ? `所选时间范围内暂无 High Usage Trend 触发记录（历史共 ${highUsageTrendOccurrences.length} 条）。`
+                                      : `No High Usage Trend occurrences in selected window (${highUsageTrendOccurrences.length} total recorded).`}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setTrendOccurrenceTimeRange('ALL')}
+                                    className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-rose-200 border border-slate-700 cursor-pointer"
                                   >
-                                    <div className="flex flex-wrap items-center gap-2 min-w-0">
-                                      <span className="text-slate-400 tabular-nums shrink-0">
-                                        {occ.timeMs}
-                                      </span>
-                                      <span
-                                        className={`px-1.5 py-0.2 rounded border font-semibold shrink-0 ${
-                                          isCurrentLatest
-                                            ? 'bg-rose-500/25 border-rose-400/50 text-rose-200'
-                                            : 'bg-slate-800 border-slate-700 text-rose-300'
-                                        }`}
-                                      >
-                                        {occ.consecutiveIncreases}x &gt;= {occ.thresholdAtTrigger}x
-                                      </span>
-                                      <span className="text-amber-300 tabular-nums shrink-0">
-                                        {occ.startScore} -&gt; {occ.curScore} (+{occ.delta.toFixed(2)})
-                                      </span>
-                                      <span className="text-slate-400 shrink-0">
-                                        {occ.windowSec}s · {occ.sessionTag}
-                                      </span>
-                                      {occ.events.length > 0 && (
-                                        <span className="text-slate-500 truncate max-w-[220px]">
-                                          [{occ.events[occ.events.length - 1]}]
-                                        </span>
-                                      )}
-                                    </div>
-                                    <span
-                                      className={`text-[9px] px-1.5 py-0.5 rounded shrink-0 ${
+                                    {isZh ? '显示全部时间' : 'Show All Time'}
+                                  </button>
+                                </div>
+                              ) : (
+                                filteredTrendOccurrences.map((occ) => {
+                                  const isCurrentLatest =
+                                    Boolean(highUsageTrendAlert) &&
+                                    occ.triggeredAtMs === highUsageTrendAlert?.triggeredAtMs &&
+                                    occ.id === highUsageTrendOccurrences[0]?.id;
+                                  return (
+                                    <div
+                                      key={occ.id}
+                                      className={`rounded-lg border px-2.5 py-1.5 font-mono text-[10px] flex flex-wrap items-center justify-between gap-2 ${
                                         isCurrentLatest
-                                          ? 'bg-rose-500/25 text-rose-200 border border-rose-400/40'
-                                          : 'bg-slate-900 text-slate-400 border border-slate-800'
+                                          ? 'border-rose-400/45 bg-rose-950/60 text-rose-100'
+                                          : 'border-slate-800 bg-slate-950/75 text-slate-300'
                                       }`}
                                     >
-                                      {isCurrentLatest
-                                        ? isZh ? '当前激活' : 'ACTIVE'
-                                        : isZh ? '历史记录' : 'HISTORY'}
-                                    </span>
-                                  </div>
-                                );
-                              })}
+                                      <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                        <span className="text-slate-400 tabular-nums shrink-0">
+                                          {occ.timeMs}
+                                        </span>
+                                        <span
+                                          className={`px-1.5 py-0.2 rounded border font-semibold shrink-0 ${
+                                            isCurrentLatest
+                                              ? 'bg-rose-500/25 border-rose-400/50 text-rose-200'
+                                              : 'bg-slate-800 border-slate-700 text-rose-300'
+                                          }`}
+                                        >
+                                          {occ.consecutiveIncreases}x &gt;= {occ.thresholdAtTrigger}x
+                                        </span>
+                                        <span className="text-amber-300 tabular-nums shrink-0">
+                                          {occ.startScore} -&gt; {occ.curScore} (+{occ.delta.toFixed(2)})
+                                        </span>
+                                        <span className="text-slate-400 shrink-0">
+                                          {occ.windowSec}s · {occ.sessionTag}
+                                        </span>
+                                        {occ.events.length > 0 && (
+                                          <span className="text-slate-500 truncate max-w-[220px]">
+                                            [{occ.events[occ.events.length - 1]}]
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="flex items-center gap-2 shrink-0">
+                                        {occ.scores.length > 0 && (
+                                          <TrendScoreSparkline
+                                            points={occ.scores}
+                                            compact
+                                            active={isCurrentLatest}
+                                            isZh={isZh}
+                                          />
+                                        )}
+                                        <span
+                                          className={`text-[9px] px-1.5 py-0.5 rounded shrink-0 ${
+                                            isCurrentLatest
+                                              ? 'bg-rose-500/25 text-rose-200 border border-rose-400/40'
+                                              : 'bg-slate-900 text-slate-400 border border-slate-800'
+                                          }`}
+                                        >
+                                          {isCurrentLatest
+                                            ? isZh ? '当前激活' : 'ACTIVE'
+                                            : isZh ? '历史记录' : 'HISTORY'}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  );
+                                })
+                              )}
                             </div>
                           )}
                         </div>
