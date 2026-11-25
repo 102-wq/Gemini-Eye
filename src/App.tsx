@@ -511,6 +511,23 @@ function loadPersistedTrendSoundEnabled(): boolean {
   }
 }
 
+const HIGH_USAGE_TREND_ENABLED_STORAGE_KEY = 'gemini_eye_high_usage_trend_enabled';
+
+function loadPersistedHighUsageTrendEnabled(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return true;
+    }
+    const raw = window.localStorage.getItem(HIGH_USAGE_TREND_ENABLED_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return true;
+    }
+    return raw !== 'false';
+  } catch {
+    return true;
+  }
+}
+
 export default function App() {
   const [uiLang, setUiLang] = useState<UiLang>('zh');
   const [hudLang, setHudLang] = useState<UiLang>('zh');
@@ -518,6 +535,9 @@ export default function App() {
   const [hudOpacity, setHudOpacity] = useState<number>(85);
   const [highBatteryImpactThreshold, setHighBatteryImpactThreshold] = useState<number>(() =>
     loadPersistedHighBatteryThreshold()
+  );
+  const [highUsageTrendEnabled, setHighUsageTrendEnabled] = useState<boolean>(() =>
+    loadPersistedHighUsageTrendEnabled()
   );
   const [trendConsecutiveThreshold, setTrendConsecutiveThreshold] = useState<number>(() =>
     loadPersistedTrendConsecutiveThreshold()
@@ -619,6 +639,7 @@ export default function App() {
     '15M' | '1H' | '6H' | '24H' | 'ALL'
   >('ALL');
   const [trendRangeTick, setTrendRangeTick] = useState<number>(0);
+  const [trendHistoryCopied, setTrendHistoryCopied] = useState<boolean>(false);
   const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
   const bgWakeupCountRef = useRef<number>(0);
   const fgDispatchCountRef = useRef<number>(1);
@@ -638,6 +659,8 @@ export default function App() {
   const [highUsageTrendChartHistory, setHighUsageTrendChartHistory] = useState<TrendWindowChartPoint[]>(() =>
     buildTrendWindowChartSeries(energyTrendWindowRef.current, loadPersistedTrendConsecutiveThreshold())
   );
+  const highUsageTrendEnabledRef = useRef<boolean>(highUsageTrendEnabled);
+  highUsageTrendEnabledRef.current = highUsageTrendEnabled;
   const trendConsecutiveThresholdRef = useRef<number>(trendConsecutiveThreshold);
   trendConsecutiveThresholdRef.current = trendConsecutiveThreshold;
   const trendSoundEnabledRef = useRef<boolean>(trendSoundEnabled);
@@ -1136,6 +1159,12 @@ export default function App() {
         break;
       }
     }
+    if (!highUsageTrendEnabled) {
+      highUsageTrendAlertedStreakRef.current = 0;
+      setHighUsageTrendAlert(null);
+      setTrendAlertRemainingSec(null);
+      return;
+    }
     if (streak < normalized) {
       highUsageTrendAlertedStreakRef.current = 0;
       setHighUsageTrendAlert((prev) => (prev && prev.consecutiveIncreases < normalized ? null : prev));
@@ -1180,9 +1209,10 @@ export default function App() {
           },
           ...prev,
         ].slice(0, 20));
+        playHighUsageTrendChime();
       }
     }
-  }, [trendConsecutiveThreshold]);
+  }, [trendConsecutiveThreshold, highUsageTrendEnabled]);
 
   useEffect(() => {
     const normalizedSec = clampTrendAutoDismissSec(trendAutoDismissSec);
@@ -1252,6 +1282,19 @@ export default function App() {
   useEffect(() => {
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(
+          HIGH_USAGE_TREND_ENABLED_STORAGE_KEY,
+          String(highUsageTrendEnabled)
+        );
+      }
+    } catch {
+      // Ignore storage quota or sandbox restrictions
+    }
+  }, [highUsageTrendEnabled]);
+
+  useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
         window.localStorage.setItem(TREND_SOUND_ENABLED_STORAGE_KEY, String(trendSoundEnabled));
       }
     } catch {
@@ -1264,6 +1307,8 @@ export default function App() {
     const handleStorageSync = (e: StorageEvent) => {
       if (e.key === HIGH_BATTERY_THRESHOLD_STORAGE_KEY && e.newValue !== null) {
         setHighBatteryImpactThreshold(clampHighBatteryThreshold(Number(e.newValue)));
+      } else if (e.key === HIGH_USAGE_TREND_ENABLED_STORAGE_KEY && e.newValue !== null) {
+        setHighUsageTrendEnabled(e.newValue !== 'false');
       } else if (e.key === TREND_CONSECUTIVE_STORAGE_KEY && e.newValue !== null) {
         setTrendConsecutiveThreshold(clampTrendConsecutiveThreshold(Number(e.newValue)));
       } else if (e.key === TREND_AUTO_DISMISS_SEC_STORAGE_KEY && e.newValue !== null) {
@@ -1279,7 +1324,7 @@ export default function App() {
   }, []);
 
   const playHighUsageTrendChime = (forcePlay = false) => {
-    if (!forcePlay && !trendSoundEnabledRef.current) return;
+    if (!forcePlay && (!highUsageTrendEnabledRef.current || !trendSoundEnabledRef.current)) return;
     if (typeof window === 'undefined') return;
     try {
       const AudioCtxCtor =
@@ -1319,6 +1364,28 @@ export default function App() {
     }
   };
 
+  const handleToggleTrendSound = () => {
+    const nextEnabled = !trendSoundEnabledRef.current;
+    setTrendSoundEnabled(nextEnabled);
+    if (nextEnabled && typeof window !== 'undefined') {
+      try {
+        const AudioCtxCtor =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (AudioCtxCtor) {
+          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+            audioContextRef.current = new AudioCtxCtor();
+          }
+          if (audioContextRef.current.state === 'suspended') {
+            void audioContextRef.current.resume().catch(() => {});
+          }
+        }
+      } catch {
+        // Ignore audio context initialization restrictions
+      }
+    }
+  };
+
   const handleResetTrendAlertHistory = () => {
     const nowTs = Date.now();
     const baselineScore = Math.round(latestEnergyScoreRef.current * 100) / 100;
@@ -1337,6 +1404,78 @@ export default function App() {
     const msgZh = `[趋势告警历史已重置] 已清空 5 分钟滑动窗口连升计数（当前基准 ${baselineScore}），全局阈值 (>=${minStreak}x / 高能耗 >=${highBatteryImpactThreshold}) 保持不变。`;
     logDevEvent('BATTERY_IMPACT', sess, msgZh, msgEn, 'info');
     setLastSyncNote(isZhRef.current ? msgZh : msgEn);
+  };
+
+  const handleCopyTrendOccurrenceHistory = async () => {
+    if (highUsageTrendOccurrences.length === 0) return;
+    const zh = isZhRef.current;
+    const targetList =
+      filteredTrendOccurrences.length > 0 ? filteredTrendOccurrences : highUsageTrendOccurrences;
+    const rangeLabel =
+      trendOccurrenceTimeRange === 'ALL' ? 'All Time' : `Last ${trendOccurrenceTimeRange.toLowerCase()}`;
+
+    const lines: string[] = [
+      '=== Gemini-Eye · High Usage Trend Occurrence Snapshot ===',
+      `Exported: ${formatFullTimestampMs(new Date())}`,
+      `Filter: ${rangeLabel} (${filteredTrendOccurrences.length}/${highUsageTrendOccurrences.length} occurrences shown)`,
+      `Thresholds: Trend Alerts ${highUsageTrendEnabled ? 'ENABLED' : 'DISABLED'} | >=${trendConsecutiveThreshold}x in 5m | High Battery Impact >=${highBatteryImpactThreshold} pts`,
+      `Active Banner: ${
+        !highUsageTrendEnabled
+          ? 'DISABLED (Global Switch Off)'
+          : highUsageTrendAlert
+            ? `ACTIVE (${highUsageTrendAlert.consecutiveIncreases}x · ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore} +${highUsageTrendAlert.delta.toFixed(2)} pts · ${highUsageTrendAlert.sessionTag})`
+            : 'DISMISSED / NONE'
+      }`,
+      '',
+      '--- Alert Occurrences ---',
+      ...targetList.map((occ, idx) => {
+        const spikePath =
+          occ.scores.length > 0
+            ? occ.scores.map((p) => `${p.score.toFixed(2)}@${p.time}`).join(' -> ')
+            : `${occ.startScore} -> ${occ.curScore}`;
+        const eventsSummary = occ.events.length > 0 ? occ.events.join(' -> ') : 'N/A';
+        return `${idx + 1}. [${occ.timeMs}] ${occ.consecutiveIncreases}x >= ${occ.thresholdAtTrigger}x | ${occ.startScore} -> ${occ.curScore} (+${occ.delta.toFixed(2)} pts) | ${occ.windowSec}s | ${occ.sessionTag}\n   Spike: ${spikePath}\n   Events: [${eventsSummary}]`;
+      }),
+    ];
+
+    const relevantLogs = devLogs
+      .filter(
+        (entry) =>
+          entry.eventType === 'BATTERY_IMPACT' ||
+          entry.detailEn.includes('High Usage Trend') ||
+          entry.detailEn.includes('Trend Alert')
+      )
+      .slice(0, 15);
+    const logsToInclude = relevantLogs.length > 0 ? relevantLogs : devLogs.slice(0, 10);
+
+    if (logsToInclude.length > 0) {
+      lines.push('', `--- Associated Logs (${logsToInclude.length}) ---`);
+      for (const entry of logsToInclude) {
+        const detail = zh ? entry.detailZh : entry.detailEn;
+        lines.push(`[${entry.timeMs}] [${entry.eventType}] [${entry.sessionTag}] ${detail}`);
+      }
+    }
+
+    const payload = lines.join('\n');
+    try {
+      await navigator.clipboard.writeText(payload);
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = payload;
+        ta.setAttribute('readonly', '');
+        ta.className = 'fixed -left-[9999px] top-0 opacity-0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      } catch {
+        // Ignore clipboard fallback errors in restricted environments
+      }
+    }
+
+    setTrendHistoryCopied(true);
+    window.setTimeout(() => setTrendHistoryCopied(false), 1800);
   };
 
   const evaluateBatteryUsageTrendWindow = (curScore: number, eventName: string) => {
@@ -1364,6 +1503,13 @@ export default function App() {
     setHighUsageTrendChartHistory(
       buildTrendWindowChartSeries(updated, minStreak)
     );
+
+    if (!highUsageTrendEnabledRef.current) {
+      highUsageTrendAlertedStreakRef.current = 0;
+      setHighUsageTrendAlert(null);
+      setTrendAlertRemainingSec(null);
+      return;
+    }
 
     let consecutiveIncreases = 0;
     let streakStartIdx = updated.length - 1;
@@ -1607,9 +1753,11 @@ export default function App() {
           `累计 CPU / 墙钟耗时: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
           `网络重放与拦截传输: ${energyNetReqs} 次请求 / ${energyNetBytes} Bytes`,
           `估算电池消耗: ~${estimatedEnergyMah.toFixed(4)} mAh`,
-          highUsageTrendAlert
-            ? `趋势告警: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} 次连续上升 / 5m 窗口: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
-            : `趋势告警: 正常 (5 分钟窗口阈值 >=${trendConsecutiveThreshold}x 未触发)`,
+          !highUsageTrendEnabled
+            ? `趋势告警: 已全局关闭 (设置开关 OFF · 保留阈值 >=${trendConsecutiveThreshold}x)`
+            : highUsageTrendAlert
+              ? `趋势告警: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} 次连续上升 / 5m 窗口: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
+              : `趋势告警: 正常 (5 分钟窗口阈值 >=${trendConsecutiveThreshold}x 未触发)`,
           '',
           `--- 当前能耗事件日志 (${batteryLogs.length} 条) ---`,
         ]
@@ -1624,9 +1772,11 @@ export default function App() {
           `Cumulative CPU / Wall Time: ${energyCpuMs.toFixed(1)} ms / ${energyWallMs.toFixed(1)} ms`,
           `Network Replays / Transferred: ${energyNetReqs} reqs / ${energyNetBytes} Bytes`,
           `Estimated Battery Draw: ~${estimatedEnergyMah.toFixed(4)} mAh`,
-          highUsageTrendAlert
-            ? `Trend Alert: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} consecutive increases in 5m window: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
-            : `Trend Alert: Normal (5m window threshold >=${trendConsecutiveThreshold}x not triggered)`,
+          !highUsageTrendEnabled
+            ? `Trend Alert: Globally Disabled (Master switch OFF · saved threshold >=${trendConsecutiveThreshold}x)`
+            : highUsageTrendAlert
+              ? `Trend Alert: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} consecutive increases in 5m window: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
+              : `Trend Alert: Normal (5m window threshold >=${trendConsecutiveThreshold}x not triggered)`,
           '',
           `--- Current Energy Usage Log (${batteryLogs.length} entries) ---`,
         ];
@@ -3563,14 +3713,59 @@ export default function App() {
                               </div>
                             </div>
 
-                            <div className="space-y-1 pt-1">
+                            <div className="space-y-1 pt-2 border-t border-slate-200/60 dark:border-zinc-700/70">
+                              <div className="flex items-center justify-between gap-2 text-[11px]">
+                                <span className="font-semibold inline-flex items-center gap-1.5">
+                                  <TrendingUp
+                                    className={`w-3.5 h-3.5 shrink-0 ${
+                                      highUsageTrendEnabled ? 'text-rose-500' : 'opacity-50'
+                                    }`}
+                                  />
+                                  <span>
+                                    {isZh
+                                      ? 'High Usage Trend 全局告警'
+                                      : 'High Usage Trend Alerts'}
+                                  </span>
+                                </span>
+                                <button
+                                  type="button"
+                                  role="switch"
+                                  aria-checked={highUsageTrendEnabled}
+                                  aria-label={
+                                    isZh
+                                      ? '全局开启或关闭 High Usage Trend 告警'
+                                      : 'Enable or disable High Usage Trend alerts globally'
+                                  }
+                                  onClick={() => setHighUsageTrendEnabled((v) => !v)}
+                                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-mono text-[9.5px] border transition-colors cursor-pointer ${
+                                    highUsageTrendEnabled
+                                      ? 'bg-rose-600 border-rose-500 text-white'
+                                      : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-300'
+                                  }`}
+                                >
+                                  <span
+                                    className={`inline-block w-1.5 h-1.5 rounded-full ${
+                                      highUsageTrendEnabled ? 'bg-white' : 'bg-slate-400 dark:bg-zinc-500'
+                                    }`}
+                                  />
+                                  <span>{highUsageTrendEnabled ? 'ENABLED' : 'DISABLED'}</span>
+                                </button>
+                              </div>
+                              <div className="text-[9.5px] opacity-65 font-mono">
+                                {isZh
+                                  ? '全局总开关 · 关闭后抑制趋势告警弹窗与提示音并保留配置 · 已保存至 localStorage'
+                                  : 'Master switch · Suppresses trend alerts & chimes while keeping settings · Saved to localStorage'}
+                              </div>
+                            </div>
+
+                            <div className={`space-y-1 pt-1 transition-opacity ${highUsageTrendEnabled ? '' : 'opacity-50'}`}>
                               <div className="flex items-center justify-between gap-2 text-[11px]">
                                 <span className="font-medium">
                                   {isZh
                                     ? 'High Usage Trend 灵敏度 (连续上升次数)'
                                     : 'High Usage Trend Sensitivity (Consecutive Increases)'}
                                 </span>
-                                <span className="font-mono text-[10px] text-rose-500 font-semibold">
+                                <span className={`font-mono text-[10px] font-semibold ${highUsageTrendEnabled ? 'text-rose-500' : 'opacity-60'}`}>
                                   &gt;= {trendConsecutiveThreshold}x / 5m
                                 </span>
                               </div>
@@ -3581,6 +3776,7 @@ export default function App() {
                                   min={TREND_CONSECUTIVE_MIN}
                                   max={TREND_CONSECUTIVE_MAX}
                                   step={1}
+                                  disabled={!highUsageTrendEnabled}
                                   value={trendConsecutiveThreshold}
                                   onChange={(e) =>
                                     setTrendConsecutiveThreshold(
@@ -3588,16 +3784,21 @@ export default function App() {
                                     )
                                   }
                                   aria-label="High Usage Trend Consecutive Increases Threshold"
-                                  className="w-full h-1.5 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                                  className={`w-full h-1.5 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none accent-rose-500 ${
+                                    highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                  }`}
                                 />
                                 <span className="text-[9px] font-mono opacity-60 shrink-0">{TREND_CONSECUTIVE_MAX}</span>
                                 {trendConsecutiveThreshold !== DEFAULT_TREND_CONSECUTIVE_THRESHOLD && (
                                   <button
                                     type="button"
+                                    disabled={!highUsageTrendEnabled}
                                     onClick={() =>
                                       setTrendConsecutiveThreshold(DEFAULT_TREND_CONSECUTIVE_THRESHOLD)
                                     }
-                                    className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 cursor-pointer ${
+                                    className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
                                       simDarkTheme
                                         ? 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
                                         : 'border-slate-200 bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -3614,7 +3815,7 @@ export default function App() {
                               </div>
                             </div>
 
-                            <div className="space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60">
+                            <div className={`space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60 transition-opacity ${highUsageTrendEnabled ? '' : 'opacity-50'}`}>
                               <div className="flex items-center justify-between gap-2 text-[11px]">
                                 <span className="font-medium">
                                   {isZh
@@ -3624,7 +3825,7 @@ export default function App() {
                                 <div className="flex items-center gap-1.5">
                                   <span
                                     className={`font-mono text-[10px] font-semibold ${
-                                      trendAutoDismissEnabled ? 'text-amber-500' : 'opacity-60'
+                                      highUsageTrendEnabled && trendAutoDismissEnabled ? 'text-amber-500' : 'opacity-60'
                                     }`}
                                   >
                                     {trendAutoDismissEnabled
@@ -3635,8 +3836,11 @@ export default function App() {
                                   </span>
                                   <button
                                     type="button"
+                                    disabled={!highUsageTrendEnabled}
                                     onClick={() => setTrendAutoDismissEnabled((v) => !v)}
-                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors cursor-pointer ${
+                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
                                       trendAutoDismissEnabled
                                         ? 'bg-amber-600 border-amber-500 text-white'
                                         : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-300'
@@ -3655,7 +3859,7 @@ export default function App() {
                                   min={TREND_AUTO_DISMISS_MIN_SEC}
                                   max={TREND_AUTO_DISMISS_MAX_SEC}
                                   step={1}
-                                  disabled={!trendAutoDismissEnabled}
+                                  disabled={!highUsageTrendEnabled || !trendAutoDismissEnabled}
                                   value={trendAutoDismissSec}
                                   onChange={(e) =>
                                     setTrendAutoDismissSec(
@@ -3664,7 +3868,7 @@ export default function App() {
                                   }
                                   aria-label="High Usage Trend Auto-Dismiss Timer Seconds"
                                   className={`w-full h-1.5 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none accent-amber-500 ${
-                                    trendAutoDismissEnabled
+                                    highUsageTrendEnabled && trendAutoDismissEnabled
                                       ? 'cursor-pointer'
                                       : 'opacity-45 cursor-not-allowed'
                                   }`}
@@ -3675,10 +3879,13 @@ export default function App() {
                                 {trendAutoDismissSec !== DEFAULT_TREND_AUTO_DISMISS_SEC && (
                                   <button
                                     type="button"
+                                    disabled={!highUsageTrendEnabled}
                                     onClick={() =>
                                       setTrendAutoDismissSec(DEFAULT_TREND_AUTO_DISMISS_SEC)
                                     }
-                                    className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 cursor-pointer ${
+                                    className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
                                       simDarkTheme
                                         ? 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
                                         : 'border-slate-200 bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -3695,10 +3902,10 @@ export default function App() {
                               </div>
                             </div>
 
-                            <div className="space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60">
+                            <div className={`space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60 transition-opacity ${highUsageTrendEnabled ? '' : 'opacity-50'}`}>
                               <div className="flex items-center justify-between gap-2 text-[11px]">
                                 <span className="font-medium inline-flex items-center gap-1">
-                                  {trendSoundEnabled ? (
+                                  {trendSoundEnabled && highUsageTrendEnabled ? (
                                     <Volume2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
                                   ) : (
                                     <VolumeX className="w-3.5 h-3.5 opacity-60 shrink-0" />
@@ -3712,8 +3919,11 @@ export default function App() {
                                 <div className="flex items-center gap-1.5">
                                   <button
                                     type="button"
+                                    disabled={!highUsageTrendEnabled}
                                     onClick={() => playHighUsageTrendChime(true)}
-                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors cursor-pointer ${
+                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
                                       simDarkTheme
                                         ? 'border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
                                         : 'border-slate-200 bg-slate-100 text-slate-700 hover:bg-slate-200'
@@ -3723,14 +3933,25 @@ export default function App() {
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => setTrendSoundEnabled((v) => !v)}
-                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors cursor-pointer ${
+                                    role="switch"
+                                    disabled={!highUsageTrendEnabled}
+                                    aria-checked={trendSoundEnabled}
+                                    aria-label={isZh ? '开启或关闭 High Usage Trend 提示音' : 'Toggle High Usage Trend Notification Sound'}
+                                    onClick={handleToggleTrendSound}
+                                    className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-mono text-[9.5px] border transition-colors ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
                                       trendSoundEnabled
                                         ? 'bg-emerald-600 border-emerald-500 text-white'
                                         : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-300'
                                     }`}
                                   >
-                                    {trendSoundEnabled ? 'ON' : 'MUTED'}
+                                    <span
+                                      className={`inline-block w-1.5 h-1.5 rounded-full ${
+                                        trendSoundEnabled ? 'bg-white' : 'bg-slate-400 dark:bg-zinc-500'
+                                      }`}
+                                    />
+                                    <span>{trendSoundEnabled ? 'ON' : 'MUTED'}</span>
                                   </button>
                                 </div>
                               </div>
@@ -4158,7 +4379,7 @@ export default function App() {
                       <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
                         {isZh ? `后台唤醒: ${bgWakeupCount} 次` : `BG Wakeups: ${bgWakeupCount}`}
                       </span>
-                      {highUsageTrendAlert && (
+                      {highUsageTrendEnabled && highUsageTrendAlert && (
                         <span className="inline-flex items-center gap-1 text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/50 animate-pulse">
                           <TrendingUp className="w-3 h-3" />
                           <span>
@@ -4192,11 +4413,11 @@ export default function App() {
               {devConsoleOpen && (
                 <div className="p-4 space-y-3">
                   {/* Developer Console Automated High Usage Trend Notification & Recent Trigger History */}
-                  {(highUsageTrendAlert || highUsageTrendOccurrences.length > 0) && (
+                  {((highUsageTrendEnabled && highUsageTrendAlert) || highUsageTrendOccurrences.length > 0) && (
                     <div
                       role="alert"
                       className={`rounded-xl border px-3.5 py-2.5 space-y-2.5 shadow-sm ${
-                        highUsageTrendAlert
+                        highUsageTrendEnabled && highUsageTrendAlert
                           ? 'border-rose-500/55 bg-gradient-to-r from-rose-950/75 via-red-950/60 to-amber-950/50'
                           : 'border-rose-500/30 bg-slate-950/85'
                       }`}
@@ -4205,7 +4426,7 @@ export default function App() {
                         <div className="flex items-start gap-2.5 min-w-0">
                           <div
                             className={`w-7 h-7 rounded-lg border flex items-center justify-center shrink-0 mt-0.5 ${
-                              highUsageTrendAlert
+                              highUsageTrendEnabled && highUsageTrendAlert
                                 ? 'bg-rose-500/20 border-rose-500/40 text-rose-300'
                                 : 'bg-rose-500/10 border-rose-500/25 text-rose-300/80'
                             }`}
@@ -4215,13 +4436,17 @@ export default function App() {
                           <div className="space-y-0.5 font-mono min-w-0">
                             <div className="text-xs font-bold text-rose-200 flex flex-wrap items-center gap-2">
                               <span>
-                                {highUsageTrendAlert
-                                  ? 'High Usage Trend'
-                                  : isZh
-                                    ? 'High Usage Trend · 近期触发历史'
-                                    : 'High Usage Trend · Recent Alert History'}
+                                {!highUsageTrendEnabled
+                                  ? isZh
+                                    ? 'High Usage Trend · 已全局关闭（历史记录）'
+                                    : 'High Usage Trend · Disabled (Historical Record)'
+                                  : highUsageTrendAlert
+                                    ? 'High Usage Trend'
+                                    : isZh
+                                      ? 'High Usage Trend · 近期触发历史'
+                                      : 'High Usage Trend · Recent Alert History'}
                               </span>
-                              {highUsageTrendAlert ? (
+                              {highUsageTrendEnabled && highUsageTrendAlert ? (
                                 <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-200 border border-rose-400/40">
                                   {isZh
                                     ? `5分钟窗口连续上升 ${highUsageTrendAlert.consecutiveIncreases} 次`
@@ -4229,12 +4454,16 @@ export default function App() {
                                 </span>
                               ) : (
                                 <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
-                                  {isZh
-                                    ? `已记录 ${highUsageTrendOccurrences.length} 次触发`
-                                    : `${highUsageTrendOccurrences.length} recorded trigger${highUsageTrendOccurrences.length === 1 ? '' : 's'}`}
+                                  {!highUsageTrendEnabled
+                                    ? isZh
+                                      ? `已全局禁用 · ${highUsageTrendOccurrences.length} 条记录`
+                                      : `DISABLED · ${highUsageTrendOccurrences.length} recorded`
+                                    : isZh
+                                      ? `已记录 ${highUsageTrendOccurrences.length} 次触发`
+                                      : `${highUsageTrendOccurrences.length} recorded trigger${highUsageTrendOccurrences.length === 1 ? '' : 's'}`}
                                 </span>
                               )}
-                              {highUsageTrendAlert && trendAutoDismissEnabled && trendAlertRemainingSec !== null && (
+                              {highUsageTrendEnabled && highUsageTrendAlert && trendAutoDismissEnabled && trendAlertRemainingSec !== null && (
                                 <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200 border border-amber-400/40 tabular-nums">
                                   <Clock className="w-3 h-3" />
                                   <span>
@@ -4246,13 +4475,17 @@ export default function App() {
                               )}
                             </div>
                             <div className="text-[11px] text-rose-100/90 break-words">
-                              {highUsageTrendAlert
+                              {!highUsageTrendEnabled
                                 ? isZh
-                                  ? `${highUsageTrendAlert.timeMs} · [${highUsageTrendAlert.sessionTag}] Energy Impact Score 在 ${highUsageTrendAlert.windowSec}s 内持续递增：${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore} (+${highUsageTrendAlert.delta.toFixed(2)} 分)`
-                                  : `${highUsageTrendAlert.timeMs} · [${highUsageTrendAlert.sessionTag}] Consecutive Battery Impact Score climb over ${highUsageTrendAlert.windowSec}s: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore} (+${highUsageTrendAlert.delta.toFixed(2)} pts)`
-                                : isZh
-                                  ? '当前实时告警已静默或自动消失；下方保留最近触发记录以便追溯。'
-                                  : 'Active alert banner dismissed; recent High Usage Trend trigger occurrences remain listed below.'}
+                                  ? 'High Usage Trend 全局告警已在设置中关闭；新的趋势检测与提示音已抑制，下方保留历史触发记录。'
+                                  : 'High Usage Trend alerts are globally disabled in Settings; new triggers and chimes are suppressed while prior history remains below.'
+                                : highUsageTrendAlert
+                                  ? isZh
+                                    ? `${highUsageTrendAlert.timeMs} · [${highUsageTrendAlert.sessionTag}] Energy Impact Score 在 ${highUsageTrendAlert.windowSec}s 内持续递增：${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore} (+${highUsageTrendAlert.delta.toFixed(2)} 分)`
+                                    : `${highUsageTrendAlert.timeMs} · [${highUsageTrendAlert.sessionTag}] Consecutive Battery Impact Score climb over ${highUsageTrendAlert.windowSec}s: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore} (+${highUsageTrendAlert.delta.toFixed(2)} pts)`
+                                  : isZh
+                                    ? '当前实时告警已静默或自动消失；下方保留最近触发记录以便追溯。'
+                                    : 'Active alert banner dismissed; recent High Usage Trend trigger occurrences remain listed below.'}
                             </div>
                           </div>
                         </div>
@@ -4266,7 +4499,7 @@ export default function App() {
                           )}
                           <button
                             type="button"
-                            onClick={() => setTrendSoundEnabled((v) => !v)}
+                            onClick={handleToggleTrendSound}
                             title={
                               isZh
                                 ? trendSoundEnabled
@@ -4359,6 +4592,31 @@ export default function App() {
                                   <option value="ALL">{isZh ? '全部时间' : 'All Time'}</option>
                                 </select>
                               </label>
+                              <button
+                                type="button"
+                                onClick={handleCopyTrendOccurrenceHistory}
+                                title={
+                                  isZh
+                                    ? '复制 High Usage Trend 触发快照与关联日志到剪贴板'
+                                    : 'Copy High Usage Trend alert snapshots and logs to clipboard'
+                                }
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-mono transition-colors cursor-pointer ${
+                                  trendHistoryCopied
+                                    ? 'border-emerald-500/50 bg-emerald-950/75 text-emerald-200'
+                                    : 'border-rose-500/35 bg-slate-900 hover:bg-slate-800 text-rose-100'
+                                }`}
+                              >
+                                {trendHistoryCopied ? (
+                                  <Check className="w-3 h-3 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3 h-3 text-rose-300" />
+                                )}
+                                <span>
+                                  {trendHistoryCopied
+                                    ? isZh ? '已复制' : 'Copied'
+                                    : isZh ? '复制到剪贴板' : 'Copy to Clipboard'}
+                                </span>
+                              </button>
                               <span className="text-[9.5px] text-slate-400 hidden sm:inline">
                                 {isZh ? '按时间倒序 · 最多 20 条' : 'Newest first · Max 20'}
                               </span>
@@ -4997,7 +5255,8 @@ export default function App() {
                             const latestTrendPoint =
                               highUsageTrendChartHistory[highUsageTrendChartHistory.length - 1];
                             const currentStreak = latestTrendPoint?.streak ?? 0;
-                            const isStreakAlert = currentStreak >= trendConsecutiveThreshold;
+                            const isStreakAlert =
+                              highUsageTrendEnabled && currentStreak >= trendConsecutiveThreshold;
                             return (
                               <div className="rounded-lg bg-slate-950/80 border border-rose-500/25 p-3 space-y-2">
                                 <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
@@ -5014,9 +5273,13 @@ export default function App() {
                                           : 'bg-slate-800 text-slate-300 border-slate-700'
                                       }`}
                                     >
-                                      {isZh
-                                        ? `连升 ${currentStreak}/${trendConsecutiveThreshold} 次`
-                                        : `Streak ${currentStreak}/${trendConsecutiveThreshold}x`}
+                                      {!highUsageTrendEnabled
+                                        ? isZh
+                                          ? `已关闭 · 连升 ${currentStreak}/${trendConsecutiveThreshold}`
+                                          : `Disabled · ${currentStreak}/${trendConsecutiveThreshold}x`
+                                        : isZh
+                                          ? `连升 ${currentStreak}/${trendConsecutiveThreshold} 次`
+                                          : `Streak ${currentStreak}/${trendConsecutiveThreshold}x`}
                                     </span>
                                   </div>
                                   <div className="flex flex-wrap items-center gap-3 text-[10px] font-mono text-slate-400">
