@@ -60,6 +60,7 @@ class QuotaSyncProvider : ContentProvider() {
         val zeroGuardCount: Int = 0,
         val linkAnomalyCount: Int = 0,
         val forceScanSeq: Long = 0L,
+        val resetTrendSeq: Long = 0L,
         val devLogsJson: String = "[]",
         val energyStatsJson: String = "{}"
     ) {
@@ -96,6 +97,7 @@ class QuotaSyncProvider : ContentProvider() {
                 putInt(KEY_ZERO_GUARD_COUNT, zeroGuardCount)
                 putInt(KEY_LINK_ANOMALY_COUNT, linkAnomalyCount)
                 putLong(KEY_FORCE_SCAN_SEQ, forceScanSeq)
+                putLong(KEY_RESET_TREND_SEQ, resetTrendSeq)
                 putString(KEY_DEV_LOGS_JSON, devLogsJson)
                 putString(KEY_ENERGY_STATS_JSON, energyStatsJson)
             }
@@ -133,6 +135,7 @@ class QuotaSyncProvider : ContentProvider() {
                     zeroGuardCount = bundle.getInt(KEY_ZERO_GUARD_COUNT, 0),
                     linkAnomalyCount = bundle.getInt(KEY_LINK_ANOMALY_COUNT, 0),
                     forceScanSeq = bundle.getLong(KEY_FORCE_SCAN_SEQ, 0L),
+                    resetTrendSeq = bundle.getLong(KEY_RESET_TREND_SEQ, 0L),
                     devLogsJson = bundle.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]",
                     energyStatsJson = bundle.getString(KEY_ENERGY_STATS_JSON, "{}") ?: "{}"
                 )
@@ -268,6 +271,12 @@ class QuotaSyncProvider : ContentProvider() {
                     updated.toBundle()
                 }
 
+                METHOD_RESET_TREND_HISTORY -> {
+                    val updated = resetTrendAlertHistoryLocal(appCtx)
+                    HookTelemetryReceiver.notifyUiListeners()
+                    updated.toBundle()
+                }
+
                 METHOD_PUT_ENERGY_STATS -> {
                     val energyJson = extras?.getString(KEY_ENERGY_STATS_JSON) ?: "{}"
                     val updated = mutateLocalStore(appCtx = appCtx, energyStatsJson = energyJson)
@@ -355,6 +364,7 @@ class QuotaSyncProvider : ContentProvider() {
         const val METHOD_APPEND_DEV_EVENT = "append_dev_event"
         const val METHOD_CLEAR_DEV_EVENTS = "clear_dev_events"
         const val METHOD_REQUEST_FULL_SCAN = "request_full_scan"
+        const val METHOD_RESET_TREND_HISTORY = "reset_trend_history"
         const val METHOD_PUT_ENERGY_STATS = "put_energy_stats"
 
         const val KEY_FIVE = "five"
@@ -388,6 +398,7 @@ class QuotaSyncProvider : ContentProvider() {
         const val KEY_ZERO_GUARD_COUNT = "zero_guard_count"
         const val KEY_LINK_ANOMALY_COUNT = "link_anomaly_count"
         const val KEY_FORCE_SCAN_SEQ = "force_scan_seq"
+        const val KEY_RESET_TREND_SEQ = "reset_trend_seq"
         const val KEY_DEV_LOGS_JSON = "dev_logs_json"
         const val KEY_DEV_EVENT_JSON = "dev_event_json"
         const val KEY_ENERGY_STATS_JSON = "energy_stats_json"
@@ -457,6 +468,7 @@ class QuotaSyncProvider : ContentProvider() {
                     zeroGuardCount = prefs.getInt(KEY_ZERO_GUARD_COUNT, 0),
                     linkAnomalyCount = prefs.getInt(KEY_LINK_ANOMALY_COUNT, 0),
                     forceScanSeq = prefs.getLong(KEY_FORCE_SCAN_SEQ, 0L),
+                    resetTrendSeq = prefs.getLong(KEY_RESET_TREND_SEQ, 0L),
                     devLogsJson = prefs.getString(KEY_DEV_LOGS_JSON, "[]") ?: "[]",
                     energyStatsJson = prefs.getString(KEY_ENERGY_STATS_JSON, "{}") ?: "{}"
                 )
@@ -1073,6 +1085,55 @@ class QuotaSyncProvider : ContentProvider() {
                     context.contentResolver.call(AUTHORITY_URI, METHOD_CLEAR_DEV_EVENTS, null, null)
                 }
             } catch (_: Throwable) {
+            }
+        }
+
+        @Synchronized
+        internal fun resetTrendAlertHistoryLocal(appCtx: Context): UnifiedState {
+            val prev = ensureLoaded(appCtx)
+            val nextSeq = maxOf(prev.resetTrendSeq + 1L, System.currentTimeMillis())
+            val nextEnergyJson = try {
+                val obj = JSONObject(prev.energyStatsJson.ifBlank { "{}" })
+                obj.put("highUsageTrendActive", false)
+                obj.put("trendConsecutiveIncreases", 0)
+                obj.put("trendWindowDelta", 0.0)
+                obj.put("lastTrendAlertAtMs", 0L)
+                obj.toString()
+            } catch (_: Throwable) {
+                prev.energyStatsJson
+            }
+            val next = prev.copy(
+                resetTrendSeq = nextSeq,
+                energyStatsJson = nextEnergyJson
+            )
+            cachedState.set(next)
+            try {
+                appCtx.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putLong(KEY_RESET_TREND_SEQ, nextSeq)
+                    .putString(KEY_ENERGY_STATS_JSON, nextEnergyJson)
+                    .apply()
+            } catch (_: Throwable) {
+            }
+            try {
+                appCtx.contentResolver.notifyChange(STATE_URI, null)
+            } catch (_: Throwable) {
+            }
+            return next
+        }
+
+        fun resetTrendAlertHistory(context: Context): UnifiedState? {
+            return try {
+                if (isInModuleProcess(context)) {
+                    val updated = resetTrendAlertHistoryLocal(context.applicationContext ?: context)
+                    HookTelemetryReceiver.notifyUiListeners()
+                    updated
+                } else {
+                    val reply = context.contentResolver.call(AUTHORITY_URI, METHOD_RESET_TREND_HISTORY, null, null)
+                    UnifiedState.fromBundle(reply)
+                }
+            } catch (_: Throwable) {
+                null
             }
         }
     }

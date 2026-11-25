@@ -435,6 +435,7 @@ object QuotaCoreEngine {
     private val outboundFramesLock = Any()
     private val recentOutboundFrames = ArrayList<OutboundProtocolFrameTrace>(16)
     private val lastHandledForceScanSeq = AtomicLong(0L)
+    private val lastHandledResetTrendSeq = AtomicLong(0L)
     @Volatile private var activeSettingsTraceRef: WeakReference<TextView> = WeakReference(null)
     @Volatile private var activeSettingsQuotaRef: WeakReference<TextView> = WeakReference(null)
     @Volatile private var showEnergyImpactStatsInDialog: Boolean = true
@@ -666,6 +667,27 @@ object QuotaCoreEngine {
                     eventCount = snap.optLong("fgDispatches", 0L).toInt()
                 )
             }
+        }
+
+        fun resetTrendAlertHistory(reason: String = "USER_RESET") {
+            val nowMs = System.currentTimeMillis()
+            val curScore = computeRawEnergyScoreRounded()
+            synchronized(logLock) {
+                trendSamples.clear()
+                trendSamples.add(Pair(nowMs, curScore))
+                highUsageTrendActive = false
+                trendConsecutiveIncreases = 0
+                trendStartScore = curScore
+                trendCurrentScore = curScore
+                trendWindowDelta = 0.0
+                lastTrendAlertAtMs = 0L
+                lastTrendAlertedStreak = 0
+                val msg = "[Trend Alert History Reset] Cleared 5-min streak counter at score=$curScore ($reason)"
+                if (ringLogs.size >= 30) ringLogs.removeAt(0)
+                ringLogs.add("${formatTimestampMs(nowMs)} $msg")
+            }
+            val ctx = appContext ?: return
+            QuotaSyncProvider.publishEnergyStats(ctx, computeSnapshot().toString())
         }
 
         private fun computeRawEnergyScoreRounded(): Double {
@@ -7465,6 +7487,10 @@ object QuotaCoreEngine {
             if (handledSeq > lastHandledForceScanSeq.get()) {
                 lastHandledForceScanSeq.set(handledSeq)
             }
+            val handledResetTrendSeq = prefs.getLong("last_handled_reset_trend_seq", 0L)
+            if (handledResetTrendSeq > lastHandledResetTrendSeq.get()) {
+                lastHandledResetTrendSeq.set(handledResetTrendSeq)
+            }
 
             val clean = QuotaHudView.Snapshot(
                 fiveHourQuota = prefs.getString("five", "--") ?: "--",
@@ -7652,6 +7678,17 @@ object QuotaCoreEngine {
             } catch (_: Throwable) {
             }
             runForegroundFullProtocolDiagnostic("MAIN_ACTIVITY_SETTINGS")
+        }
+        if (state.resetTrendSeq > 0L && state.resetTrendSeq > lastHandledResetTrendSeq.get()) {
+            lastHandledResetTrendSeq.set(state.resetTrendSeq)
+            try {
+                appContext?.getSharedPreferences(QuotaTextParser.PREFS_NAME, Context.MODE_PRIVATE)
+                    ?.edit()
+                    ?.putLong("last_handled_reset_trend_seq", state.resetTrendSeq)
+                    ?.apply()
+            } catch (_: Throwable) {
+            }
+            EnergyImpactMonitor.resetTrendAlertHistory("MAIN_ACTIVITY_RESET")
         }
     }
 

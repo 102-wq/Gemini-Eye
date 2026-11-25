@@ -16,6 +16,7 @@ import {
   FolderGit2,
   Moon,
   RefreshCw,
+  RotateCcw,
   Search,
   Send,
   ShieldCheck,
@@ -24,6 +25,8 @@ import {
   Trash2,
   TrendingUp,
   UserCheck,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import {
   CartesianGrid,
@@ -338,6 +341,23 @@ function loadPersistedTrendAutoDismissEnabled(): boolean {
   }
 }
 
+const TREND_SOUND_ENABLED_STORAGE_KEY = 'gemini_eye_trend_sound_enabled';
+
+function loadPersistedTrendSoundEnabled(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return true;
+    }
+    const raw = window.localStorage.getItem(TREND_SOUND_ENABLED_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return true;
+    }
+    return raw !== 'false';
+  } catch {
+    return true;
+  }
+}
+
 export default function App() {
   const [uiLang, setUiLang] = useState<UiLang>('zh');
   const [hudLang, setHudLang] = useState<UiLang>('zh');
@@ -354,6 +374,9 @@ export default function App() {
   );
   const [trendAutoDismissSec, setTrendAutoDismissSec] = useState<number>(() =>
     loadPersistedTrendAutoDismissSec()
+  );
+  const [trendSoundEnabled, setTrendSoundEnabled] = useState<boolean>(() =>
+    loadPersistedTrendSoundEnabled()
   );
   const [trendAlertRemainingSec, setTrendAlertRemainingSec] = useState<number | null>(null);
   const [activeView, setActiveView] = useState<ActiveView>('simulator');
@@ -442,6 +465,9 @@ export default function App() {
   );
   const trendConsecutiveThresholdRef = useRef<number>(trendConsecutiveThreshold);
   trendConsecutiveThresholdRef.current = trendConsecutiveThreshold;
+  const trendSoundEnabledRef = useRef<boolean>(trendSoundEnabled);
+  trendSoundEnabledRef.current = trendSoundEnabled;
+  const audioContextRef = useRef<AudioContext | null>(null);
   const highUsageTrendAlertedStreakRef = useRef<number>(0);
   const fullEnergyTimelineRef = useRef<EnergyTimelineEntry[]>([
     {
@@ -1001,6 +1027,16 @@ export default function App() {
   }, [highUsageTrendAlert, trendAutoDismissEnabled, trendAutoDismissSec]);
 
   useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(TREND_SOUND_ENABLED_STORAGE_KEY, String(trendSoundEnabled));
+      }
+    } catch {
+      // Ignore storage quota or sandbox restrictions
+    }
+  }, [trendSoundEnabled]);
+
+  useEffect(() => {
     if (typeof window === 'undefined') return;
     const handleStorageSync = (e: StorageEvent) => {
       if (e.key === HIGH_BATTERY_THRESHOLD_STORAGE_KEY && e.newValue !== null) {
@@ -1011,11 +1047,73 @@ export default function App() {
         setTrendAutoDismissSec(clampTrendAutoDismissSec(Number(e.newValue)));
       } else if (e.key === TREND_AUTO_DISMISS_ENABLED_STORAGE_KEY && e.newValue !== null) {
         setTrendAutoDismissEnabled(e.newValue !== 'false');
+      } else if (e.key === TREND_SOUND_ENABLED_STORAGE_KEY && e.newValue !== null) {
+        setTrendSoundEnabled(e.newValue !== 'false');
       }
     };
     window.addEventListener('storage', handleStorageSync);
     return () => window.removeEventListener('storage', handleStorageSync);
   }, []);
+
+  const playHighUsageTrendChime = (forcePlay = false) => {
+    if (!forcePlay && !trendSoundEnabledRef.current) return;
+    if (typeof window === 'undefined') return;
+    try {
+      const AudioCtxCtor =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtxCtor) return;
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        audioContextRef.current = new AudioCtxCtor();
+      }
+      const ctx = audioContextRef.current;
+      if (ctx.state === 'suspended') {
+        void ctx.resume().catch(() => {});
+      }
+
+      const now = ctx.currentTime;
+      const playSoftNote = (freq: number, startOffsetSec: number, durationSec: number, peakGain: number, wave: OscillatorType) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = wave;
+        osc.frequency.setValueAtTime(freq, now + startOffsetSec);
+
+        gain.gain.setValueAtTime(0.0001, now + startOffsetSec);
+        gain.gain.linearRampToValueAtTime(peakGain, now + startOffsetSec + 0.018);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + startOffsetSec + durationSec);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + startOffsetSec);
+        osc.stop(now + startOffsetSec + durationSec + 0.02);
+      };
+
+      // Subtle two-tone awareness chime (D5 -> G5), low gain to stay non-intrusive
+      playSoftNote(587.33, 0, 0.14, 0.055, 'sine');
+      playSoftNote(783.99, 0.09, 0.22, 0.048, 'triangle');
+    } catch {
+      // Ignore Web Audio API restrictions in sandboxed/headless environments
+    }
+  };
+
+  const handleResetTrendAlertHistory = () => {
+    const nowTs = Date.now();
+    const baselineScore = Math.round(latestEnergyScoreRef.current * 100) / 100;
+    const minStreak = clampTrendConsecutiveThreshold(trendConsecutiveThresholdRef.current);
+    const resetBaseline = [{ ts: nowTs, score: baselineScore, event: 'STREAK_RESET' }];
+
+    energyTrendWindowRef.current = resetBaseline;
+    highUsageTrendAlertedStreakRef.current = 0;
+    setHighUsageTrendChartHistory(buildTrendWindowChartSeries(resetBaseline, minStreak));
+    setTrendAlertRemainingSec(null);
+    setHighUsageTrendAlert(null);
+
+    const sess = activeSessionRef.current.sessionTag;
+    const msgEn = `[Trend Alert History Reset] Cleared 5-min rolling streak counter at baseline ${baselineScore} without changing global thresholds (>=${minStreak}x / High >=${highBatteryImpactThreshold}).`;
+    const msgZh = `[趋势告警历史已重置] 已清空 5 分钟滑动窗口连升计数（当前基准 ${baselineScore}），全局阈值 (>=${minStreak}x / 高能耗 >=${highBatteryImpactThreshold}) 保持不变。`;
+    logDevEvent('BATTERY_IMPACT', sess, msgZh, msgEn, 'info');
+    setLastSyncNote(isZhRef.current ? msgZh : msgEn);
+  };
 
   const evaluateBatteryUsageTrendWindow = (curScore: number, eventName: string) => {
     const minStreak = trendConsecutiveThresholdRef.current;
@@ -1081,6 +1179,7 @@ export default function App() {
       highUsageTrendAlertedStreakRef.current = consecutiveIncreases;
       setBatteryImpactCount((c) => c + 1);
       setDevConsoleOpen(true);
+      playHighUsageTrendChime();
 
       const trendMsgEn = `[High Usage Trend] Detected ${consecutiveIncreases} consecutive Battery Impact Score increases within 5-min rolling window (${windowSec}s span): ${startSample.score} -> ${curScore} (+${delta.toFixed(2)} pts, session=${sess})`;
       const trendMsgZh = `[High Usage Trend · 持续高功耗趋势] 5 分钟滑动窗口内检测到连续 ${consecutiveIncreases} 次 Battery Impact Score 上升（耗时 ${windowSec}s）：${startSample.score} -> ${curScore} (+${delta.toFixed(2)} 分，会话=${sess})`;
@@ -3351,6 +3450,52 @@ export default function App() {
                                   : 'Auto-removes console alert after timeout · Saved to localStorage'}
                               </div>
                             </div>
+
+                            <div className="space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60">
+                              <div className="flex items-center justify-between gap-2 text-[11px]">
+                                <span className="font-medium inline-flex items-center gap-1">
+                                  {trendSoundEnabled ? (
+                                    <Volume2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                                  ) : (
+                                    <VolumeX className="w-3.5 h-3.5 opacity-60 shrink-0" />
+                                  )}
+                                  <span>
+                                    {isZh
+                                      ? 'Trend 告警提示音 (Web Audio)'
+                                      : 'Trend Alert Sound (Web Audio)'}
+                                  </span>
+                                </span>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => playHighUsageTrendChime(true)}
+                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors cursor-pointer ${
+                                      simDarkTheme
+                                        ? 'border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+                                        : 'border-slate-200 bg-slate-100 text-slate-700 hover:bg-slate-200'
+                                    }`}
+                                  >
+                                    {isZh ? '试听' : 'Test'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setTrendSoundEnabled((v) => !v)}
+                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors cursor-pointer ${
+                                      trendSoundEnabled
+                                        ? 'bg-emerald-600 border-emerald-500 text-white'
+                                        : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-300'
+                                    }`}
+                                  >
+                                    {trendSoundEnabled ? 'ON' : 'MUTED'}
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="text-[9.5px] opacity-65 font-mono">
+                                {isZh
+                                  ? '触发 High Usage Trend 时播放柔和双音提示 · 已保存至 localStorage'
+                                  : 'Subtle Web Audio chime on High Usage Trend · Saved to localStorage'}
+                              </div>
+                            </div>
                           </div>
 
                           <div className="pt-1.5 border-t border-slate-200/60 dark:border-zinc-700/70 space-y-1.5">
@@ -3838,13 +3983,53 @@ export default function App() {
                           </div>
                         </div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setHighUsageTrendAlert(null)}
-                        className="px-2.5 py-1 text-[10px] font-medium rounded-md bg-rose-900/60 hover:bg-rose-800/80 text-rose-100 border border-rose-700/60 shrink-0 cursor-pointer"
-                      >
-                        {isZh ? '确认忽略' : 'Dismiss'}
-                      </button>
+                      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setTrendSoundEnabled((v) => !v)}
+                          title={
+                            isZh
+                              ? trendSoundEnabled
+                                ? '点击静音 High Usage Trend 提示音'
+                                : '点击开启 High Usage Trend 提示音'
+                              : trendSoundEnabled
+                                ? 'Mute High Usage Trend chime'
+                                : 'Unmute High Usage Trend chime'
+                          }
+                          className={`inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded-md border shrink-0 cursor-pointer transition-colors ${
+                            trendSoundEnabled
+                              ? 'bg-emerald-950/60 hover:bg-emerald-900/70 text-emerald-200 border-emerald-700/60'
+                              : 'bg-slate-900/70 hover:bg-slate-800 text-slate-300 border-slate-700/70'
+                          }`}
+                        >
+                          {trendSoundEnabled ? (
+                            <Volume2 className="w-3 h-3" />
+                          ) : (
+                            <VolumeX className="w-3 h-3" />
+                          )}
+                          <span>{trendSoundEnabled ? (isZh ? '提示音开' : 'Sound On') : (isZh ? '已静音' : 'Muted')}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleResetTrendAlertHistory}
+                          title={
+                            isZh
+                              ? '清空连升计数并静默当前持久告警（不修改全局阈值）'
+                              : 'Clear streak counter and silence alert without modifying global thresholds'
+                          }
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-medium rounded-md bg-amber-900/65 hover:bg-amber-800/80 text-amber-100 border border-amber-600/60 shrink-0 cursor-pointer transition-colors"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>{isZh ? '重置告警历史' : 'Reset Alert History'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setHighUsageTrendAlert(null)}
+                          className="px-2.5 py-1 text-[10px] font-medium rounded-md bg-rose-900/60 hover:bg-rose-800/80 text-rose-100 border border-rose-700/60 shrink-0 cursor-pointer transition-colors"
+                        >
+                          {isZh ? '确认忽略' : 'Dismiss'}
+                        </button>
+                      </div>
                     </div>
                   )}
 

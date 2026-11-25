@@ -53,6 +53,7 @@ class MainActivity : Activity() {
     private var engineDescView: TextView? = null
     private var devConsoleTitleView: TextView? = null
     private var devConsoleCountView: TextView? = null
+    private var devConsoleResetTrendBtn: Button? = null
     private var devConsoleClearBtn: Button? = null
     private var devConsoleLogsView: TextView? = null
     private var energyCardTitleView: TextView? = null
@@ -292,6 +293,10 @@ class MainActivity : Activity() {
             "Zero-Guard: $zeroCount | Anomaly: $anomalyCount | Energy: $batteryCount"
         }
         devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
+        devConsoleResetTrendBtn?.apply {
+            text = if (zh) "重置告警历史" else "Reset Alert History"
+            visibility = if (hasHighUsageTrend || trendStreak > 0) View.VISIBLE else View.GONE
+        }
         devConsoleLogsView?.text = buildString {
             if (hasHighUsageTrend) {
                 val countdownHint = if (remainingAutoDismissSec != null) {
@@ -875,6 +880,28 @@ class MainActivity : Activity() {
         }
         devConsoleCountView = devCount
 
+        val devResetTrend = Button(this).apply {
+            isAllCaps = false
+            setTextColor(Color.parseColor("#FDE68A"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            background = makeBtnDrawable("#78350F", "#F59E0B")
+            setPadding(dp(8f), dp(4f), dp(8f), dp(4f))
+            minimumHeight = 0
+            minHeight = dp(28f)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginEnd = dp(6f)
+            }
+            visibility = View.GONE
+            setOnClickListener {
+                QuotaSyncProvider.resetTrendAlertHistory(this@MainActivity)
+                refreshAllUi()
+            }
+        }
+        devConsoleResetTrendBtn = devResetTrend
+
         val devClear = Button(this).apply {
             isAllCaps = false
             setTextColor(Color.parseColor("#CBD5E1"))
@@ -892,6 +919,7 @@ class MainActivity : Activity() {
 
         devHeaderRow.addView(devTitle)
         devHeaderRow.addView(devCount)
+        devHeaderRow.addView(devResetTrend)
         devHeaderRow.addView(devClear)
 
         val devLogsTv = TextView(this).apply {
