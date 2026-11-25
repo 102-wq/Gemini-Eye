@@ -1098,6 +1098,7 @@ class QuotaSyncProvider : ContentProvider() {
                 obj.put("trendConsecutiveIncreases", 0)
                 obj.put("trendWindowDelta", 0.0)
                 obj.put("lastTrendAlertAtMs", 0L)
+                obj.put("trendAlertHistory", JSONArray())
                 obj.toString()
             } catch (_: Throwable) {
                 prev.energyStatsJson

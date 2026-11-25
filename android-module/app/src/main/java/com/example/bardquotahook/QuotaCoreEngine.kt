@@ -496,6 +496,7 @@ object QuotaCoreEngine {
         private val logLock = Any()
         private val ringLogs = ArrayList<String>(32)
         private val trendSamples = ArrayList<Pair<Long, Double>>(32)
+        private val trendAlertOccurrences = ArrayList<JSONObject>(20)
         private val maWindow = ArrayList<Double>(MA_WINDOW_SIZE)
         private val timelineHistory = ArrayList<EnergyTimelineSample>(256)
         @Volatile private var smoothedEnergyScore: Double = 0.0
@@ -637,6 +638,19 @@ object QuotaCoreEngine {
                     if (streak > lastTrendAlertedStreak) {
                         lastTrendAlertedStreak = streak
                         shouldEmitWarn = true
+                        if (trendAlertOccurrences.size >= 20) trendAlertOccurrences.removeAt(0)
+                        trendAlertOccurrences.add(
+                            JSONObject().apply {
+                                put("ts", nowMs)
+                                put("streak", streak)
+                                put("threshold", minConsecutive)
+                                put("startScore", startScore)
+                                put("curScore", curScore)
+                                put("delta", delta)
+                                put("session", sessionTag)
+                                put("reason", reason)
+                            }
+                        )
                         val warnMsg = "[High Usage Trend] $streak consecutive battery score increases in 5-min window (threshold>=$minConsecutive): $startScore -> $curScore (+$delta pts, reason=$reason, session=$sessionTag)"
                         if (ringLogs.size >= 30) ringLogs.removeAt(0)
                         ringLogs.add("${formatTimestampMs(nowMs)} $warnMsg")
@@ -675,6 +689,7 @@ object QuotaCoreEngine {
             synchronized(logLock) {
                 trendSamples.clear()
                 trendSamples.add(Pair(nowMs, curScore))
+                trendAlertOccurrences.clear()
                 highUsageTrendActive = false
                 trendConsecutiveIncreases = 0
                 trendStartScore = curScore
@@ -862,6 +877,13 @@ object QuotaCoreEngine {
                 put("poolSize", poolSize)
                 put("lastSurgeDelta", lastSurgeDelta)
                 put("lastSurgeAtMs", lastSurgeAtMs)
+                val trendHistoryArr = JSONArray()
+                synchronized(logLock) {
+                    for (i in trendAlertOccurrences.size - 1 downTo 0) {
+                        trendHistoryArr.put(trendAlertOccurrences[i])
+                    }
+                }
+                put("trendAlertHistory", trendHistoryArr)
                 put("highUsageTrendActive", trendStillVisible)
                 put("trendConsecutiveIncreases", trendConsecutiveIncreases)
                 put("trendStartScore", trendStartScore)

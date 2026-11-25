@@ -285,6 +285,7 @@ class MainActivity : Activity() {
         val trendStart = energyObj.optDouble("trendStartScore", 0.0)
         val trendCur = energyObj.optDouble("trendCurrentScore", 0.0)
         val trendDelta = energyObj.optDouble("trendWindowDelta", 0.0)
+        val trendHistoryArr = energyObj.optJSONArray("trendAlertHistory")
 
         devConsoleTitleView?.text = if (zh) "开发者控制台 (Dev Console)" else "Developer Console"
         devConsoleCountView?.text = if (zh) {
@@ -295,7 +296,7 @@ class MainActivity : Activity() {
         devConsoleClearBtn?.text = if (zh) "清空" else "Clear"
         devConsoleResetTrendBtn?.apply {
             text = if (zh) "重置告警历史" else "Reset Alert History"
-            visibility = if (hasHighUsageTrend || trendStreak > 0) View.VISIBLE else View.GONE
+            visibility = if (hasHighUsageTrend || trendStreak > 0 || (trendHistoryArr != null && trendHistoryArr.length() > 0)) View.VISIBLE else View.GONE
         }
         devConsoleLogsView?.text = buildString {
             if (hasHighUsageTrend) {
@@ -305,10 +306,29 @@ class MainActivity : Activity() {
                     ""
                 }
                 if (zh) {
-                    append("⚠ High Usage Trend · 5分钟滑动窗口连续上升 $trendStreak 次 ($trendStart -> $trendCur, +$trendDelta 分)$countdownHint\n\n")
+                    append("⚠ High Usage Trend · 5分钟滑动窗口连续上升 $trendStreak 次 ($trendStart -> $trendCur, +$trendDelta 分)$countdownHint\n")
                 } else {
-                    append("⚠ High Usage Trend · $trendStreak consecutive increases in 5m window ($trendStart -> $trendCur, +$trendDelta pts)$countdownHint\n\n")
+                    append("⚠ High Usage Trend · $trendStreak consecutive increases in 5m window ($trendStart -> $trendCur, +$trendDelta pts)$countdownHint\n")
                 }
+            }
+            if (trendHistoryArr != null && trendHistoryArr.length() > 0) {
+                val count = trendHistoryArr.length()
+                append(if (zh) "  近期触发历史 ($count 条):\n" else "  Recent Alert Occurrences ($count):\n")
+                val limit = minOf(count, 8)
+                for (idx in 0 until limit) {
+                    val item = trendHistoryArr.optJSONObject(idx) ?: continue
+                    val ts = formatLogTime(item.optLong("ts", 0L))
+                    val st = item.optInt("streak", 0)
+                    val th = item.optInt("threshold", state.trendConsecutiveThreshold)
+                    val s0 = item.optDouble("startScore", 0.0)
+                    val s1 = item.optDouble("curScore", 0.0)
+                    val d = item.optDouble("delta", 0.0)
+                    val r = item.optString("reason", "SAMPLE")
+                    append("   • $ts · ${st}x>=$th · $s0->$s1 (+$d) [$r]\n")
+                }
+                append('\n')
+            } else if (hasHighUsageTrend) {
+                append('\n')
             }
             if (entries.isEmpty()) {
                 if (zh) {
