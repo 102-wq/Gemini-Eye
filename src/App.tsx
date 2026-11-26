@@ -13,7 +13,9 @@ import {
   ExternalLink,
   FileCode,
   FileText,
+  Filter,
   FolderGit2,
+  Mail,
   Moon,
   RefreshCw,
   RotateCcw,
@@ -29,9 +31,12 @@ import {
   VolumeX,
 } from 'lucide-react';
 import {
+  Area,
   CartesianGrid,
+  ComposedChart,
   Line,
   LineChart,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
@@ -44,7 +49,7 @@ import { buildZipBlob } from './zipBuilder';
 type UiLang = 'zh' | 'en';
 type HudTheme = 'MIUIX' | 'MD3';
 type HudDockEdge = 'NONE' | 'LEFT' | 'RIGHT';
-type ActiveView = 'simulator' | 'files' | 'spec';
+type ActiveView = 'simulator' | 'trend_analysis' | 'files' | 'spec';
 type DevEventType =
   | 'APP_OPEN'
   | 'QUERY_SENT'
@@ -250,14 +255,15 @@ interface TrendWindowChartPoint {
 
 function buildTrendWindowChartSeries(
   samples: Array<{ ts: number; score: number; event: string }>,
-  alertStreakThreshold = 3
+  alertStreakThreshold = 3,
+  minScoreDelta = 0.1
 ): TrendWindowChartPoint[] {
   const pad = (n: number) => String(n).padStart(2, '0');
   let runningStreak = 0;
   return samples.map((sample, idx) => {
     const prev = idx > 0 ? samples[idx - 1] : null;
     const deltaFromPrev = prev ? Math.round((sample.score - prev.score) * 100) / 100 : 0;
-    if (prev && sample.score > prev.score) {
+    if (prev && deltaFromPrev >= minScoreDelta) {
       runningStreak += 1;
     } else {
       runningStreak = 0;
@@ -453,6 +459,33 @@ function loadPersistedTrendConsecutiveThreshold(): number {
   }
 }
 
+const DEFAULT_TREND_MIN_DELTA = 0.1;
+const TREND_MIN_DELTA_MIN = 0.05;
+const TREND_MIN_DELTA_MAX = 5.0;
+const TREND_MIN_DELTA_STEP = 0.05;
+const TREND_MIN_DELTA_STORAGE_KEY = 'gemini_eye_trend_min_delta';
+
+function clampTrendMinDelta(val: number): number {
+  if (!Number.isFinite(val)) return DEFAULT_TREND_MIN_DELTA;
+  const clamped = Math.min(TREND_MIN_DELTA_MAX, Math.max(TREND_MIN_DELTA_MIN, val));
+  return Math.round(clamped * 100) / 100;
+}
+
+function loadPersistedTrendMinDelta(): number {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return DEFAULT_TREND_MIN_DELTA;
+    }
+    const raw = window.localStorage.getItem(TREND_MIN_DELTA_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return DEFAULT_TREND_MIN_DELTA;
+    }
+    return clampTrendMinDelta(Number(raw));
+  } catch {
+    return DEFAULT_TREND_MIN_DELTA;
+  }
+}
+
 const DEFAULT_TREND_AUTO_DISMISS_SEC = 15;
 const TREND_AUTO_DISMISS_MIN_SEC = 5;
 const TREND_AUTO_DISMISS_MAX_SEC = 60;
@@ -495,6 +528,55 @@ function loadPersistedTrendAutoDismissEnabled(): boolean {
 }
 
 const TREND_SOUND_ENABLED_STORAGE_KEY = 'gemini_eye_trend_sound_enabled';
+const TREND_SOUND_TONE_STORAGE_KEY = 'gemini_eye_trend_sound_tone';
+
+type TrendSoundTone = 'soft_chime' | 'triple_arp' | 'amber_pulse' | 'telemetry_ping';
+
+const TREND_SOUND_TONE_OPTIONS: Array<{
+  id: TrendSoundTone;
+  labelEn: string;
+  labelZh: string;
+  descEn: string;
+  descZh: string;
+}> = [
+  {
+    id: 'soft_chime',
+    labelEn: 'Soft Dual Chime (Default)',
+    labelZh: '柔和双音 (默认)',
+    descEn: 'D5 -> G5 gentle sine/triangle',
+    descZh: 'D5 -> G5 柔和正弦/三角波',
+  },
+  {
+    id: 'triple_arp',
+    labelEn: 'Crystal Tri-Chime',
+    labelZh: '清脆三连音',
+    descEn: 'C5 -> E5 -> A5 ascending chime',
+    descZh: 'C5 -> E5 -> A5 阶梯清脆提示音',
+  },
+  {
+    id: 'amber_pulse',
+    labelEn: 'Amber Alert Pulse',
+    labelZh: '警示双脉冲',
+    descEn: 'A4 -> D5 -> A4 warm pulse',
+    descZh: 'A4 -> D5 -> A4 温暖警示脉冲',
+  },
+  {
+    id: 'telemetry_ping',
+    labelEn: 'Telemetry Sonar Ping',
+    labelZh: '遥测雷达短鸣',
+    descEn: 'E6 -> B5 crisp instrumentation ping',
+    descZh: 'E6 -> B5 高频仪器短鸣',
+  },
+];
+
+function isTrendSoundTone(value: string): value is TrendSoundTone {
+  return (
+    value === 'soft_chime' ||
+    value === 'triple_arp' ||
+    value === 'amber_pulse' ||
+    value === 'telemetry_ping'
+  );
+}
 
 function loadPersistedTrendSoundEnabled(): boolean {
   try {
@@ -508,6 +590,21 @@ function loadPersistedTrendSoundEnabled(): boolean {
     return raw !== 'false';
   } catch {
     return true;
+  }
+}
+
+function loadPersistedTrendSoundTone(): TrendSoundTone {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return 'soft_chime';
+    }
+    const raw = window.localStorage.getItem(TREND_SOUND_TONE_STORAGE_KEY);
+    if (raw && isTrendSoundTone(raw)) {
+      return raw;
+    }
+    return 'soft_chime';
+  } catch {
+    return 'soft_chime';
   }
 }
 
@@ -528,6 +625,53 @@ function loadPersistedHighUsageTrendEnabled(): boolean {
   }
 }
 
+const TREND_EMAIL_ENABLED_STORAGE_KEY = 'gemini_eye_trend_email_enabled';
+const TREND_EMAIL_RECIPIENT_STORAGE_KEY = 'gemini_eye_trend_email_recipient';
+
+function loadPersistedTrendEmailEnabled(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return false;
+    }
+    const raw = window.localStorage.getItem(TREND_EMAIL_ENABLED_STORAGE_KEY);
+    if (raw === null || raw.trim() === '') {
+      return false;
+    }
+    return raw === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function loadPersistedTrendEmailRecipient(): string {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return '';
+    }
+    return window.localStorage.getItem(TREND_EMAIL_RECIPIENT_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+interface TrendEmailReportEntry {
+  id: string;
+  recipient: string;
+  subject: string;
+  bodyText: string;
+  sentAtMs: number;
+  timeMs: string;
+  consecutiveIncreases: number;
+  thresholdAtTrigger: number;
+  startScore: number;
+  curScore: number;
+  delta: number;
+  windowSec: number;
+  sessionTag: string;
+  events: string[];
+  isTest: boolean;
+}
+
 export default function App() {
   const [uiLang, setUiLang] = useState<UiLang>('zh');
   const [hudLang, setHudLang] = useState<UiLang>('zh');
@@ -542,6 +686,7 @@ export default function App() {
   const [trendConsecutiveThreshold, setTrendConsecutiveThreshold] = useState<number>(() =>
     loadPersistedTrendConsecutiveThreshold()
   );
+  const [trendMinDelta, setTrendMinDelta] = useState<number>(() => loadPersistedTrendMinDelta());
   const [trendAutoDismissEnabled, setTrendAutoDismissEnabled] = useState<boolean>(() =>
     loadPersistedTrendAutoDismissEnabled()
   );
@@ -551,6 +696,18 @@ export default function App() {
   const [trendSoundEnabled, setTrendSoundEnabled] = useState<boolean>(() =>
     loadPersistedTrendSoundEnabled()
   );
+  const [trendSoundTone, setTrendSoundTone] = useState<TrendSoundTone>(() =>
+    loadPersistedTrendSoundTone()
+  );
+  const [trendEmailEnabled, setTrendEmailEnabled] = useState<boolean>(() =>
+    loadPersistedTrendEmailEnabled()
+  );
+  const [trendEmailRecipient, setTrendEmailRecipient] = useState<string>(() =>
+    loadPersistedTrendEmailRecipient()
+  );
+  const [trendEmailReports, setTrendEmailReports] = useState<TrendEmailReportEntry[]>([]);
+  const [expandedEmailReportId, setExpandedEmailReportId] = useState<string | null>(null);
+  const [copiedEmailReportId, setCopiedEmailReportId] = useState<string | null>(null);
   const [trendAlertRemainingSec, setTrendAlertRemainingSec] = useState<number | null>(null);
   const [activeView, setActiveView] = useState<ActiveView>('simulator');
   const [selectedPath, setSelectedPath] = useState<string>(
@@ -640,6 +797,17 @@ export default function App() {
   >('ALL');
   const [trendRangeTick, setTrendRangeTick] = useState<number>(0);
   const [trendHistoryCopied, setTrendHistoryCopied] = useState<boolean>(false);
+  const [trendConfigCopied, setTrendConfigCopied] = useState<boolean>(false);
+  const trendConfigCopiedTimerRef = useRef<number | null>(null);
+  const [trendAnalysisDateRange, setTrendAnalysisDateRange] = useState<
+    '1H' | '6H' | '24H' | 'ALL'
+  >('ALL');
+  const [trendAnalysisRangeTick, setTrendAnalysisRangeTick] = useState<number>(0);
+  const [trendAnalysisEventFilter, setTrendAnalysisEventFilter] = useState<string>('ALL');
+  const [trendAnalysisShowStreak, setTrendAnalysisShowStreak] = useState<boolean>(true);
+  const [trendAnalysisShowRaw, setTrendAnalysisShowRaw] = useState<boolean>(true);
+  const [trendAnalysisShowCorridors, setTrendAnalysisShowCorridors] = useState<boolean>(true);
+  const [selectedTrendTriggerId, setSelectedTrendTriggerId] = useState<string | null>(null);
   const [consoleFilter, setConsoleFilter] = useState<'ALL' | 'ZERO_GUARD' | 'LINK_ANOMALY' | 'BATTERY_IMPACT'>('ALL');
   const bgWakeupCountRef = useRef<number>(0);
   const fgDispatchCountRef = useRef<number>(1);
@@ -657,14 +825,26 @@ export default function App() {
     { ts: Date.now() - 1_000, score: 0.52, event: 'INIT_BASELINE' },
   ]);
   const [highUsageTrendChartHistory, setHighUsageTrendChartHistory] = useState<TrendWindowChartPoint[]>(() =>
-    buildTrendWindowChartSeries(energyTrendWindowRef.current, loadPersistedTrendConsecutiveThreshold())
+    buildTrendWindowChartSeries(
+      energyTrendWindowRef.current,
+      loadPersistedTrendConsecutiveThreshold(),
+      loadPersistedTrendMinDelta()
+    )
   );
   const highUsageTrendEnabledRef = useRef<boolean>(highUsageTrendEnabled);
   highUsageTrendEnabledRef.current = highUsageTrendEnabled;
   const trendConsecutiveThresholdRef = useRef<number>(trendConsecutiveThreshold);
   trendConsecutiveThresholdRef.current = trendConsecutiveThreshold;
+  const trendMinDeltaRef = useRef<number>(trendMinDelta);
+  trendMinDeltaRef.current = trendMinDelta;
   const trendSoundEnabledRef = useRef<boolean>(trendSoundEnabled);
   trendSoundEnabledRef.current = trendSoundEnabled;
+  const trendSoundToneRef = useRef<TrendSoundTone>(trendSoundTone);
+  trendSoundToneRef.current = trendSoundTone;
+  const trendEmailEnabledRef = useRef<boolean>(trendEmailEnabled);
+  trendEmailEnabledRef.current = trendEmailEnabled;
+  const trendEmailRecipientRef = useRef<string>(trendEmailRecipient);
+  trendEmailRecipientRef.current = trendEmailRecipient;
   const audioContextRef = useRef<AudioContext | null>(null);
   const highUsageTrendAlertedStreakRef = useRef<number>(0);
   const fullEnergyTimelineRef = useRef<EnergyTimelineEntry[]>([
@@ -1135,9 +1315,11 @@ export default function App() {
 
   useEffect(() => {
     const normalized = clampTrendConsecutiveThreshold(trendConsecutiveThreshold);
+    const normalizedDelta = clampTrendMinDelta(trendMinDelta);
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
         window.localStorage.setItem(TREND_CONSECUTIVE_STORAGE_KEY, String(normalized));
+        window.localStorage.setItem(TREND_MIN_DELTA_STORAGE_KEY, String(normalizedDelta));
       }
     } catch {
       // Ignore storage quota or sandbox restrictions
@@ -1147,12 +1329,13 @@ export default function App() {
       (sample) => nowTs - sample.ts <= ENERGY_TREND_WINDOW_MS
     );
     energyTrendWindowRef.current = pruned;
-    setHighUsageTrendChartHistory(buildTrendWindowChartSeries(pruned, normalized));
+    setHighUsageTrendChartHistory(buildTrendWindowChartSeries(pruned, normalized, normalizedDelta));
 
     let streak = 0;
     let startIdx = Math.max(0, pruned.length - 1);
     for (let i = pruned.length - 1; i > 0; i--) {
-      if (pruned[i].score > pruned[i - 1].score) {
+      const stepDelta = Math.round((pruned[i].score - pruned[i - 1].score) * 100) / 100;
+      if (stepDelta >= normalizedDelta) {
         streak += 1;
         startIdx = i - 1;
       } else {
@@ -1210,9 +1393,25 @@ export default function App() {
           ...prev,
         ].slice(0, 20));
         playHighUsageTrendChime();
+        if (trendEmailEnabledRef.current) {
+          dispatchTrendEmailSummary({
+            consecutiveIncreases: streak,
+            thresholdAtTrigger: normalized,
+            minDelta: normalizedDelta,
+            startScore: startSample.score,
+            curScore: latestSample.score,
+            delta,
+            windowSec,
+            timeMs,
+            sessionTag: sess,
+            events: trailEvents,
+            nowTs,
+            isTest: false,
+          });
+        }
       }
     }
-  }, [trendConsecutiveThreshold, highUsageTrendEnabled]);
+  }, [trendConsecutiveThreshold, trendMinDelta, highUsageTrendEnabled]);
 
   useEffect(() => {
     const normalizedSec = clampTrendAutoDismissSec(trendAutoDismissSec);
@@ -1280,6 +1479,225 @@ export default function App() {
   }, [highUsageTrendOccurrences, trendOccurrenceTimeRange, trendRangeTick]);
 
   useEffect(() => {
+    if (activeView !== 'trend_analysis' || trendAnalysisDateRange === 'ALL') return;
+    const id = window.setInterval(() => {
+      setTrendAnalysisRangeTick((t) => t + 1);
+    }, 15_000);
+    return () => window.clearInterval(id);
+  }, [activeView, trendAnalysisDateRange]);
+
+  const trendAnalysisModel = useMemo(() => {
+    const timeline = fullEnergyTimelineRef.current;
+    const minDelta = clampTrendMinDelta(trendMinDelta);
+    const streakTarget = clampTrendConsecutiveThreshold(trendConsecutiveThreshold);
+
+    const parsedTimestamps = timeline.map((entry) => {
+      const parsed = Date.parse(entry.timestampIso);
+      return Number.isFinite(parsed) ? parsed : 0;
+    });
+
+    const cutoffMs =
+      trendAnalysisDateRange === 'ALL'
+        ? null
+        : Date.now() -
+          (trendAnalysisDateRange === '1H'
+            ? 60 * 60 * 1000
+            : trendAnalysisDateRange === '6H'
+              ? 6 * 60 * 60 * 1000
+              : 24 * 60 * 60 * 1000);
+
+    const rangeOccurrences =
+      cutoffMs === null
+        ? highUsageTrendOccurrences
+        : highUsageTrendOccurrences.filter((occ) => occ.triggeredAtMs >= cutoffMs);
+
+    type TrendOccurrenceItem = (typeof highUsageTrendOccurrences)[number];
+    const matchedOccByTimelinePos = new Map<number, TrendOccurrenceItem>();
+    const assignedTimelinePositions = new Set<number>();
+
+    for (const occ of rangeOccurrences) {
+      let bestPos = -1;
+      let bestDist = Infinity;
+      const lastEvent = occ.events[occ.events.length - 1];
+      for (let i = 0; i < timeline.length; i++) {
+        if (assignedTimelinePositions.has(i)) continue;
+        if (cutoffMs !== null && parsedTimestamps[i] < cutoffMs) continue;
+        const entry = timeline[i];
+        const tsDist = Math.abs(parsedTimestamps[i] - occ.triggeredAtMs);
+        if (tsDist > ENERGY_TREND_WINDOW_MS) continue;
+        const scoreMatch = Math.abs(entry.rawScore - occ.curScore) < 0.015;
+        const eventMatch = !lastEvent || entry.event === lastEvent;
+        const penalty = (scoreMatch ? 0 : 100_000) + (eventMatch ? 0 : 25_000) + tsDist;
+        if (penalty < bestDist) {
+          bestDist = penalty;
+          bestPos = i;
+        }
+      }
+      if (bestPos >= 0) {
+        assignedTimelinePositions.add(bestPos);
+        matchedOccByTimelinePos.set(bestPos, occ);
+      }
+    }
+
+    let runningStreak = 0;
+    const timeLabelByIndex = new Map<number, string>();
+    const eventStatsMap = new Map<
+      string,
+      {
+        event: string;
+        totalCount: number;
+        streakStepCount: number;
+        triggerInvolvementCount: number;
+        deltaSum: number;
+        maxDelta: number;
+      }
+    >();
+
+    const allComputedPoints = timeline.map((entry, idx) => {
+      const prev = idx > 0 ? timeline[idx - 1] : null;
+      const stepDelta = prev
+        ? Math.round((entry.rawScore - prev.rawScore) * 100) / 100
+        : 0;
+      const isResetEvent = entry.event === 'RESET' || entry.event === 'STREAK_RESET';
+      if (isResetEvent) {
+        runningStreak = 0;
+      } else if (prev && stepDelta >= minDelta) {
+        runningStreak += 1;
+      } else if (prev && entry.rawScore !== prev.rawScore) {
+        runningStreak = 0;
+      }
+
+      const matchedOcc = matchedOccByTimelinePos.get(idx) ?? null;
+      const isRuleTrigger =
+        highUsageTrendEnabled && runningStreak >= streakTarget && !isResetEvent;
+      const isTriggerPoint =
+        Boolean(matchedOcc) ||
+        (highUsageTrendEnabled && runningStreak === streakTarget && !isResetEvent);
+
+      return {
+        pos: idx,
+        tsMs: parsedTimestamps[idx],
+        hasPrev: Boolean(prev),
+        isResetEvent,
+        index: entry.index,
+        timeHms: entry.timeHms,
+        timestampIso: entry.timestampIso,
+        sessionTag: entry.sessionTag,
+        event: entry.event,
+        filteredScore: entry.filteredScore,
+        rawScore: entry.rawScore,
+        stepDelta,
+        spikeBypass: entry.spikeBypass,
+        aboveHighThreshold:
+          entry.rawScore >= highBatteryImpactThreshold ||
+          entry.filteredScore >= highBatteryImpactThreshold,
+        cpuMs: entry.cpuMs,
+        netReqs: entry.netReqs,
+        streak: runningStreak,
+        matchedOccurrence: matchedOcc,
+        isTriggerPoint,
+        isRuleTrigger,
+        isStreakStep: !isResetEvent && Boolean(prev) && stepDelta >= minDelta,
+        matchesEventFilter:
+          trendAnalysisEventFilter === 'ALL' || entry.event === trendAnalysisEventFilter,
+      };
+    });
+
+    const points =
+      cutoffMs === null
+        ? allComputedPoints
+        : allComputedPoints.filter((pt) => pt.tsMs >= cutoffMs);
+
+    for (const pt of points) {
+      timeLabelByIndex.set(pt.index, pt.timeHms);
+      const stat = eventStatsMap.get(pt.event) ?? {
+        event: pt.event,
+        totalCount: 0,
+        streakStepCount: 0,
+        triggerInvolvementCount: 0,
+        deltaSum: 0,
+        maxDelta: 0,
+      };
+      stat.totalCount += 1;
+      if (pt.isStreakStep) {
+        stat.streakStepCount += 1;
+      }
+      stat.deltaSum += pt.stepDelta;
+      if (pt.stepDelta > stat.maxDelta) {
+        stat.maxDelta = pt.stepDelta;
+      }
+      eventStatsMap.set(pt.event, stat);
+    }
+
+    for (const occ of rangeOccurrences) {
+      const uniqueEvents = Array.from(new Set(occ.events));
+      for (const ev of uniqueEvents) {
+        const stat = eventStatsMap.get(ev);
+        if (stat) {
+          stat.triggerInvolvementCount += 1;
+        }
+      }
+    }
+
+    const corridors: Array<{
+      id: string;
+      x1: number;
+      x2: number;
+      occ: TrendOccurrenceItem;
+    }> = [];
+
+    const firstVisibleIndex = points[0]?.index;
+    matchedOccByTimelinePos.forEach((occ, pos) => {
+      const startPos = Math.max(0, pos - Math.max(1, occ.consecutiveIncreases));
+      const rawX1 = timeline[startPos]?.index;
+      const x2 = timeline[pos]?.index;
+      if (rawX1 !== undefined && x2 !== undefined && firstVisibleIndex !== undefined) {
+        const x1 = Math.max(firstVisibleIndex, rawX1);
+        corridors.push({ id: occ.id, x1, x2, occ });
+      }
+    });
+
+    const eventStats = Array.from(eventStatsMap.values())
+      .map((s) => ({
+        ...s,
+        avgDelta: s.totalCount > 0 ? Math.round((s.deltaSum / s.totalCount) * 100) / 100 : 0,
+      }))
+      .sort(
+        (a, b) =>
+          b.triggerInvolvementCount - a.triggerInvolvementCount ||
+          b.streakStepCount - a.streakStepCount ||
+          b.maxDelta - a.maxDelta ||
+          b.totalCount - a.totalCount
+      );
+
+    const distinctEvents = Array.from(new Set(points.map((p) => p.event)));
+    const topCorrelatedEvent =
+      eventStats.find((s) => s.triggerInvolvementCount > 0 || s.streakStepCount > 0) ?? null;
+
+    return {
+      points,
+      totalTimelineCount: timeline.length,
+      rangeOccurrences,
+      timeLabelByIndex,
+      corridors,
+      eventStats,
+      distinctEvents,
+      topCorrelatedEvent,
+      triggerPointCount: points.filter((p) => p.isTriggerPoint).length,
+    };
+  }, [
+    energyTimelineCount,
+    highUsageTrendOccurrences,
+    trendConsecutiveThreshold,
+    trendMinDelta,
+    highUsageTrendEnabled,
+    trendAnalysisEventFilter,
+    trendAnalysisDateRange,
+    trendAnalysisRangeTick,
+    highBatteryImpactThreshold,
+  ]);
+
+  useEffect(() => {
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
         window.localStorage.setItem(
@@ -1296,11 +1714,23 @@ export default function App() {
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
         window.localStorage.setItem(TREND_SOUND_ENABLED_STORAGE_KEY, String(trendSoundEnabled));
+        window.localStorage.setItem(TREND_SOUND_TONE_STORAGE_KEY, trendSoundTone);
       }
     } catch {
       // Ignore storage quota or sandbox restrictions
     }
-  }, [trendSoundEnabled]);
+  }, [trendSoundEnabled, trendSoundTone]);
+
+  useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(TREND_EMAIL_ENABLED_STORAGE_KEY, String(trendEmailEnabled));
+        window.localStorage.setItem(TREND_EMAIL_RECIPIENT_STORAGE_KEY, trendEmailRecipient.trim());
+      }
+    } catch {
+      // Ignore storage quota or sandbox restrictions
+    }
+  }, [trendEmailEnabled, trendEmailRecipient]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1311,19 +1741,31 @@ export default function App() {
         setHighUsageTrendEnabled(e.newValue !== 'false');
       } else if (e.key === TREND_CONSECUTIVE_STORAGE_KEY && e.newValue !== null) {
         setTrendConsecutiveThreshold(clampTrendConsecutiveThreshold(Number(e.newValue)));
+      } else if (e.key === TREND_MIN_DELTA_STORAGE_KEY && e.newValue !== null) {
+        setTrendMinDelta(clampTrendMinDelta(Number(e.newValue)));
       } else if (e.key === TREND_AUTO_DISMISS_SEC_STORAGE_KEY && e.newValue !== null) {
         setTrendAutoDismissSec(clampTrendAutoDismissSec(Number(e.newValue)));
       } else if (e.key === TREND_AUTO_DISMISS_ENABLED_STORAGE_KEY && e.newValue !== null) {
         setTrendAutoDismissEnabled(e.newValue !== 'false');
       } else if (e.key === TREND_SOUND_ENABLED_STORAGE_KEY && e.newValue !== null) {
         setTrendSoundEnabled(e.newValue !== 'false');
+      } else if (
+        e.key === TREND_SOUND_TONE_STORAGE_KEY &&
+        e.newValue !== null &&
+        isTrendSoundTone(e.newValue)
+      ) {
+        setTrendSoundTone(e.newValue);
+      } else if (e.key === TREND_EMAIL_ENABLED_STORAGE_KEY && e.newValue !== null) {
+        setTrendEmailEnabled(e.newValue === 'true');
+      } else if (e.key === TREND_EMAIL_RECIPIENT_STORAGE_KEY && e.newValue !== null) {
+        setTrendEmailRecipient(e.newValue);
       }
     };
     window.addEventListener('storage', handleStorageSync);
     return () => window.removeEventListener('storage', handleStorageSync);
   }, []);
 
-  const playHighUsageTrendChime = (forcePlay = false) => {
+  const playHighUsageTrendChime = (forcePlay = false, overrideTone?: TrendSoundTone) => {
     if (!forcePlay && (!highUsageTrendEnabledRef.current || !trendSoundEnabledRef.current)) return;
     if (typeof window === 'undefined') return;
     try {
@@ -1356,9 +1798,23 @@ export default function App() {
         osc.stop(now + startOffsetSec + durationSec + 0.02);
       };
 
-      // Subtle two-tone awareness chime (D5 -> G5), low gain to stay non-intrusive
-      playSoftNote(587.33, 0, 0.14, 0.055, 'sine');
-      playSoftNote(783.99, 0.09, 0.22, 0.048, 'triangle');
+      const selectedTone = overrideTone ?? trendSoundToneRef.current;
+      if (selectedTone === 'triple_arp') {
+        playSoftNote(523.25, 0, 0.13, 0.048, 'sine');
+        playSoftNote(659.25, 0.08, 0.14, 0.045, 'sine');
+        playSoftNote(880.0, 0.16, 0.24, 0.044, 'triangle');
+      } else if (selectedTone === 'amber_pulse') {
+        playSoftNote(440.0, 0, 0.14, 0.052, 'triangle');
+        playSoftNote(587.33, 0.11, 0.15, 0.05, 'sine');
+        playSoftNote(440.0, 0.23, 0.22, 0.042, 'triangle');
+      } else if (selectedTone === 'telemetry_ping') {
+        playSoftNote(1318.51, 0, 0.1, 0.036, 'sine');
+        playSoftNote(987.77, 0.09, 0.2, 0.038, 'sine');
+      } else {
+        // Subtle two-tone awareness chime (D5 -> G5), low gain to stay non-intrusive
+        playSoftNote(587.33, 0, 0.14, 0.055, 'sine');
+        playSoftNote(783.99, 0.09, 0.22, 0.048, 'triangle');
+      }
     } catch {
       // Ignore Web Audio API restrictions in sandboxed/headless environments
     }
@@ -1386,22 +1842,134 @@ export default function App() {
     }
   };
 
+  const dispatchTrendEmailSummary = (params: {
+    consecutiveIncreases: number;
+    thresholdAtTrigger: number;
+    minDelta: number;
+    startScore: number;
+    curScore: number;
+    delta: number;
+    windowSec: number;
+    timeMs: string;
+    sessionTag: string;
+    events: string[];
+    nowTs: number;
+    isTest: boolean;
+  }) => {
+    const recipient = trendEmailRecipientRef.current.trim() || 'alerts@example.com';
+    const testPrefix = params.isTest ? '[TEST] ' : '';
+    const subject = `${testPrefix}[Gemini-Eye] High Usage Trend Summary (${params.consecutiveIncreases}x >= ${params.thresholdAtTrigger}x · +${params.delta.toFixed(2)} pts)`;
+    const eventChain = params.events.length > 0 ? params.events.join(' -> ') : 'N/A';
+
+    const bodyLines = [
+      '=== Gemini-Eye · High Usage Trend Summary Report ===',
+      `Recipient: ${recipient}`,
+      `Timestamp: ${params.timeMs}`,
+      `Session: ${params.sessionTag}`,
+      `Streak Status: ${params.consecutiveIncreases} consecutive increases (Threshold: >=${params.thresholdAtTrigger}x in 5m rolling window)`,
+      `Sensitivity Filter: Min step delta >= +${params.minDelta.toFixed(2)} pts`,
+      `Energy Score Climb: ${params.startScore} -> ${params.curScore} (+${params.delta.toFixed(2)} pts over ${params.windowSec}s)`,
+      `Correlated App Events: [${eventChain}]`,
+      params.isTest
+        ? 'Note: Manual test summary dispatched from HUD Settings.'
+        : 'Note: Automated summary triggered when streak exceeded configured threshold.',
+    ];
+
+    const entry: TrendEmailReportEntry = {
+      id: `email-${params.nowTs}-${Math.random().toString(36).slice(2, 7)}`,
+      recipient,
+      subject,
+      bodyText: bodyLines.join('\n'),
+      sentAtMs: params.nowTs,
+      timeMs: params.timeMs,
+      consecutiveIncreases: params.consecutiveIncreases,
+      thresholdAtTrigger: params.thresholdAtTrigger,
+      startScore: params.startScore,
+      curScore: params.curScore,
+      delta: params.delta,
+      windowSec: params.windowSec,
+      sessionTag: params.sessionTag,
+      events: params.events,
+      isTest: params.isTest,
+    };
+
+    setTrendEmailReports((prev) => [entry, ...prev].slice(0, 15));
+    setExpandedEmailReportId(entry.id);
+
+    const msgEn = `[Email Summary Report${params.isTest ? ' · TEST' : ''}] Prepared High Usage Trend summary for ${recipient} (${params.consecutiveIncreases}x >= ${params.thresholdAtTrigger}x, +${params.delta.toFixed(2)} pts).`;
+    const msgZh = `[邮件摘要通知${params.isTest ? ' · 测试' : ''}] 已为 ${recipient} 生成 High Usage Trend 摘要报告（连续 ${params.consecutiveIncreases}x >= ${params.thresholdAtTrigger}x，+${params.delta.toFixed(2)} 分）。`;
+    logDevEvent('BATTERY_IMPACT', params.sessionTag, msgZh, msgEn, params.isTest ? 'info' : 'warn');
+  };
+
+  const handleSendTestTrendEmailSummary = () => {
+    const nowTs = Date.now();
+    const minStreak = clampTrendConsecutiveThreshold(trendConsecutiveThresholdRef.current);
+    const minDelta = clampTrendMinDelta(trendMinDeltaRef.current);
+    const base = highUsageTrendAlert;
+    const curScore = base ? base.curScore : Math.round(latestEnergyScoreRef.current * 100) / 100;
+    const startScore = base
+      ? base.startScore
+      : Math.max(0, Math.round((curScore - minDelta * minStreak) * 100) / 100);
+    const delta = base ? base.delta : Math.round((curScore - startScore) * 100) / 100;
+
+    dispatchTrendEmailSummary({
+      consecutiveIncreases: base ? base.consecutiveIncreases : minStreak,
+      thresholdAtTrigger: minStreak,
+      minDelta,
+      startScore,
+      curScore,
+      delta,
+      windowSec: base ? base.windowSec : 12,
+      timeMs: formatFullTimestampMs(new Date(nowTs)),
+      sessionTag: activeSessionRef.current.sessionTag,
+      events: base ? base.events : ['QUERY_SENT', 'HEARTBEAT_REPLAY', 'TEST_SUMMARY'],
+      nowTs,
+      isTest: true,
+    });
+    setDevConsoleOpen(true);
+  };
+
+  const handleCopyTrendEmailReport = async (report: TrendEmailReportEntry) => {
+    const payload = `To: ${report.recipient}\nSubject: ${report.subject}\n\n${report.bodyText}`;
+    try {
+      await navigator.clipboard.writeText(payload);
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = payload;
+        ta.setAttribute('readonly', '');
+        ta.className = 'fixed -left-[9999px] top-0 opacity-0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      } catch {
+        // Ignore clipboard fallback errors in restricted environments
+      }
+    }
+    setCopiedEmailReportId(report.id);
+    window.setTimeout(() => {
+      setCopiedEmailReportId((curr) => (curr === report.id ? null : curr));
+    }, 1800);
+  };
+
   const handleResetTrendAlertHistory = () => {
     const nowTs = Date.now();
     const baselineScore = Math.round(latestEnergyScoreRef.current * 100) / 100;
     const minStreak = clampTrendConsecutiveThreshold(trendConsecutiveThresholdRef.current);
+    const minDelta = clampTrendMinDelta(trendMinDeltaRef.current);
     const resetBaseline = [{ ts: nowTs, score: baselineScore, event: 'STREAK_RESET' }];
 
     energyTrendWindowRef.current = resetBaseline;
     highUsageTrendAlertedStreakRef.current = 0;
-    setHighUsageTrendChartHistory(buildTrendWindowChartSeries(resetBaseline, minStreak));
+    setHighUsageTrendChartHistory(buildTrendWindowChartSeries(resetBaseline, minStreak, minDelta));
     setTrendAlertRemainingSec(null);
     setHighUsageTrendAlert(null);
     setHighUsageTrendOccurrences([]);
 
     const sess = activeSessionRef.current.sessionTag;
-    const msgEn = `[Trend Alert History Reset] Cleared 5-min rolling streak counter at baseline ${baselineScore} without changing global thresholds (>=${minStreak}x / High >=${highBatteryImpactThreshold}).`;
-    const msgZh = `[趋势告警历史已重置] 已清空 5 分钟滑动窗口连升计数（当前基准 ${baselineScore}），全局阈值 (>=${minStreak}x / 高能耗 >=${highBatteryImpactThreshold}) 保持不变。`;
+    const msgEn = `[Trend Alert History Reset] Cleared 5-min rolling streak counter at baseline ${baselineScore} without changing global thresholds (>=${minStreak}x, Min Δ>=+${minDelta.toFixed(2)} / High >=${highBatteryImpactThreshold}).`;
+    const msgZh = `[趋势告警历史已重置] 已清空 5 分钟滑动窗口连升计数（当前基准 ${baselineScore}），全局阈值 (>=${minStreak}x, 最小增量>=+${minDelta.toFixed(2)} / 高能耗 >=${highBatteryImpactThreshold}) 保持不变。`;
     logDevEvent('BATTERY_IMPACT', sess, msgZh, msgEn, 'info');
     setLastSyncNote(isZhRef.current ? msgZh : msgEn);
   };
@@ -1418,7 +1986,7 @@ export default function App() {
       '=== Gemini-Eye · High Usage Trend Occurrence Snapshot ===',
       `Exported: ${formatFullTimestampMs(new Date())}`,
       `Filter: ${rangeLabel} (${filteredTrendOccurrences.length}/${highUsageTrendOccurrences.length} occurrences shown)`,
-      `Thresholds: Trend Alerts ${highUsageTrendEnabled ? 'ENABLED' : 'DISABLED'} | >=${trendConsecutiveThreshold}x in 5m | High Battery Impact >=${highBatteryImpactThreshold} pts`,
+      `Thresholds: Trend Alerts ${highUsageTrendEnabled ? 'ENABLED' : 'DISABLED'} | >=${trendConsecutiveThreshold}x in 5m (Min Delta >=+${trendMinDelta.toFixed(2)} pts) | High Battery Impact >=${highBatteryImpactThreshold} pts`,
       `Active Banner: ${
         !highUsageTrendEnabled
           ? 'DISABLED (Global Switch Off)'
@@ -1478,8 +2046,57 @@ export default function App() {
     window.setTimeout(() => setTrendHistoryCopied(false), 1800);
   };
 
+  const handleCopyTrendConfiguration = async () => {
+    const configSnapshot = {
+      highUsageTrend: {
+        enabled: highUsageTrendEnabled,
+        streakCountThreshold: clampTrendConsecutiveThreshold(trendConsecutiveThreshold),
+        rollingWindowMinutes: 5,
+        sensitivityThresholdMinDelta: clampTrendMinDelta(trendMinDelta),
+        autoDismiss: {
+          enabled: trendAutoDismissEnabled,
+          timeoutSeconds: clampTrendAutoDismissSec(trendAutoDismissSec),
+        },
+        soundEnabled: trendSoundEnabled,
+        soundTone: trendSoundTone,
+        emailNotifications: {
+          enabled: trendEmailEnabled,
+          recipient: trendEmailRecipient.trim() || null,
+        },
+      },
+    };
+
+    const payload = JSON.stringify(configSnapshot, null, 2);
+    try {
+      await navigator.clipboard.writeText(payload);
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = payload;
+        ta.setAttribute('readonly', '');
+        ta.className = 'fixed -left-[9999px] top-0 opacity-0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      } catch {
+        // Ignore clipboard fallback errors in restricted environments
+      }
+    }
+
+    setTrendConfigCopied(true);
+    if (trendConfigCopiedTimerRef.current !== null) {
+      window.clearTimeout(trendConfigCopiedTimerRef.current);
+    }
+    trendConfigCopiedTimerRef.current = window.setTimeout(() => {
+      setTrendConfigCopied(false);
+      trendConfigCopiedTimerRef.current = null;
+    }, 1800);
+  };
+
   const evaluateBatteryUsageTrendWindow = (curScore: number, eventName: string) => {
     const minStreak = trendConsecutiveThresholdRef.current;
+    const minDelta = clampTrendMinDelta(trendMinDeltaRef.current);
     const nowTs = Date.now();
     const pruned = energyTrendWindowRef.current.filter(
       (sample) => nowTs - sample.ts <= ENERGY_TREND_WINDOW_MS
@@ -1489,19 +2106,22 @@ export default function App() {
     if (lastSample && curScore === lastSample.score) {
       energyTrendWindowRef.current = pruned;
       setHighUsageTrendChartHistory(
-        buildTrendWindowChartSeries(pruned, minStreak)
+        buildTrendWindowChartSeries(pruned, minStreak, minDelta)
       );
       return;
     }
 
-    if (lastSample && curScore < lastSample.score) {
+    const stepDeltaFromLast = lastSample
+      ? Math.round((curScore - lastSample.score) * 100) / 100
+      : 0;
+    if (lastSample && stepDeltaFromLast < minDelta) {
       highUsageTrendAlertedStreakRef.current = 0;
     }
 
     const updated = [...pruned, { ts: nowTs, score: curScore, event: eventName }];
     energyTrendWindowRef.current = updated;
     setHighUsageTrendChartHistory(
-      buildTrendWindowChartSeries(updated, minStreak)
+      buildTrendWindowChartSeries(updated, minStreak, minDelta)
     );
 
     if (!highUsageTrendEnabledRef.current) {
@@ -1514,7 +2134,8 @@ export default function App() {
     let consecutiveIncreases = 0;
     let streakStartIdx = updated.length - 1;
     for (let i = updated.length - 1; i > 0; i--) {
-      if (updated[i].score > updated[i - 1].score) {
+      const stepDelta = Math.round((updated[i].score - updated[i - 1].score) * 100) / 100;
+      if (stepDelta >= minDelta) {
         consecutiveIncreases += 1;
         streakStartIdx = i - 1;
       } else {
@@ -1570,6 +2191,22 @@ export default function App() {
       setBatteryImpactCount((c) => c + 1);
       setDevConsoleOpen(true);
       playHighUsageTrendChime();
+      if (trendEmailEnabledRef.current) {
+        dispatchTrendEmailSummary({
+          consecutiveIncreases,
+          thresholdAtTrigger: minStreak,
+          minDelta,
+          startScore: startSample.score,
+          curScore,
+          delta,
+          windowSec,
+          timeMs,
+          sessionTag: sess,
+          events: trailEvents,
+          nowTs,
+          isTest: false,
+        });
+      }
 
       const trendMsgEn = `[High Usage Trend] Detected ${consecutiveIncreases} consecutive Battery Impact Score increases within 5-min rolling window (${windowSec}s span): ${startSample.score} -> ${curScore} (+${delta.toFixed(2)} pts, session=${sess})`;
       const trendMsgZh = `[High Usage Trend · 持续高功耗趋势] 5 分钟滑动窗口内检测到连续 ${consecutiveIncreases} 次 Battery Impact Score 上升（耗时 ${windowSec}s）：${startSample.score} -> ${curScore} (+${delta.toFixed(2)} 分，会话=${sess})`;
@@ -1754,10 +2391,10 @@ export default function App() {
           `网络重放与拦截传输: ${energyNetReqs} 次请求 / ${energyNetBytes} Bytes`,
           `估算电池消耗: ~${estimatedEnergyMah.toFixed(4)} mAh`,
           !highUsageTrendEnabled
-            ? `趋势告警: 已全局关闭 (设置开关 OFF · 保留阈值 >=${trendConsecutiveThreshold}x)`
+            ? `趋势告警: 已全局关闭 (设置开关 OFF · 保留阈值 >=${trendConsecutiveThreshold}x, 最小增量 >=+${trendMinDelta.toFixed(2)})`
             : highUsageTrendAlert
               ? `趋势告警: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} 次连续上升 / 5m 窗口: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
-              : `趋势告警: 正常 (5 分钟窗口阈值 >=${trendConsecutiveThreshold}x 未触发)`,
+              : `趋势告警: 正常 (5 分钟窗口阈值 >=${trendConsecutiveThreshold}x 且增量 >=+${trendMinDelta.toFixed(2)} 未触发)`,
           '',
           `--- 当前能耗事件日志 (${batteryLogs.length} 条) ---`,
         ]
@@ -1773,10 +2410,10 @@ export default function App() {
           `Network Replays / Transferred: ${energyNetReqs} reqs / ${energyNetBytes} Bytes`,
           `Estimated Battery Draw: ~${estimatedEnergyMah.toFixed(4)} mAh`,
           !highUsageTrendEnabled
-            ? `Trend Alert: Globally Disabled (Master switch OFF · saved threshold >=${trendConsecutiveThreshold}x)`
+            ? `Trend Alert: Globally Disabled (Master switch OFF · saved >=${trendConsecutiveThreshold}x, min delta >=+${trendMinDelta.toFixed(2)})`
             : highUsageTrendAlert
               ? `Trend Alert: High Usage Trend (${highUsageTrendAlert.consecutiveIncreases}/${trendConsecutiveThreshold} consecutive increases in 5m window: ${highUsageTrendAlert.startScore} -> ${highUsageTrendAlert.curScore})`
-              : `Trend Alert: Normal (5m window threshold >=${trendConsecutiveThreshold}x not triggered)`,
+              : `Trend Alert: Normal (5m window threshold >=${trendConsecutiveThreshold}x with min delta >=+${trendMinDelta.toFixed(2)} not triggered)`,
           '',
           `--- Current Energy Usage Log (${batteryLogs.length} entries) ---`,
         ];
@@ -3013,6 +3650,34 @@ export default function App() {
 
           <button
             type="button"
+            onClick={() => setActiveView('trend_analysis')}
+            className={`w-full flex items-center justify-between gap-2 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+              activeView === 'trend_analysis'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+            }`}
+          >
+            <span className="flex items-center gap-2.5 min-w-0">
+              <TrendingUp className="w-4 h-4 shrink-0" />
+              <span className="truncate">
+                {isZh ? '趋势关联分析 (Trend Analysis)' : 'Trend Analysis'}
+              </span>
+            </span>
+            {highUsageTrendOccurrences.length > 0 && (
+              <span
+                className={`text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 ${
+                  activeView === 'trend_analysis'
+                    ? 'bg-rose-500 text-white'
+                    : 'bg-rose-100 text-rose-700'
+                }`}
+              >
+                {highUsageTrendOccurrences.length}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
             onClick={() => setActiveView('files')}
             className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
               activeView === 'files'
@@ -3087,6 +3752,10 @@ export default function App() {
                 ? isZh
                   ? '动态 Authorization/Cookie 切号隔离 · 前台挂载 / 后台完全休眠'
                   : 'Dynamic Session Interception · Foreground-Only Lifecycle'
+                : activeView === 'trend_analysis'
+                ? isZh
+                  ? 'Trend Analysis · 能耗时间线与 High Usage Trend 事件关联叠加分析'
+                  : 'Trend Analysis · High Usage Trend Triggers Overlaid on Energy Timeline'
                 : activeView === 'files'
                 ? currentFile.path
                 : isZh
@@ -3762,8 +4431,8 @@ export default function App() {
                               <div className="flex items-center justify-between gap-2 text-[11px]">
                                 <span className="font-medium">
                                   {isZh
-                                    ? 'High Usage Trend 灵敏度 (连续上升次数)'
-                                    : 'High Usage Trend Sensitivity (Consecutive Increases)'}
+                                    ? '连续上升次数阈值 (Streak Count)'
+                                    : 'Streak Count Threshold (Consecutive Increases)'}
                                 </span>
                                 <span className={`font-mono text-[10px] font-semibold ${highUsageTrendEnabled ? 'text-rose-500' : 'opacity-60'}`}>
                                   &gt;= {trendConsecutiveThreshold}x / 5m
@@ -3812,6 +4481,63 @@ export default function App() {
                                 {isZh
                                   ? '5 分钟滑动窗口连续上升触发阈值 · 已自动保存至 localStorage'
                                   : '5-min rolling window trigger streak · Saved to localStorage'}
+                              </div>
+                            </div>
+
+                            <div className={`space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60 transition-opacity ${highUsageTrendEnabled ? '' : 'opacity-50'}`}>
+                              <div className="flex items-center justify-between gap-2 text-[11px]">
+                                <span className="font-medium">
+                                  {isZh
+                                    ? '灵敏度阈值 · Sensitivity Threshold (最小增量)'
+                                    : 'Sensitivity Threshold (Min Score Delta)'}
+                                </span>
+                                <span className={`font-mono text-[10px] font-semibold tabular-nums ${highUsageTrendEnabled ? 'text-rose-500' : 'opacity-60'}`}>
+                                  &gt;= +{trendMinDelta.toFixed(2)} pts
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[9px] font-mono opacity-60 shrink-0">
+                                  +{TREND_MIN_DELTA_MIN.toFixed(2)}
+                                </span>
+                                <input
+                                  type="range"
+                                  min={TREND_MIN_DELTA_MIN}
+                                  max={TREND_MIN_DELTA_MAX}
+                                  step={TREND_MIN_DELTA_STEP}
+                                  disabled={!highUsageTrendEnabled}
+                                  value={trendMinDelta}
+                                  onChange={(e) =>
+                                    setTrendMinDelta(clampTrendMinDelta(Number(e.target.value)))
+                                  }
+                                  aria-label="High Usage Trend Sensitivity Threshold (Min Energy Score Delta)"
+                                  className={`w-full h-1.5 bg-slate-200 dark:bg-zinc-700 rounded-lg appearance-none accent-rose-500 ${
+                                    highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                  }`}
+                                />
+                                <span className="text-[9px] font-mono opacity-60 shrink-0">
+                                  +{TREND_MIN_DELTA_MAX.toFixed(1)}
+                                </span>
+                                {trendMinDelta !== DEFAULT_TREND_MIN_DELTA && (
+                                  <button
+                                    type="button"
+                                    disabled={!highUsageTrendEnabled}
+                                    onClick={() => setTrendMinDelta(DEFAULT_TREND_MIN_DELTA)}
+                                    className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
+                                      simDarkTheme
+                                        ? 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                                        : 'border-slate-200 bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                    }`}
+                                  >
+                                    {isZh ? '重置' : 'Reset'}
+                                  </button>
+                                )}
+                              </div>
+                              <div className="text-[9.5px] opacity-65 font-mono">
+                                {isZh
+                                  ? '过滤低于该差值的微小抖动，单步增量达标才计入连续上升 · 已保存至 localStorage'
+                                  : 'Filters minor score noise below this delta before incrementing streak · Saved to localStorage'}
                               </div>
                             </div>
 
@@ -3902,7 +4628,7 @@ export default function App() {
                               </div>
                             </div>
 
-                            <div className={`space-y-1 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60 transition-opacity ${highUsageTrendEnabled ? '' : 'opacity-50'}`}>
+                            <div className={`space-y-1.5 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60 transition-opacity ${highUsageTrendEnabled ? '' : 'opacity-50'}`}>
                               <div className="flex items-center justify-between gap-2 text-[11px]">
                                 <span className="font-medium inline-flex items-center gap-1">
                                   {trendSoundEnabled && highUsageTrendEnabled ? (
@@ -3955,11 +4681,180 @@ export default function App() {
                                   </button>
                                 </div>
                               </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <label
+                                  htmlFor="trend-notification-sound-select"
+                                  className="text-[10px] font-mono opacity-80 shrink-0"
+                                >
+                                  {isZh ? 'Notification Sound (音色)' : 'Notification Sound'}
+                                </label>
+                                <select
+                                  id="trend-notification-sound-select"
+                                  disabled={!highUsageTrendEnabled}
+                                  value={trendSoundTone}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    if (!isTrendSoundTone(val)) return;
+                                    setTrendSoundTone(val);
+                                    if (trendSoundEnabledRef.current && highUsageTrendEnabledRef.current) {
+                                      playHighUsageTrendChime(true, val);
+                                    }
+                                  }}
+                                  aria-label={isZh ? '选择 High Usage Trend 提示音音色' : 'Select High Usage Trend Notification Sound'}
+                                  className={`flex-1 max-w-[210px] rounded border px-2 py-1 text-[10px] font-mono focus:outline-none ${
+                                    highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                  } ${
+                                    simDarkTheme
+                                      ? 'border-zinc-700 bg-zinc-900/90 text-zinc-100 focus:border-emerald-500'
+                                      : 'border-slate-200 bg-white text-slate-800 focus:border-emerald-500'
+                                  }`}
+                                >
+                                  {TREND_SOUND_TONE_OPTIONS.map((tone) => (
+                                    <option key={tone.id} value={tone.id}>
+                                      {isZh ? tone.labelZh : tone.labelEn}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div className="text-[9.5px] opacity-65 font-mono">
+                                {(() => {
+                                  const activeTone =
+                                    TREND_SOUND_TONE_OPTIONS.find((t) => t.id === trendSoundTone) ??
+                                    TREND_SOUND_TONE_OPTIONS[0];
+                                  return isZh
+                                    ? `${activeTone.descZh} · 选择后自动试听并保存至 localStorage`
+                                    : `${activeTone.descEn} · Previews on change & saved to localStorage`;
+                                })()}
+                              </div>
+                            </div>
+
+                            <div className={`space-y-1.5 pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60 transition-opacity ${highUsageTrendEnabled ? '' : 'opacity-50'}`}>
+                              <div className="flex items-center justify-between gap-2 text-[11px]">
+                                <span className="font-medium inline-flex items-center gap-1">
+                                  <Mail
+                                    className={`w-3.5 h-3.5 shrink-0 ${
+                                      trendEmailEnabled && highUsageTrendEnabled ? 'text-sky-500' : 'opacity-60'
+                                    }`}
+                                  />
+                                  <span>
+                                    {isZh
+                                      ? '邮件摘要通知 · Email Notifications'
+                                      : 'Email Notifications (Summary Reports)'}
+                                  </span>
+                                </span>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    disabled={!highUsageTrendEnabled}
+                                    onClick={handleSendTestTrendEmailSummary}
+                                    className={`px-1.5 py-0.5 rounded font-mono text-[9.5px] border transition-colors ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
+                                      simDarkTheme
+                                        ? 'border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+                                        : 'border-slate-200 bg-slate-100 text-slate-700 hover:bg-slate-200'
+                                    }`}
+                                  >
+                                    {isZh ? '生成测试' : 'Test Report'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    role="switch"
+                                    disabled={!highUsageTrendEnabled}
+                                    aria-checked={trendEmailEnabled}
+                                    aria-label={
+                                      isZh
+                                        ? '开启或关闭 High Usage Trend 邮件摘要通知'
+                                        : 'Toggle High Usage Trend Email Notifications'
+                                    }
+                                    onClick={() => setTrendEmailEnabled((v) => !v)}
+                                    className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-mono text-[9.5px] border transition-colors ${
+                                      highUsageTrendEnabled ? 'cursor-pointer' : 'cursor-not-allowed'
+                                    } ${
+                                      trendEmailEnabled
+                                        ? 'bg-sky-600 border-sky-500 text-white'
+                                        : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-300'
+                                    }`}
+                                  >
+                                    <span
+                                      className={`inline-block w-1.5 h-1.5 rounded-full ${
+                                        trendEmailEnabled ? 'bg-white' : 'bg-slate-400 dark:bg-zinc-500'
+                                      }`}
+                                    />
+                                    <span>{trendEmailEnabled ? 'ON' : 'OFF'}</span>
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="email"
+                                  disabled={!highUsageTrendEnabled}
+                                  value={trendEmailRecipient}
+                                  onChange={(e) => setTrendEmailRecipient(e.target.value)}
+                                  placeholder="alerts@example.com"
+                                  aria-label={
+                                    isZh
+                                      ? '接收趋势摘要报告的邮箱地址'
+                                      : 'Recipient email address for High Usage Trend summary reports'
+                                  }
+                                  className={`w-full rounded border px-2 py-1 text-[10px] font-mono focus:outline-none ${
+                                    highUsageTrendEnabled ? '' : 'cursor-not-allowed'
+                                  } ${
+                                    simDarkTheme
+                                      ? 'border-zinc-700 bg-zinc-900/90 text-zinc-100 placeholder:text-zinc-500 focus:border-sky-500'
+                                      : 'border-slate-200 bg-white text-slate-800 placeholder:text-slate-400 focus:border-sky-500'
+                                  }`}
+                                />
+                              </div>
                               <div className="text-[9.5px] opacity-65 font-mono">
                                 {isZh
-                                  ? '触发 High Usage Trend 时播放柔和双音提示 · 已保存至 localStorage'
-                                  : 'Subtle Web Audio chime on High Usage Trend · Saved to localStorage'}
+                                  ? '当连升次数超越阈值时自动生成邮件摘要（支持复制与 mailto 打开）· 已保存至 localStorage'
+                                  : 'Generates summary email report when streak exceeds threshold (with mailto & copy) · Saved to localStorage'}
                               </div>
+                            </div>
+
+                            <div className="pt-1.5 border-t border-slate-200/50 dark:border-zinc-700/60 flex items-center justify-between gap-2">
+                              <span className="text-[10px] font-mono opacity-75">
+                                {isZh
+                                  ? '导出阈值、灵敏度与自动消失 JSON 配置'
+                                  : 'Export threshold, sensitivity & auto-dismiss JSON'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={handleCopyTrendConfiguration}
+                                aria-label={
+                                  isZh
+                                    ? '复制 High Usage Trend JSON 配置'
+                                    : 'Copy High Usage Trend Configuration JSON'
+                                }
+                                title={
+                                  isZh
+                                    ? '将当前 High Usage Trend 配置导出为 JSON 并复制到剪贴板'
+                                    : 'Copy current High Usage Trend settings as a JSON snippet'
+                                }
+                                className={`inline-flex items-center gap-1.5 px-2 py-1 rounded font-mono text-[10px] border transition-colors shrink-0 cursor-pointer ${
+                                  trendConfigCopied
+                                    ? 'bg-emerald-600 border-emerald-500 text-white'
+                                    : simDarkTheme
+                                      ? 'border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+                                      : 'border-slate-200 bg-slate-100 text-slate-700 hover:bg-slate-200'
+                                }`}
+                              >
+                                {trendConfigCopied ? (
+                                  <Check className="w-3 h-3 shrink-0" />
+                                ) : (
+                                  <Copy className="w-3 h-3 shrink-0" />
+                                )}
+                                <span>
+                                  {trendConfigCopied
+                                    ? isZh
+                                      ? '已复制 JSON'
+                                      : 'Copied JSON'
+                                    : isZh
+                                      ? '复制配置'
+                                      : 'Copy Configuration'}
+                                </span>
+                              </button>
                             </div>
                           </div>
 
@@ -4413,7 +5308,9 @@ export default function App() {
               {devConsoleOpen && (
                 <div className="p-4 space-y-3">
                   {/* Developer Console Automated High Usage Trend Notification & Recent Trigger History */}
-                  {((highUsageTrendEnabled && highUsageTrendAlert) || highUsageTrendOccurrences.length > 0) && (
+                  {((highUsageTrendEnabled && highUsageTrendAlert) ||
+                    highUsageTrendOccurrences.length > 0 ||
+                    trendEmailReports.length > 0) && (
                     <div
                       role="alert"
                       className={`rounded-xl border px-3.5 py-2.5 space-y-2.5 shadow-sm ${
@@ -4709,6 +5606,93 @@ export default function App() {
                           )}
                         </div>
                       )}
+
+                      {trendEmailReports.length > 0 && (
+                        <div className="pt-2 border-t border-sky-500/25 space-y-1.5">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono">
+                            <span className="inline-flex items-center gap-1.5 text-sky-200 font-semibold">
+                              <Mail className="w-3 h-3 text-sky-400" />
+                              <span>
+                                {isZh
+                                  ? `邮件摘要通知队列 (${trendEmailReports.length})`
+                                  : `Email Summary Reports (${trendEmailReports.length})`}
+                              </span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setTrendEmailReports([])}
+                              className="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 cursor-pointer"
+                            >
+                              {isZh ? '清空队列' : 'Clear Outbox'}
+                            </button>
+                          </div>
+
+                          <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                            {trendEmailReports.map((report) => {
+                              const isExpanded = expandedEmailReportId === report.id;
+                              const isCopied = copiedEmailReportId === report.id;
+                              const mailtoHref = `mailto:${encodeURIComponent(report.recipient)}?subject=${encodeURIComponent(
+                                report.subject
+                              )}&body=${encodeURIComponent(report.bodyText)}`;
+                              return (
+                                <div
+                                  key={report.id}
+                                  className="rounded-lg border border-sky-500/30 bg-slate-950/85 px-2.5 py-1.5 font-mono text-[10px] space-y-1.5"
+                                >
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setExpandedEmailReportId((prev) =>
+                                          prev === report.id ? null : report.id
+                                        )
+                                      }
+                                      className="inline-flex items-center gap-1.5 text-left text-sky-100 hover:text-white cursor-pointer min-w-0"
+                                    >
+                                      {isExpanded ? (
+                                        <ChevronDown className="w-3 h-3 text-sky-400 shrink-0" />
+                                      ) : (
+                                        <ChevronRight className="w-3 h-3 text-sky-400 shrink-0" />
+                                      )}
+                                      <span className="text-slate-400 shrink-0">{report.timeMs}</span>
+                                      <span className="text-sky-300 font-semibold truncate">
+                                        {report.recipient}
+                                      </span>
+                                      <span className="text-slate-300 truncate">{report.subject}</span>
+                                    </button>
+                                    <div className="flex items-center gap-1.5 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleCopyTrendEmailReport(report)}
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 cursor-pointer"
+                                      >
+                                        {isCopied ? (
+                                          <Check className="w-2.5 h-2.5 text-emerald-400" />
+                                        ) : (
+                                          <Copy className="w-2.5 h-2.5 text-sky-300" />
+                                        )}
+                                        <span>{isCopied ? (isZh ? '已复制' : 'Copied') : isZh ? '复制摘要' : 'Copy'}</span>
+                                      </button>
+                                      <a
+                                        href={mailtoHref}
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-700/70 hover:bg-sky-600/80 text-white border border-sky-500/50"
+                                      >
+                                        <Mail className="w-2.5 h-2.5" />
+                                        <span>{isZh ? '发送邮件' : 'Open Mail'}</span>
+                                      </a>
+                                    </div>
+                                  </div>
+                                  {isExpanded && (
+                                    <pre className="rounded bg-slate-900/90 border border-slate-800 p-2 text-[10px] text-slate-200 whitespace-pre-wrap break-words leading-relaxed">
+                                      {report.bodyText}
+                                    </pre>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -4834,7 +5818,11 @@ export default function App() {
                           const resetSamples = [{ ts: resetTs, score: 0, event: 'RESET' }];
                           energyTrendWindowRef.current = resetSamples;
                           setHighUsageTrendChartHistory(
-                            buildTrendWindowChartSeries(resetSamples, trendConsecutiveThresholdRef.current)
+                            buildTrendWindowChartSeries(
+                              resetSamples,
+                              trendConsecutiveThresholdRef.current,
+                              trendMinDeltaRef.current
+                            )
                           );
                           highUsageTrendAlertedStreakRef.current = 0;
                           setEnergySurgeAlert(null);
@@ -4968,6 +5956,20 @@ export default function App() {
                               ? 'Hide Energy Impact'
                               : 'Show Energy Impact'}
                           </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setActiveView('trend_analysis')}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded bg-rose-700/90 hover:bg-rose-600 text-white border border-rose-400/40 transition-colors cursor-pointer"
+                          title={
+                            isZh
+                              ? '打开专属 Trend Analysis 视图，将触发点叠加到能耗时间线以排查关联事件'
+                              : 'Open dedicated Trend Analysis view to inspect triggers overlaid on the energy timeline'
+                          }
+                        >
+                          <TrendingUp className="w-3 h-3" />
+                          <span>{isZh ? 'Trend Analysis 分析视图' : 'Trend Analysis'}</span>
                         </button>
 
                         <button
@@ -5283,6 +6285,11 @@ export default function App() {
                                     </span>
                                   </div>
                                   <div className="flex flex-wrap items-center gap-3 text-[10px] font-mono text-slate-400">
+                                    <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300">
+                                      {isZh
+                                        ? `灵敏度 Δ>=+${trendMinDelta.toFixed(2)}`
+                                        : `Min Δ>=+${trendMinDelta.toFixed(2)}`}
+                                    </span>
                                     <span className="inline-flex items-center gap-1">
                                       <span className="w-2.5 h-0.5 bg-rose-400" />
                                       {isZh ? '连续上升计数' : 'Increase Streak'}
@@ -5711,6 +6718,938 @@ export default function App() {
             </div>
           </div>
         )}
+
+          {activeView === 'trend_analysis' && (
+            <div className="space-y-5">
+              {/* Top Header & Quick Simulation Controls */}
+              <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-0.5 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <TrendingUp className="w-4 h-4 text-rose-500 shrink-0" />
+                    <h1 className="text-sm font-bold text-slate-900">
+                      {isZh
+                        ? 'Trend Analysis · 高功耗趋势叠加与事件关联视图'
+                        : 'Trend Analysis · Trigger Overlay & App Event Correlation'}
+                    </h1>
+                    <span
+                      className={`text-[10px] font-mono px-1.5 py-0.5 rounded border font-semibold ${
+                        highUsageTrendEnabled
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-slate-100 text-slate-600 border-slate-300'
+                      }`}
+                    >
+                      {highUsageTrendEnabled
+                        ? isZh
+                          ? '告警已启用'
+                          : 'ALERTS ENABLED'
+                        : isZh
+                          ? '告警已全局关闭'
+                          : 'ALERTS DISABLED'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    {isZh
+                      ? '将 High Usage Trend 触发标记与连升区间直接叠加在全量能耗时间线上，快速验证连升趋势是否由特定应用事件触发。'
+                      : 'Overlays High Usage Trend trigger markers and streak corridors directly onto the full energy timeline to correlate spikes with app events.'}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSimulateHighUsageTrend}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white transition-colors cursor-pointer"
+                  >
+                    <TrendingUp className="w-3.5 h-3.5" />
+                    <span>{isZh ? '模拟 5m 趋势触发' : 'Simulate 5m Trend'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSimulateEnergyJitterTest}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 transition-colors cursor-pointer"
+                  >
+                    <span>{isZh ? '抖动滤波测试' : 'Jitter Test'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSimulateHighBatteryImpact}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 transition-colors cursor-pointer"
+                  >
+                    <span>{isZh ? '模拟高能耗冲击' : 'Simulate High Load'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveView('simulator')}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-900 hover:bg-slate-800 text-white transition-colors cursor-pointer"
+                  >
+                    <Smartphone className="w-3.5 h-3.5" />
+                    <span>{isZh ? '返回模拟器' : 'Back to Simulator'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* KPI Summary Strip */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                <div className="rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
+                  <div className="text-[11px] font-medium text-slate-500">
+                    {isZh ? '时间线采样总集' : 'Energy Timeline Samples'}
+                  </div>
+                  <div className="mt-1 flex items-baseline justify-between gap-2">
+                    <span className="text-xl font-bold font-mono text-slate-900 tabular-nums">
+                      {trendAnalysisDateRange === 'ALL'
+                        ? trendAnalysisModel.points.length
+                        : `${trendAnalysisModel.points.length}/${trendAnalysisModel.totalTimelineCount}`}
+                    </span>
+                    <span className="text-[11px] font-mono text-teal-600 font-semibold">
+                      MA({ENERGY_MA_WINDOW_SIZE})={smoothedEnergyScore} · Raw={energyImpactScore}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-rose-200 bg-rose-50/40 p-3.5 shadow-sm">
+                  <div className="text-[11px] font-medium text-rose-700">
+                    {isZh ? '已叠加 Trend 触发次数' : 'Overlaid Trend Triggers'}
+                  </div>
+                  <div className="mt-1 flex items-baseline justify-between gap-2">
+                    <span className="text-xl font-bold font-mono text-rose-700 tabular-nums">
+                      {trendAnalysisModel.rangeOccurrences.length}
+                    </span>
+                    <span className="text-[11px] font-mono text-rose-600">
+                      {isZh
+                        ? `${trendAnalysisModel.triggerPointCount} 个时间线标记点`
+                        : `${trendAnalysisModel.triggerPointCount} timeline markers`}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
+                  <div className="text-[11px] font-medium text-slate-500">
+                    {isZh ? '最高关联应用事件' : 'Top Correlated App Event'}
+                  </div>
+                  <div className="mt-1 flex items-baseline justify-between gap-2 min-w-0">
+                    <span className="text-sm font-bold font-mono text-slate-900 truncate">
+                      {trendAnalysisModel.topCorrelatedEvent
+                        ? trendAnalysisModel.topCorrelatedEvent.event
+                        : isZh
+                          ? '暂无上升事件'
+                          : 'None yet'}
+                    </span>
+                    {trendAnalysisModel.topCorrelatedEvent && (
+                      <span className="text-[11px] font-mono text-amber-600 shrink-0 font-semibold">
+                        +{trendAnalysisModel.topCorrelatedEvent.maxDelta.toFixed(2)} peak Δ
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
+                  <div className="text-[11px] font-medium text-slate-500">
+                    {isZh ? '当前检测规则阈值' : 'Active Detection Rules'}
+                  </div>
+                  <div className="mt-1 flex items-baseline justify-between gap-2">
+                    <span className="text-sm font-bold font-mono text-slate-900 tabular-nums">
+                      &gt;= {trendConsecutiveThreshold}x / 5m
+                    </span>
+                    <span className="text-[11px] font-mono text-rose-600 font-semibold tabular-nums">
+                      Min Δ &gt;= +{trendMinDelta.toFixed(2)} pts
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Main Overlaid Timeline Chart Card */}
+              <div className="rounded-xl border border-slate-800 bg-slate-950 text-slate-100 p-4 shadow-sm space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-mono font-bold text-rose-300">
+                        {isZh
+                          ? 'Energy Timeline × High Usage Trend 触发叠加曲线'
+                          : 'Energy Timeline × High Usage Trend Overlay'}
+                      </span>
+                      {trendAnalysisDateRange !== 'ALL' && (
+                        <button
+                          type="button"
+                          onClick={() => setTrendAnalysisDateRange('ALL')}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-500/20 border border-teal-400/40 text-teal-200 text-[10px] font-mono hover:bg-teal-500/30 cursor-pointer"
+                        >
+                          <span>
+                            {trendAnalysisDateRange === '1H'
+                              ? isZh
+                                ? '时间范围: 最近 1 小时'
+                                : 'Range: Last 1H'
+                              : trendAnalysisDateRange === '6H'
+                                ? isZh
+                                  ? '时间范围: 最近 6 小时'
+                                  : 'Range: Last 6H'
+                                : isZh
+                                  ? '时间范围: 最近 24 小时'
+                                  : 'Range: Last 24H'}
+                          </span>
+                          <span>×</span>
+                        </button>
+                      )}
+                      {trendAnalysisEventFilter !== 'ALL' && (
+                        <button
+                          type="button"
+                          onClick={() => setTrendAnalysisEventFilter('ALL')}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/20 border border-sky-400/40 text-sky-200 text-[10px] font-mono hover:bg-sky-500/30 cursor-pointer"
+                        >
+                          <span>
+                            {isZh ? `聚焦事件: ${trendAnalysisEventFilter}` : `Focus: ${trendAnalysisEventFilter}`}
+                          </span>
+                          <span>×</span>
+                        </button>
+                      )}
+                      {selectedTrendTriggerId && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedTrendTriggerId(null)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-500/20 border border-rose-400/40 text-rose-200 text-[10px] font-mono hover:bg-rose-500/30 cursor-pointer"
+                        >
+                          <span>{isZh ? '清除选中触发区间' : 'Clear Selected Trigger'}</span>
+                          <span>×</span>
+                        </button>
+                      )}
+                    </div>
+                    <div className="text-[11px] font-mono text-slate-400">
+                      {isZh
+                        ? '玫瑰红垂直虚线与阴影带标示触发的 High Usage Trend 连升区间；将鼠标悬停到样本点可查看对应 App Event 与增量。'
+                        : 'Rose vertical markers and shaded corridors pinpoint High Usage Trend streaks; hover any sample to inspect the triggering app event and delta.'}
+                    </div>
+                  </div>
+
+                  {/* Overlay Layer Toggles, Date Range & App Event Filter */}
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                    <label className="inline-flex items-center gap-1.5 text-slate-300">
+                      <Clock className="w-3.5 h-3.5 text-teal-400" />
+                      <select
+                        aria-label={isZh ? '趋势分析时间范围筛选' : 'Trend Analysis Date Range Filter'}
+                        value={trendAnalysisDateRange}
+                        onChange={(e) => {
+                          setTrendAnalysisDateRange(
+                            e.target.value as '1H' | '6H' | '24H' | 'ALL'
+                          );
+                          setSelectedTrendTriggerId(null);
+                        }}
+                        className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-100 focus:outline-none focus:border-teal-400 cursor-pointer"
+                      >
+                        <option value="1H">{isZh ? '最近 1H (Last 1H)' : 'Last 1H'}</option>
+                        <option value="6H">{isZh ? '最近 6H (Last 6H)' : 'Last 6H'}</option>
+                        <option value="24H">{isZh ? '最近 24H (Last 24H)' : 'Last 24H'}</option>
+                        <option value="ALL">{isZh ? '全部时间 (All Time)' : 'All Time'}</option>
+                      </select>
+                    </label>
+
+                    <label className="inline-flex items-center gap-1.5 text-slate-300">
+                      <Filter className="w-3.5 h-3.5 text-sky-400" />
+                      <select
+                        aria-label={isZh ? '筛选关联应用事件' : 'Filter App Event Overlay'}
+                        value={trendAnalysisEventFilter}
+                        onChange={(e) => setTrendAnalysisEventFilter(e.target.value)}
+                        className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-100 focus:outline-none focus:border-sky-400 cursor-pointer"
+                      >
+                        <option value="ALL">
+                          {isZh ? '全部应用事件 (All Events)' : 'All App Events'}
+                        </option>
+                        {trendAnalysisModel.distinctEvents.map((ev) => (
+                          <option key={ev} value={ev}>
+                            {ev}
+                          </option>
+                        ))}
+                        {trendAnalysisEventFilter !== 'ALL' &&
+                          !trendAnalysisModel.distinctEvents.includes(trendAnalysisEventFilter) && (
+                            <option value={trendAnalysisEventFilter}>
+                              {trendAnalysisEventFilter}
+                            </option>
+                          )}
+                      </select>
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={() => setTrendAnalysisShowRaw((v) => !v)}
+                      className={`px-2 py-1 rounded border transition-colors cursor-pointer ${
+                        trendAnalysisShowRaw
+                          ? 'bg-sky-500/20 border-sky-400/50 text-sky-200'
+                          : 'bg-slate-900 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      Raw Score
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTrendAnalysisShowStreak((v) => !v)}
+                      className={`px-2 py-1 rounded border transition-colors cursor-pointer ${
+                        trendAnalysisShowStreak
+                          ? 'bg-rose-500/20 border-rose-400/50 text-rose-200'
+                          : 'bg-slate-900 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      {isZh ? '连升曲线' : 'Streak Axis'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTrendAnalysisShowCorridors((v) => !v)}
+                      className={`px-2 py-1 rounded border transition-colors cursor-pointer ${
+                        trendAnalysisShowCorridors
+                          ? 'bg-amber-500/20 border-amber-400/50 text-amber-200'
+                          : 'bg-slate-900 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      {isZh ? '触发阴影带' : 'Trigger Corridors'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Legend */}
+                <div className="flex flex-wrap items-center gap-4 text-[10.5px] font-mono text-slate-400 border-b border-slate-800/80 pb-2">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="w-3 h-0.5 bg-teal-400" />
+                    {isZh ? `MA(${ENERGY_MA_WINDOW_SIZE}) 滤波分` : `MA(${ENERGY_MA_WINDOW_SIZE}) Filtered`}
+                  </span>
+                  {trendAnalysisShowRaw && (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="w-3 h-0 border-t border-dashed border-sky-400" />
+                      {isZh ? '原始功耗分 (Raw)' : 'Raw Energy Score'}
+                    </span>
+                  )}
+                  {trendAnalysisShowStreak && (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="w-3 h-0.5 bg-rose-400" />
+                      {isZh ? '连升计数 (Streak)' : 'Consecutive Streak'}
+                    </span>
+                  )}
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-rose-600 text-white border border-rose-300/70 text-[9px] font-bold leading-none">
+                      <AlertTriangle className="w-2.5 h-2.5 text-amber-200 shrink-0" />
+                      <span>!</span>
+                    </span>
+                    {isZh
+                      ? 'High Usage Trend 触发数据点（点击可定位事件链路）'
+                      : 'Alert Triggered Point Badge (click to highlight trail)'}
+                  </span>
+                  {trendAnalysisEventFilter !== 'ALL' && (
+                    <span className="inline-flex items-center gap-1.5 text-sky-300">
+                      <span className="w-2.5 h-2.5 rounded-full bg-sky-400 border border-slate-950" />
+                      {isZh ? `匹配事件: ${trendAnalysisEventFilter}` : `Matched: ${trendAnalysisEventFilter}`}
+                    </span>
+                  )}
+                </div>
+
+                {/* Main ComposedChart */}
+                {trendAnalysisModel.points.length === 0 ? (
+                  <div className="w-full h-80 flex flex-col items-center justify-center rounded-lg border border-dashed border-slate-800 bg-slate-900/50 text-center p-6 space-y-2">
+                    <div className="text-xs font-mono font-semibold text-slate-200">
+                      {isZh
+                        ? '所选时间范围内暂无能耗采样数据'
+                        : 'No energy timeline samples in the selected date range'}
+                    </div>
+                    <p className="text-[11px] font-mono text-slate-400">
+                      {isZh
+                        ? '可切换回 All Time 查看全量历史，或点击顶部模拟按钮生成新的实时数据。'
+                        : 'Switch back to All Time or trigger a simulation above to populate samples in this window.'}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setTrendAnalysisDateRange('ALL')}
+                      className="px-3 py-1 rounded bg-teal-600 hover:bg-teal-500 text-white text-[11px] font-mono cursor-pointer"
+                    >
+                      {isZh ? '切换为 All Time' : 'Reset to All Time'}
+                    </button>
+                  </div>
+                ) : (
+                <div className="w-full h-80">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart
+                      data={trendAnalysisModel.points}
+                      margin={{ top: 24, right: 14, left: -10, bottom: 4 }}
+                    >
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                      <XAxis
+                        dataKey="index"
+                        tickFormatter={(val) =>
+                          trendAnalysisModel.timeLabelByIndex.get(Number(val)) ?? `#${val}`
+                        }
+                        tick={{ fill: '#94a3b8', fontSize: 10 }}
+                        stroke="#334155"
+                      />
+                      <YAxis
+                        yAxisId="score"
+                        domain={[
+                          0,
+                          (dataMax: number) =>
+                            Math.max(highBatteryImpactThreshold + 5, 20, Math.ceil(dataMax * 1.15)),
+                        ]}
+                        tick={{ fill: '#5eead4', fontSize: 10 }}
+                        stroke="#134e4a"
+                      />
+                      {trendAnalysisShowStreak && (
+                        <YAxis
+                          yAxisId="streak"
+                          orientation="right"
+                          allowDecimals={false}
+                          domain={[
+                            0,
+                            (dataMax: number) =>
+                              Math.max(trendConsecutiveThreshold + 1, 4, Math.ceil(dataMax + 1)),
+                          ]}
+                          tick={{ fill: '#fda4af', fontSize: 10 }}
+                          stroke="#4c0519"
+                        />
+                      )}
+                      <Tooltip
+                        content={({ active, payload }) => {
+                          if (!active || !payload || payload.length === 0) return null;
+                          const pt = payload[0]?.payload as
+                            | (typeof trendAnalysisModel.points)[number]
+                            | undefined;
+                          if (!pt) return null;
+                          return (
+                            <div className="rounded-lg border border-slate-700 bg-slate-950/95 px-3 py-2 text-[11px] font-mono shadow-xl space-y-1 max-w-xs">
+                              <div className="flex items-center justify-between gap-3 text-slate-400">
+                                <span>
+                                  #{pt.index} · {pt.timeHms}
+                                </span>
+                                <span className="text-slate-500">{pt.sessionTag}</span>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-slate-400">Event:</span>
+                                <span
+                                  className={`px-1.5 py-0.5 rounded font-semibold ${
+                                    pt.isTriggerPoint
+                                      ? 'bg-rose-500/25 text-rose-200 border border-rose-400/40'
+                                      : pt.isStreakStep
+                                        ? 'bg-amber-500/20 text-amber-200 border border-amber-400/40'
+                                        : 'bg-slate-800 text-sky-200 border border-slate-700'
+                                  }`}
+                                >
+                                  {pt.event}
+                                </span>
+                              </div>
+                              <div className="text-teal-300">
+                                MA({ENERGY_MA_WINDOW_SIZE}): <strong>{pt.filteredScore}</strong> · Raw:{' '}
+                                <strong>{pt.rawScore}</strong> ({pt.stepDelta >= 0 ? '+' : ''}
+                                {pt.stepDelta.toFixed(2)} pts)
+                              </div>
+                              <div className="text-rose-300">
+                                Streak: <strong>{pt.streak}/{trendConsecutiveThreshold}x</strong> · CPU:{' '}
+                                {pt.cpuMs.toFixed(1)} ms · Net: {pt.netReqs}r
+                              </div>
+                              {pt.matchedOccurrence && (
+                                <div className="mt-1 pt-1 border-t border-rose-500/30 text-rose-200 space-y-0.5">
+                                  <div className="font-bold">
+                                    HIGH USAGE TREND TRIGGER ({pt.matchedOccurrence.consecutiveIncreases}x · +
+                                    {pt.matchedOccurrence.delta.toFixed(2)} pts / {pt.matchedOccurrence.windowSec}s)
+                                  </div>
+                                  <div className="text-[10px] text-rose-300/90 break-words">
+                                    Trail: [{pt.matchedOccurrence.events.join(' -> ')}]
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        }}
+                      />
+
+                      <ReferenceLine
+                        yAxisId="score"
+                        y={highBatteryImpactThreshold}
+                        stroke="#f59e0b"
+                        strokeDasharray="4 4"
+                        label={{
+                          value: `High >= ${highBatteryImpactThreshold}`,
+                          position: 'insideTopRight',
+                          fill: '#fbbf24',
+                          fontSize: 10,
+                        }}
+                      />
+
+                      {trendAnalysisShowCorridors &&
+                        trendAnalysisModel.corridors.map((c) => {
+                          const isSelected = selectedTrendTriggerId === c.id;
+                          return (
+                            <ReferenceArea
+                              key={`corridor-${c.id}`}
+                              yAxisId="score"
+                              x1={c.x1}
+                              x2={c.x2}
+                              fill="#f43f5e"
+                              fillOpacity={isSelected ? 0.24 : 0.11}
+                              stroke={isSelected ? '#fda4af' : '#fb7185'}
+                              strokeOpacity={isSelected ? 0.8 : 0.25}
+                            />
+                          );
+                        })}
+
+                      {trendAnalysisModel.points
+                        .filter((p) => p.isTriggerPoint)
+                        .map((p) => {
+                          const isSelected =
+                            selectedTrendTriggerId !== null &&
+                            p.matchedOccurrence?.id === selectedTrendTriggerId;
+                          return (
+                            <ReferenceLine
+                              key={`trig-line-${p.index}`}
+                              yAxisId="score"
+                              x={p.index}
+                              stroke={isSelected ? '#fda4af' : '#f43f5e'}
+                              strokeWidth={isSelected ? 2 : 1.25}
+                              strokeDasharray="3 3"
+                              label={{
+                                value: p.matchedOccurrence
+                                  ? `${p.matchedOccurrence.consecutiveIncreases}x · ${p.event}`
+                                  : `Trend · ${p.event}`,
+                                position: 'top',
+                                fill: isSelected ? '#fde68a' : '#fda4af',
+                                fontSize: 9.5,
+                              }}
+                            />
+                          );
+                        })}
+
+                      {trendAnalysisShowRaw && (
+                        <Line
+                          yAxisId="score"
+                          type="monotone"
+                          dataKey="rawScore"
+                          name={isZh ? '原始功耗分' : 'Raw Energy Score'}
+                          stroke="#38bdf8"
+                          strokeWidth={1.6}
+                          strokeDasharray="3 3"
+                          isAnimationActive={false}
+                          activeDot={{ r: 5.5, fill: '#38bdf8', stroke: '#ffffff', strokeWidth: 1.6 }}
+                          dot={(dotProps) => {
+                            const { cx, cy, index, payload } = dotProps;
+                            if (typeof cx !== 'number' || typeof cy !== 'number') {
+                              return <g key={`ta-raw-empty-${index ?? 0}`} />;
+                            }
+                            const pt = payload as
+                              | (typeof trendAnalysisModel.points)[number]
+                              | undefined;
+                            if (!pt) return <g key={`ta-raw-none-${index ?? 0}`} />;
+                            const isFilteredHighlight =
+                              trendAnalysisEventFilter !== 'ALL' && pt.matchesEventFilter;
+                            if (!pt.isTriggerPoint && !isFilteredHighlight) {
+                              return <g key={`ta-raw-skip-${pt.index}`} />;
+                            }
+                            if (pt.isTriggerPoint) {
+                              const isSelected =
+                                selectedTrendTriggerId !== null &&
+                                pt.matchedOccurrence?.id === selectedTrendTriggerId;
+                              return (
+                                <g key={`ta-raw-trig-${pt.index}`}>
+                                  <polygon
+                                    points={`${cx},${cy - 6.5} ${cx + 6.5},${cy} ${cx},${cy + 6.5} ${cx - 6.5},${cy}`}
+                                    fill={isSelected ? '#f59e0b' : '#f43f5e'}
+                                    stroke="#ffffff"
+                                    strokeWidth={1.4}
+                                  />
+                                  <circle cx={cx} cy={cy} r={1.8} fill="#ffffff" />
+                                </g>
+                              );
+                            }
+                            return (
+                              <circle
+                                key={`ta-raw-dot-${pt.index}`}
+                                cx={cx}
+                                cy={cy}
+                                r={4.5}
+                                fill="#38bdf8"
+                                stroke="#ffffff"
+                                strokeWidth={1.5}
+                              />
+                            );
+                          }}
+                        />
+                      )}
+
+                      <Area
+                        yAxisId="score"
+                        type="monotone"
+                        dataKey="filteredScore"
+                        name={isZh ? `移动平均 MA(${ENERGY_MA_WINDOW_SIZE})` : `MA(${ENERGY_MA_WINDOW_SIZE}) Score`}
+                        stroke="#2dd4bf"
+                        fill="#14b8a6"
+                        fillOpacity={0.14}
+                        strokeWidth={2.4}
+                        isAnimationActive={false}
+                        activeDot={{ r: 5.5, fill: '#2dd4bf', stroke: '#ffffff', strokeWidth: 1.6 }}
+                        dot={(dotProps) => {
+                          const { cx, cy, index, payload } = dotProps;
+                          if (typeof cx !== 'number' || typeof cy !== 'number') {
+                            return <g key={`ta-ma-empty-${index ?? 0}`} />;
+                          }
+                          const pt = payload as
+                            | (typeof trendAnalysisModel.points)[number]
+                            | undefined;
+                          if (!pt) return <g key={`ta-ma-none-${index ?? 0}`} />;
+                          const isFocused =
+                            trendAnalysisEventFilter !== 'ALL' && pt.matchesEventFilter;
+                          if (pt.isTriggerPoint) {
+                            const occ = pt.matchedOccurrence;
+                            const isSelected =
+                              selectedTrendTriggerId !== null &&
+                              occ?.id === selectedTrendTriggerId;
+                            const placeBelow = cy < 48;
+                            const badgeY = placeBelow ? cy + 13 : cy - 29;
+                            const badgeLabel = occ
+                              ? `${occ.consecutiveIncreases}x`
+                              : `${pt.streak}x`;
+                            const badgeW = badgeLabel.length >= 3 ? 40 : 34;
+                            const badgeX = cx - badgeW / 2;
+                            const triCenterX = badgeX + 8.5;
+                            const triTopY = badgeY + 3.5;
+                            const fillHex = isSelected ? '#d97706' : '#e11d48';
+                            const strokeHex = isSelected ? '#fde68a' : '#fecdd3';
+
+                            return (
+                              <g
+                                key={`ta-ma-trig-${pt.index}`}
+                                className={occ ? 'cursor-pointer' : undefined}
+                                onClick={
+                                  occ
+                                    ? (e) => {
+                                        e.stopPropagation();
+                                        setSelectedTrendTriggerId((prev) =>
+                                          prev === occ.id ? null : occ.id
+                                        );
+                                      }
+                                    : undefined
+                                }
+                              >
+                                <title>
+                                  {occ
+                                    ? `Alert Triggered (${occ.consecutiveIncreases}x · ${pt.event} · +${occ.delta.toFixed(2)} pts)`
+                                    : `Alert Triggered (${pt.streak}x · ${pt.event})`}
+                                </title>
+                                {/* Halo ring highlighting the exact triggered sample */}
+                                <circle
+                                  cx={cx}
+                                  cy={cy}
+                                  r={isSelected ? 11 : 8.5}
+                                  fill={fillHex}
+                                  fillOpacity={isSelected ? 0.28 : 0.18}
+                                  stroke={strokeHex}
+                                  strokeWidth={1}
+                                  strokeOpacity={0.85}
+                                />
+                                {/* Connector stem between point and badge */}
+                                <line
+                                  x1={cx}
+                                  y1={placeBelow ? cy + 5 : cy - 5}
+                                  x2={cx}
+                                  y2={placeBelow ? badgeY : badgeY + 16}
+                                  stroke={strokeHex}
+                                  strokeWidth={1.25}
+                                />
+                                {/* Anchor dot on the curve */}
+                                <circle
+                                  cx={cx}
+                                  cy={cy}
+                                  r={5}
+                                  fill={fillHex}
+                                  stroke="#ffffff"
+                                  strokeWidth={1.6}
+                                />
+                                {/* Floating Alert Icon + Streak Badge */}
+                                <rect
+                                  x={badgeX}
+                                  y={badgeY}
+                                  width={badgeW}
+                                  height={16}
+                                  rx={4}
+                                  fill={fillHex}
+                                  stroke={strokeHex}
+                                  strokeWidth={1.1}
+                                />
+                                {/* Warning triangle alert icon inside badge */}
+                                <polygon
+                                  points={`${triCenterX},${triTopY} ${triCenterX + 4.5},${triTopY + 8.5} ${triCenterX - 4.5},${triTopY + 8.5}`}
+                                  fill="#fef08a"
+                                />
+                                <rect
+                                  x={triCenterX - 0.65}
+                                  y={triTopY + 2.7}
+                                  width={1.3}
+                                  height={3.2}
+                                  rx={0.5}
+                                  fill="#991b1b"
+                                />
+                                <circle
+                                  cx={triCenterX}
+                                  cy={triTopY + 7.1}
+                                  r={0.7}
+                                  fill="#991b1b"
+                                />
+                                <text
+                                  x={badgeX + 15.5}
+                                  y={badgeY + 11.2}
+                                  fill="#ffffff"
+                                  fontSize={9}
+                                  fontWeight={700}
+                                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                                >
+                                  {badgeLabel}
+                                </text>
+                              </g>
+                            );
+                          }
+                          const radius = isFocused ? 4.5 : pt.isStreakStep ? 3.5 : 2.5;
+                          const fill = isFocused
+                            ? '#38bdf8'
+                            : pt.isStreakStep
+                              ? '#f59e0b'
+                              : '#2dd4bf';
+                          return (
+                            <circle
+                              key={`ta-ma-dot-${pt.index}`}
+                              cx={cx}
+                              cy={cy}
+                              r={radius}
+                              fill={fill}
+                              stroke="#0f172a"
+                              strokeWidth={1.2}
+                            />
+                          );
+                        }}
+                      />
+
+                      {trendAnalysisShowStreak && (
+                        <Line
+                          yAxisId="streak"
+                          type="stepAfter"
+                          dataKey="streak"
+                          name={isZh ? '连续上升计数' : 'Consecutive Streak'}
+                          stroke="#fb7185"
+                          strokeWidth={1.8}
+                          dot={false}
+                          isAnimationActive={false}
+                        />
+                      )}
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+                )}
+              </div>
+
+              {/* Event Correlation Breakdown & Trigger Occurrences Grid */}
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                {/* App Event Correlation Table */}
+                <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-xs font-bold text-slate-900">
+                        {isZh
+                          ? '应用事件与连升趋势关联统计 (Event Correlation)'
+                          : 'App Event Correlation Breakdown'}
+                      </h2>
+                      <p className="text-[11px] text-slate-500">
+                        {isZh
+                          ? '点击任意事件行可在上方时间线图表中高亮对应的样本点。'
+                          : 'Click any event row to highlight matching samples on the timeline chart above.'}
+                      </p>
+                    </div>
+                    {trendAnalysisEventFilter !== 'ALL' && (
+                      <button
+                        type="button"
+                        onClick={() => setTrendAnalysisEventFilter('ALL')}
+                        className="px-2 py-1 rounded text-[11px] font-mono bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
+                      >
+                        {isZh ? '显示全部' : 'Show All'}
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs font-mono">
+                      <thead>
+                        <tr className="border-b border-slate-200 text-[10.5px] text-slate-500">
+                          <th className="py-1.5 pr-2 font-semibold">App Event</th>
+                          <th className="py-1.5 px-2 font-semibold text-right">
+                            {isZh ? '样本数' : 'Samples'}
+                          </th>
+                          <th className="py-1.5 px-2 font-semibold text-right">
+                            {isZh ? '达标连升步' : 'Streak Steps'}
+                          </th>
+                          <th className="py-1.5 px-2 font-semibold text-right">
+                            {isZh ? '关联触发' : 'In Triggers'}
+                          </th>
+                          <th className="py-1.5 pl-2 font-semibold text-right">
+                            {isZh ? '峰值 Δ' : 'Peak Δ'}
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {trendAnalysisModel.eventStats.map((stat) => {
+                          const isSelected = trendAnalysisEventFilter === stat.event;
+                          return (
+                            <tr
+                              key={stat.event}
+                              onClick={() =>
+                                setTrendAnalysisEventFilter((prev) =>
+                                  prev === stat.event ? 'ALL' : stat.event
+                                )
+                              }
+                              className={`cursor-pointer transition-colors ${
+                                isSelected
+                                  ? 'bg-sky-50 text-sky-900'
+                                  : 'hover:bg-slate-50 text-slate-700'
+                              }`}
+                            >
+                              <td className="py-2 pr-2 font-semibold flex items-center gap-1.5">
+                                <span
+                                  className={`inline-block w-2 h-2 rounded-full shrink-0 ${
+                                    stat.triggerInvolvementCount > 0
+                                      ? 'bg-rose-500'
+                                      : stat.streakStepCount > 0
+                                        ? 'bg-amber-500'
+                                        : 'bg-slate-300'
+                                  }`}
+                                />
+                                <span className="truncate">{stat.event}</span>
+                              </td>
+                              <td className="py-2 px-2 text-right tabular-nums">{stat.totalCount}</td>
+                              <td className="py-2 px-2 text-right tabular-nums text-amber-700 font-semibold">
+                                {stat.streakStepCount}
+                              </td>
+                              <td className="py-2 px-2 text-right tabular-nums">
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                    stat.triggerInvolvementCount > 0
+                                      ? 'bg-rose-100 text-rose-700'
+                                      : 'bg-slate-100 text-slate-500'
+                                  }`}
+                                >
+                                  {stat.triggerInvolvementCount}
+                                </span>
+                              </td>
+                              <td className="py-2 pl-2 text-right tabular-nums">
+                                {stat.maxDelta >= 0 ? '+' : ''}
+                                {stat.maxDelta.toFixed(2)}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Trigger-to-Event Trail List */}
+                <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-xs font-bold text-slate-900">
+                        {isZh
+                          ? '触发记录与完整事件链路 (Trigger Event Trails)'
+                          : 'High Usage Trend Trigger Trails'}
+                      </h2>
+                      <p className="text-[11px] text-slate-500">
+                        {isZh
+                          ? '点击触发条目可高亮对应阴影区间，点击事件标签可筛选同类事件。'
+                          : 'Select a trigger card to emphasize its shaded corridor, or click an event pill to filter the chart.'}
+                      </p>
+                    </div>
+                    <span className="text-[11px] font-mono text-slate-500">
+                      {trendAnalysisDateRange === 'ALL'
+                        ? `${highUsageTrendOccurrences.length} ${isZh ? '条触发' : 'triggers'}`
+                        : `${trendAnalysisModel.rangeOccurrences.length}/${highUsageTrendOccurrences.length} ${isZh ? '条触发' : 'triggers'}`}
+                    </span>
+                  </div>
+
+                  {trendAnalysisModel.rangeOccurrences.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-5 text-center space-y-2">
+                      <div className="text-xs font-medium text-slate-700">
+                        {trendAnalysisDateRange === 'ALL' || highUsageTrendOccurrences.length === 0
+                          ? isZh
+                            ? '当前暂无 High Usage Trend 触发记录'
+                            : 'No High Usage Trend triggers recorded yet'
+                          : isZh
+                            ? '所选时间范围内暂无 High Usage Trend 触发记录'
+                            : 'No High Usage Trend triggers recorded in the selected date range'}
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        {trendAnalysisDateRange !== 'ALL' && highUsageTrendOccurrences.length > 0
+                          ? isZh
+                            ? '尝试将图表右上角时间范围切换为更长窗口（如 All Time）查看历史触发。'
+                            : 'Try expanding the date-range selector above (e.g. All Time) to inspect earlier triggers.'
+                          : isZh
+                            ? '点击上方「模拟 5m 趋势触发」或在模拟器连续发送提问，即可在时间线上叠加触发标记与事件链路。'
+                            : 'Click "Simulate 5m Trend" above or send consecutive queries in the simulator to overlay triggers onto the timeline.'}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                      {trendAnalysisModel.rangeOccurrences.map((occ) => {
+                        const isSelected = selectedTrendTriggerId === occ.id;
+                        return (
+                          <div
+                            key={occ.id}
+                            onClick={() =>
+                              setSelectedTrendTriggerId((prev) => (prev === occ.id ? null : occ.id))
+                            }
+                            className={`rounded-lg border p-3 space-y-2 cursor-pointer transition-colors ${
+                              isSelected
+                                ? 'border-rose-400 bg-rose-50/70'
+                                : 'border-slate-200 bg-slate-50/60 hover:bg-slate-50'
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="px-1.5 py-0.5 rounded bg-rose-600 text-white font-semibold">
+                                  {occ.consecutiveIncreases}x &gt;= {occ.thresholdAtTrigger}x
+                                </span>
+                                <span className="font-semibold text-slate-800">
+                                  {occ.startScore} -&gt; {occ.curScore} (+{occ.delta.toFixed(2)} pts)
+                                </span>
+                                <span className="text-slate-500">
+                                  {occ.windowSec}s · {occ.timeMs}
+                                </span>
+                              </div>
+                              {occ.scores.length > 0 && (
+                                <TrendScoreSparkline
+                                  points={occ.scores}
+                                  compact
+                                  active={isSelected}
+                                  isZh={isZh}
+                                />
+                              )}
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="text-[10px] font-mono text-slate-500">
+                                {isZh ? '关联事件链:' : 'Event Trail:'}
+                              </span>
+                              {occ.events.map((ev, evIdx) => (
+                                <button
+                                  key={`${occ.id}-ev-${evIdx}`}
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setTrendAnalysisEventFilter((prev) =>
+                                      prev === ev ? 'ALL' : ev
+                                    );
+                                  }}
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-mono border transition-colors cursor-pointer ${
+                                    trendAnalysisEventFilter === ev
+                                      ? 'bg-sky-600 text-white border-sky-600'
+                                      : 'bg-white text-slate-700 border-slate-200 hover:border-sky-400'
+                                  }`}
+                                >
+                                  {ev}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           {activeView === 'files' && (
             <div className="space-y-4">
