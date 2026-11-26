@@ -797,6 +797,7 @@ export default function App() {
   >('ALL');
   const [trendRangeTick, setTrendRangeTick] = useState<number>(0);
   const [trendHistoryCopied, setTrendHistoryCopied] = useState<boolean>(false);
+  const [trendCsvExported, setTrendCsvExported] = useState<boolean>(false);
   const [trendConfigCopied, setTrendConfigCopied] = useState<boolean>(false);
   const trendConfigCopiedTimerRef = useRef<number | null>(null);
   const [trendAnalysisDateRange, setTrendAnalysisDateRange] = useState<
@@ -2044,6 +2045,88 @@ export default function App() {
 
     setTrendHistoryCopied(true);
     window.setTimeout(() => setTrendHistoryCopied(false), 1800);
+  };
+
+  const handleExportTrendOccurrencesCsv = (
+    overrideList?: typeof highUsageTrendOccurrences
+  ) => {
+    const targetList =
+      overrideList && overrideList.length > 0
+        ? overrideList
+        : filteredTrendOccurrences.length > 0
+          ? filteredTrendOccurrences
+          : highUsageTrendOccurrences;
+    if (targetList.length === 0) return;
+
+    const escapeCsvCell = (value: string | number): string => {
+      const str = String(value);
+      if (/[",\n\r]/.test(str)) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const headers = [
+      'occurrence_id',
+      'triggered_at_iso',
+      'triggered_time_ms',
+      'session_tag',
+      'streak_count',
+      'streak_threshold_at_trigger',
+      'min_delta_threshold',
+      'start_score',
+      'end_score',
+      'delta_score',
+      'window_sec',
+      'event_trail',
+      'score_spike_path',
+    ];
+
+    const rows = targetList.map((occ) => {
+      const triggeredAtIso = new Date(occ.triggeredAtMs).toISOString();
+      const eventTrail = occ.events.length > 0 ? occ.events.join(' -> ') : 'N/A';
+      const spikePath =
+        occ.scores.length > 0
+          ? occ.scores.map((p) => `${p.score.toFixed(2)}@${p.time}`).join(' -> ')
+          : `${occ.startScore.toFixed(2)} -> ${occ.curScore.toFixed(2)}`;
+      return [
+        occ.id,
+        triggeredAtIso,
+        occ.timeMs,
+        occ.sessionTag,
+        occ.consecutiveIncreases,
+        occ.thresholdAtTrigger,
+        trendMinDelta.toFixed(2),
+        occ.startScore.toFixed(2),
+        occ.curScore.toFixed(2),
+        occ.delta.toFixed(2),
+        occ.windowSec,
+        eventTrail,
+        spikePath,
+      ]
+        .map(escapeCsvCell)
+        .join(',');
+    });
+
+    const csvContent = `\uFEFF${[headers.join(','), ...rows].join('\n')}`;
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const fileStamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(
+      now.getHours()
+    )}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `high_usage_trend_occurrences_${fileStamp}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    setTrendCsvExported(true);
+    window.setTimeout(() => setTrendCsvExported(false), 1800);
   };
 
   const handleCopyTrendConfiguration = async () => {
@@ -5514,6 +5597,31 @@ export default function App() {
                                     : isZh ? '复制到剪贴板' : 'Copy to Clipboard'}
                                 </span>
                               </button>
+                              <button
+                                type="button"
+                                onClick={() => handleExportTrendOccurrencesCsv()}
+                                title={
+                                  isZh
+                                    ? '导出当前 High Usage Trend 触发记录（含事件链与连升数据）为 CSV 文件'
+                                    : 'Download current High Usage Trend occurrences (with event trails and streak data) as CSV'
+                                }
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-mono transition-colors cursor-pointer ${
+                                  trendCsvExported
+                                    ? 'border-emerald-500/50 bg-emerald-950/75 text-emerald-200'
+                                    : 'border-sky-500/35 bg-slate-900 hover:bg-slate-800 text-sky-100'
+                                }`}
+                              >
+                                {trendCsvExported ? (
+                                  <Check className="w-3 h-3 text-emerald-400" />
+                                ) : (
+                                  <Download className="w-3 h-3 text-sky-300" />
+                                )}
+                                <span>
+                                  {trendCsvExported
+                                    ? isZh ? '已导出 CSV' : 'CSV Exported'
+                                    : isZh ? '导出 CSV' : 'Export CSV'}
+                                </span>
+                              </button>
                               <span className="text-[9.5px] text-slate-400 hidden sm:inline">
                                 {isZh ? '按时间倒序 · 最多 20 条' : 'Newest first · Max 20'}
                               </span>
@@ -7020,6 +7128,12 @@ export default function App() {
                       {isZh ? '连升计数 (Streak)' : 'Consecutive Streak'}
                     </span>
                   )}
+                  <span className="inline-flex items-center gap-1.5 text-rose-300">
+                    <span className="w-3.5 h-0 border-t-2 border-dashed border-rose-400" />
+                    {isZh
+                      ? `连升触发基准线 (>=${trendConsecutiveThreshold}x)`
+                      : `Streak Threshold (>=${trendConsecutiveThreshold}x)`}
+                  </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-rose-600 text-white border border-rose-300/70 text-[9px] font-bold leading-none">
                       <AlertTriangle className="w-2.5 h-2.5 text-amber-200 shrink-0" />
@@ -7084,20 +7198,19 @@ export default function App() {
                         tick={{ fill: '#5eead4', fontSize: 10 }}
                         stroke="#134e4a"
                       />
-                      {trendAnalysisShowStreak && (
-                        <YAxis
-                          yAxisId="streak"
-                          orientation="right"
-                          allowDecimals={false}
-                          domain={[
-                            0,
-                            (dataMax: number) =>
-                              Math.max(trendConsecutiveThreshold + 1, 4, Math.ceil(dataMax + 1)),
-                          ]}
-                          tick={{ fill: '#fda4af', fontSize: 10 }}
-                          stroke="#4c0519"
-                        />
-                      )}
+                      <YAxis
+                        yAxisId="streak"
+                        orientation="right"
+                        hide={!trendAnalysisShowStreak}
+                        allowDecimals={false}
+                        domain={[
+                          0,
+                          (dataMax: number) =>
+                            Math.max(trendConsecutiveThreshold + 1, 4, Math.ceil(dataMax + 1)),
+                        ]}
+                        tick={{ fill: '#fda4af', fontSize: 10 }}
+                        stroke="#4c0519"
+                      />
                       <Tooltip
                         content={({ active, payload }) => {
                           if (!active || !payload || payload.length === 0) return null;
@@ -7161,6 +7274,22 @@ export default function App() {
                           value: `High >= ${highBatteryImpactThreshold}`,
                           position: 'insideTopRight',
                           fill: '#fbbf24',
+                          fontSize: 10,
+                        }}
+                      />
+
+                      <ReferenceLine
+                        yAxisId="streak"
+                        y={trendConsecutiveThreshold}
+                        stroke="#fb7185"
+                        strokeWidth={1.6}
+                        strokeDasharray="6 3"
+                        label={{
+                          value: isZh
+                            ? `连升触发阈值 >= ${trendConsecutiveThreshold}x`
+                            : `Streak Threshold >= ${trendConsecutiveThreshold}x`,
+                          position: 'insideTopLeft',
+                          fill: '#fda4af',
                           fontSize: 10,
                         }}
                       />
@@ -7551,11 +7680,43 @@ export default function App() {
                           : 'Select a trigger card to emphasize its shaded corridor, or click an event pill to filter the chart.'}
                       </p>
                     </div>
-                    <span className="text-[11px] font-mono text-slate-500">
-                      {trendAnalysisDateRange === 'ALL'
-                        ? `${highUsageTrendOccurrences.length} ${isZh ? '条触发' : 'triggers'}`
-                        : `${trendAnalysisModel.rangeOccurrences.length}/${highUsageTrendOccurrences.length} ${isZh ? '条触发' : 'triggers'}`}
-                    </span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[11px] font-mono text-slate-500">
+                        {trendAnalysisDateRange === 'ALL'
+                          ? `${highUsageTrendOccurrences.length} ${isZh ? '条触发' : 'triggers'}`
+                          : `${trendAnalysisModel.rangeOccurrences.length}/${highUsageTrendOccurrences.length} ${isZh ? '条触发' : 'triggers'}`}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={trendAnalysisModel.rangeOccurrences.length === 0}
+                        onClick={() =>
+                          handleExportTrendOccurrencesCsv(trendAnalysisModel.rangeOccurrences)
+                        }
+                        title={
+                          isZh
+                            ? '导出当前触发记录、事件链与连升数据为 CSV'
+                            : 'Export displayed High Usage Trend occurrences (with event trails and streak data) as CSV'
+                        }
+                        className={`inline-flex items-center gap-1 px-2 py-1 rounded border text-[11px] font-mono transition-colors ${
+                          trendAnalysisModel.rangeOccurrences.length === 0
+                            ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
+                            : trendCsvExported
+                              ? 'bg-emerald-50 border-emerald-300 text-emerald-700 cursor-pointer'
+                              : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700 cursor-pointer'
+                        }`}
+                      >
+                        {trendCsvExported ? (
+                          <Check className="w-3 h-3 text-emerald-600" />
+                        ) : (
+                          <Download className="w-3 h-3 text-sky-600" />
+                        )}
+                        <span>
+                          {trendCsvExported
+                            ? isZh ? '已导出 CSV' : 'CSV Exported'
+                            : isZh ? '导出 CSV' : 'Export CSV'}
+                        </span>
+                      </button>
+                    </div>
                   </div>
 
                   {trendAnalysisModel.rangeOccurrences.length === 0 ? (
