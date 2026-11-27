@@ -608,6 +608,33 @@ function loadPersistedTrendSoundTone(): TrendSoundTone {
   }
 }
 
+const TRIGGER_CONFIDENCE_WINDOW_MS = 30_000;
+
+function computeTriggerConfidenceFromWindow(
+  samples: Array<{ ts: number; score: number; event: string }>,
+  triggerTsMs: number
+): {
+  confidencePct: number;
+  eventCount30s: number;
+  densityPerSec: number;
+} {
+  const cutoff = triggerTsMs - TRIGGER_CONFIDENCE_WINDOW_MS;
+  const activeInWindow = samples.filter(
+    (s) =>
+      s.ts >= cutoff &&
+      s.ts <= triggerTsMs &&
+      s.event !== 'INIT' &&
+      s.event !== 'INIT_BASELINE' &&
+      s.event !== 'RESET' &&
+      s.event !== 'STREAK_RESET'
+  );
+  const eventCount30s = activeInWindow.length;
+  const densityPerSec = Math.round((eventCount30s / 30) * 100) / 100;
+  const rawProb = 1 / (1 + Math.exp(-0.58 * (eventCount30s - 2.15)));
+  const confidencePct = Math.max(5, Math.min(99, Math.round(rawProb * 100)));
+  return { confidencePct, eventCount30s, densityPerSec };
+}
+
 const HIGH_USAGE_TREND_ENABLED_STORAGE_KEY = 'gemini_eye_high_usage_trend_enabled';
 
 function loadPersistedHighUsageTrendEnabled(): boolean {
@@ -789,6 +816,11 @@ export default function App() {
       events: string[];
       scores: TrendSpikePoint[];
       triggeredAtMs: number;
+      wasHighBatteryImpact: boolean;
+      highBatteryThresholdAtTrigger: number;
+      triggerConfidencePct: number;
+      preceding30sEvents: number;
+      preceding30sDensityPerSec: number;
     }>
   >([]);
   const [trendOccurrencesExpanded, setTrendOccurrencesExpanded] = useState<boolean>(true);
@@ -832,6 +864,8 @@ export default function App() {
       loadPersistedTrendMinDelta()
     )
   );
+  const highBatteryImpactThresholdRef = useRef<number>(highBatteryImpactThreshold);
+  highBatteryImpactThresholdRef.current = highBatteryImpactThreshold;
   const highUsageTrendEnabledRef = useRef<boolean>(highUsageTrendEnabled);
   highUsageTrendEnabledRef.current = highUsageTrendEnabled;
   const trendConsecutiveThresholdRef = useRef<number>(trendConsecutiveThreshold);
@@ -1376,6 +1410,9 @@ export default function App() {
       }));
       if (streak > highUsageTrendAlertedStreakRef.current) {
         highUsageTrendAlertedStreakRef.current = streak;
+        const highThresholdAtTrigger = highBatteryImpactThresholdRef.current;
+        const wasHighBatteryImpact = latestSample.score >= highThresholdAtTrigger;
+        const confidence = computeTriggerConfidenceFromWindow(pruned, nowTs);
         setHighUsageTrendOccurrences((prev) => [
           {
             id: `trend-${nowTs}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1390,6 +1427,11 @@ export default function App() {
             events: trailEvents,
             scores: spikeScores,
             triggeredAtMs: nowTs,
+            wasHighBatteryImpact,
+            highBatteryThresholdAtTrigger: highThresholdAtTrigger,
+            triggerConfidencePct: confidence.confidencePct,
+            preceding30sEvents: confidence.eventCount30s,
+            preceding30sDensityPerSec: confidence.densityPerSec,
           },
           ...prev,
         ].slice(0, 20));
@@ -2003,7 +2045,7 @@ export default function App() {
             ? occ.scores.map((p) => `${p.score.toFixed(2)}@${p.time}`).join(' -> ')
             : `${occ.startScore} -> ${occ.curScore}`;
         const eventsSummary = occ.events.length > 0 ? occ.events.join(' -> ') : 'N/A';
-        return `${idx + 1}. [${occ.timeMs}] ${occ.consecutiveIncreases}x >= ${occ.thresholdAtTrigger}x | ${occ.startScore} -> ${occ.curScore} (+${occ.delta.toFixed(2)} pts) | ${occ.windowSec}s | ${occ.sessionTag}\n   Spike: ${spikePath}\n   Events: [${eventsSummary}]`;
+        return `${idx + 1}. [${occ.timeMs}] ${occ.consecutiveIncreases}x >= ${occ.thresholdAtTrigger}x | Conf ${occ.triggerConfidencePct}% (${occ.preceding30sEvents} ev/30s) | ${occ.startScore} -> ${occ.curScore} (+${occ.delta.toFixed(2)} pts) | ${occ.windowSec}s | ${occ.sessionTag}\n   Spike: ${spikePath}\n   Events: [${eventsSummary}]`;
       }),
     ];
 
@@ -2078,6 +2120,11 @@ export default function App() {
       'end_score',
       'delta_score',
       'window_sec',
+      'was_high_battery_impact',
+      'high_battery_threshold_at_trigger',
+      'trigger_confidence_pct',
+      'preceding_30s_events',
+      'preceding_30s_density_per_sec',
       'event_trail',
       'score_spike_path',
     ];
@@ -2101,6 +2148,11 @@ export default function App() {
         occ.curScore.toFixed(2),
         occ.delta.toFixed(2),
         occ.windowSec,
+        occ.wasHighBatteryImpact ? 'true' : 'false',
+        occ.highBatteryThresholdAtTrigger,
+        occ.triggerConfidencePct,
+        occ.preceding30sEvents,
+        occ.preceding30sDensityPerSec.toFixed(2),
         eventTrail,
         spikePath,
       ]
@@ -2254,6 +2306,9 @@ export default function App() {
 
     if (consecutiveIncreases > highUsageTrendAlertedStreakRef.current) {
       highUsageTrendAlertedStreakRef.current = consecutiveIncreases;
+      const highThresholdAtTrigger = highBatteryImpactThresholdRef.current;
+      const wasHighBatteryImpact = curScore >= highThresholdAtTrigger;
+      const confidence = computeTriggerConfidenceFromWindow(updated, nowTs);
       setHighUsageTrendOccurrences((prev) => [
         {
           id: `trend-${nowTs}-${Math.random().toString(36).slice(2, 7)}`,
@@ -2268,6 +2323,11 @@ export default function App() {
           events: trailEvents,
           scores: spikeScores,
           triggeredAtMs: nowTs,
+          wasHighBatteryImpact,
+          highBatteryThresholdAtTrigger: highThresholdAtTrigger,
+          triggerConfidencePct: confidence.confidencePct,
+          preceding30sEvents: confidence.eventCount30s,
+          preceding30sDensityPerSec: confidence.densityPerSec,
         },
         ...prev,
       ].slice(0, 20));
@@ -5676,6 +5736,27 @@ export default function App() {
                                         <span className="text-amber-300 tabular-nums shrink-0">
                                           {occ.startScore} -&gt; {occ.curScore} (+{occ.delta.toFixed(2)})
                                         </span>
+                                        <span
+                                          title={
+                                            isZh
+                                              ? `触发置信度 (Trigger Confidence): 基于告警前 30s 窗口内 ${occ.preceding30sEvents} 次事件 (${occ.preceding30sDensityPerSec.toFixed(2)}/s) 计算的真阳性概率`
+                                              : `Trigger Confidence: ${occ.triggerConfidencePct}% true-positive probability (${occ.preceding30sEvents} events in preceding 30s · ${occ.preceding30sDensityPerSec.toFixed(2)}/s)`
+                                          }
+                                          className={`inline-flex items-center gap-1 px-1.5 py-0.2 rounded border font-semibold tabular-nums shrink-0 ${
+                                            occ.triggerConfidencePct >= 80
+                                              ? 'bg-emerald-500/20 border-emerald-400/45 text-emerald-200'
+                                              : occ.triggerConfidencePct >= 55
+                                                ? 'bg-sky-500/20 border-sky-400/45 text-sky-200'
+                                                : 'bg-slate-800 border-slate-700 text-slate-300'
+                                          }`}
+                                        >
+                                          <ShieldCheck className="w-2.5 h-2.5 shrink-0" />
+                                          <span>
+                                            {isZh
+                                              ? `置信度 ${occ.triggerConfidencePct}%`
+                                              : `Conf ${occ.triggerConfidencePct}%`}
+                                          </span>
+                                        </span>
                                         <span className="text-slate-400 shrink-0">
                                           {occ.windowSec}s · {occ.sessionTag}
                                         </span>
@@ -7687,6 +7768,30 @@ export default function App() {
                       </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
+                      {(() => {
+                        const compoundedHighCount = trendAnalysisModel.rangeOccurrences.filter(
+                          (o) =>
+                            o.wasHighBatteryImpact ?? o.curScore >= highBatteryImpactThreshold
+                        ).length;
+                        if (compoundedHighCount === 0) return null;
+                        return (
+                          <span
+                            title={
+                              isZh
+                                ? '触发时 Battery Impact 同时处于 High 区间的复合压力事件数量'
+                                : 'Trend alerts triggered while Battery Impact was in the High range'
+                            }
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-mono font-semibold"
+                          >
+                            <AlertTriangle className="w-3 h-3 text-amber-600 shrink-0" />
+                            <span>
+                              {isZh
+                                ? `${compoundedHighCount} 次复合高负载`
+                                : `${compoundedHighCount} High-Impact`}
+                            </span>
+                          </span>
+                        );
+                      })()}
                       <span className="text-[11px] font-mono text-slate-500">
                         {trendAnalysisDateRange === 'ALL'
                           ? `${highUsageTrendOccurrences.length} ${isZh ? '条触发' : 'triggers'}`
@@ -7750,6 +7855,10 @@ export default function App() {
                     <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
                       {trendAnalysisModel.rangeOccurrences.map((occ) => {
                         const isSelected = selectedTrendTriggerId === occ.id;
+                        const isHighRangeStress =
+                          occ.wasHighBatteryImpact ?? occ.curScore >= highBatteryImpactThreshold;
+                        const highThresholdLabel =
+                          occ.highBatteryThresholdAtTrigger ?? highBatteryImpactThreshold;
                         return (
                           <div
                             key={occ.id}
@@ -7757,9 +7866,13 @@ export default function App() {
                               setSelectedTrendTriggerId((prev) => (prev === occ.id ? null : occ.id))
                             }
                             className={`rounded-lg border p-3 space-y-2 cursor-pointer transition-colors ${
-                              isSelected
-                                ? 'border-rose-400 bg-rose-50/70'
-                                : 'border-slate-200 bg-slate-50/60 hover:bg-slate-50'
+                              isHighRangeStress
+                                ? isSelected
+                                  ? 'border-amber-500 bg-gradient-to-r from-amber-50 via-orange-50/85 to-rose-50/85 ring-1 ring-amber-400/60'
+                                  : 'border-amber-300 bg-gradient-to-r from-amber-50/75 via-orange-50/45 to-rose-50/35 hover:border-amber-400'
+                                : isSelected
+                                  ? 'border-rose-400 bg-rose-50/70'
+                                  : 'border-slate-200 bg-slate-50/60 hover:bg-slate-50'
                             }`}
                           >
                             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">
@@ -7767,7 +7880,28 @@ export default function App() {
                                 <span className="px-1.5 py-0.5 rounded bg-rose-600 text-white font-semibold">
                                   {occ.consecutiveIncreases}x &gt;= {occ.thresholdAtTrigger}x
                                 </span>
-                                <span className="font-semibold text-slate-800">
+                                {isHighRangeStress && (
+                                  <span
+                                    title={
+                                      isZh
+                                        ? `复合高负载事件：触发时 Battery Impact (${occ.curScore}) 处于 High 区间 (>=${highThresholdLabel} pts)`
+                                        : `Compounded Stress Event: triggered while Battery Impact (${occ.curScore}) was in High range (>=${highThresholdLabel} pts)`
+                                    }
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 font-semibold"
+                                  >
+                                    <AlertTriangle className="w-3 h-3 text-amber-600 shrink-0" />
+                                    <span>
+                                      {isZh
+                                        ? `HIGH 负载 (>=${highThresholdLabel})`
+                                        : `HIGH IMPACT (>=${highThresholdLabel})`}
+                                    </span>
+                                  </span>
+                                )}
+                                <span
+                                  className={`font-semibold ${
+                                    isHighRangeStress ? 'text-amber-900' : 'text-slate-800'
+                                  }`}
+                                >
                                   {occ.startScore} -&gt; {occ.curScore} (+{occ.delta.toFixed(2)} pts)
                                 </span>
                                 <span className="text-slate-500">
@@ -7782,6 +7916,52 @@ export default function App() {
                                   isZh={isZh}
                                 />
                               )}
+                            </div>
+
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[10.5px] font-mono">
+                              <div className="inline-flex flex-wrap items-center gap-1.5">
+                                <span
+                                  title={
+                                    isZh
+                                      ? `基于告警前 30 秒滑动窗口内事件密度 (${occ.preceding30sEvents} 次事件 / ${occ.preceding30sDensityPerSec.toFixed(2)} 次/秒) 计算的真阳性概率`
+                                      : `True-positive probability derived from event density in the 30s window preceding the alert (${occ.preceding30sEvents} events / ${occ.preceding30sDensityPerSec.toFixed(2)}/s)`
+                                  }
+                                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-semibold tabular-nums ${
+                                    occ.triggerConfidencePct >= 80
+                                      ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                                      : occ.triggerConfidencePct >= 55
+                                        ? 'bg-sky-100 text-sky-800 border-sky-300'
+                                        : 'bg-slate-100 text-slate-700 border-slate-300'
+                                  }`}
+                                >
+                                  <ShieldCheck className="w-3 h-3 shrink-0" />
+                                  <span>
+                                    {isZh
+                                      ? `触发置信度 Trigger Confidence: ${occ.triggerConfidencePct}%`
+                                      : `Trigger Confidence: ${occ.triggerConfidencePct}%`}
+                                  </span>
+                                </span>
+                                <span className="text-[10px] text-slate-500 tabular-nums">
+                                  {isZh
+                                    ? `前30s密度: ${occ.preceding30sEvents} 事件 (${occ.preceding30sDensityPerSec.toFixed(2)}/s)`
+                                    : `${occ.preceding30sEvents} events in prior 30s (${occ.preceding30sDensityPerSec.toFixed(2)}/s)`}
+                                </span>
+                              </div>
+                              <span
+                                className={`text-[10px] font-semibold ${
+                                  occ.triggerConfidencePct >= 80
+                                    ? 'text-emerald-700'
+                                    : occ.triggerConfidencePct >= 55
+                                      ? 'text-sky-700'
+                                      : 'text-slate-500'
+                                }`}
+                              >
+                                {occ.triggerConfidencePct >= 80
+                                  ? isZh ? '高真阳性概率' : 'High True-Positive Likelihood'
+                                  : occ.triggerConfidencePct >= 55
+                                    ? isZh ? '中等真阳性概率' : 'Moderate Likelihood'
+                                    : isZh ? '低密度稀疏触发' : 'Sparse Window'}
+                              </span>
                             </div>
 
                             <div className="flex flex-wrap items-center gap-1.5">
