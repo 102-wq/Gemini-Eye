@@ -7206,7 +7206,11 @@ export default function App() {
                         domain={[
                           0,
                           (dataMax: number) =>
-                            Math.max(trendConsecutiveThreshold + 1, 4, Math.ceil(dataMax + 1)),
+                            Math.max(
+                              trendConsecutiveThreshold + 1,
+                              4,
+                              Number.isFinite(dataMax) ? Math.ceil(dataMax + 1) : trendConsecutiveThreshold + 1
+                            ),
                         ]}
                         tick={{ fill: '#fda4af', fontSize: 10 }}
                         stroke="#4c0519"
@@ -7282,15 +7286,17 @@ export default function App() {
                         yAxisId="streak"
                         y={trendConsecutiveThreshold}
                         stroke="#fb7185"
-                        strokeWidth={1.6}
+                        strokeWidth={1.75}
+                        strokeOpacity={highUsageTrendEnabled ? 0.95 : 0.45}
                         strokeDasharray="6 3"
                         label={{
                           value: isZh
-                            ? `连升触发阈值 >= ${trendConsecutiveThreshold}x`
-                            : `Streak Threshold >= ${trendConsecutiveThreshold}x`,
+                            ? `High Usage Trend 连升阈值 >= ${trendConsecutiveThreshold}x${highUsageTrendEnabled ? '' : ' (已关闭)'}`
+                            : `Streak Threshold >= ${trendConsecutiveThreshold}x${highUsageTrendEnabled ? '' : ' (Disabled)'}`,
                           position: 'insideTopLeft',
-                          fill: '#fda4af',
+                          fill: highUsageTrendEnabled ? '#fda4af' : '#94a3b8',
                           fontSize: 10,
+                          fontWeight: 600,
                         }}
                       />
 
